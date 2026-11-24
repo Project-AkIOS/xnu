@@ -1,0 +1,1661 @@
+/*
+ * HakiosGPU on the Pixel 8a: zuma's Mali-G715 for programs to draw and compute with.
+ *
+ * hakios.akita_mali.c brings the GPU up and, with boot-arg mali_keep=1, keeps it on and starts this service. A program
+ * that opens it speaks the interface of Linux's panthor DRM driver, the one Mesa's panfrost and panvk know: every
+ * request is a call of the user client with the request's number as the selector (DRM's: 0x40 + panthor's own number,
+ * 0x09 GEM_CLOSE, 0xbf.. the sync objects) and the request's structure passed in and back -- as redwood's HakiosGPU does
+ * with msm's for freedreno (drivers/gpu/hakios.gpu.cpp; the userland side, tools/mesa/hakios-drm, stands in for libdrm).
+ * A buffer's memory is the client memory of the type that is its handle (BO_MMAP_OFFSET answers the handle << 12).
+ *
+ * What there is: the device's description; VMs (each its own address space of the GPU, with its own tables); buffers
+ * (zeroed, write-combined for the processors, mapped into a VM page by page); groups of queues fed by the kernel; the
+ * submission of a program's command streams; DRM sync objects, binary and timeline, signalled by submissions and
+ * waited for (a submission's wait operations are waited for here, before it goes to the GPU). Tiler heaps: their initial
+ * chunks (growing one is not here yet). Not here yet: sync files, interrupts (waiting is asking again every millisecond), recovery of a group that faulted.
+ *
+ * The structures are those of Linux's include/uapi/drm/panthor_drm.h and drm.h (MIT, Collabora and others), as
+ * Mesa 26.2.5 carries them, written out here.
+ *
+ * Timeouts of the waits are RELATIVE nanoseconds here (DRM's are absolute, CLOCK_MONOTONIC): the userland side
+ * converts, since it shares the clock with the caller.
+ */
+#include <IOKit/IOLib.h>
+#include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
+#include "MiniIOSurface.h"
+#include <libkern/c++/OSObject.h>
+#include <pexpert/pexpert.h>
+#include <IOKit/IOKitKeys.h>
+#include <IOKit/IOPlatformExpert.h>
+
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
+
+extern "C" {
+bool akita_mali_ready(void);
+int akita_mali_vm_new(void);
+void akita_mali_vm_free(int vm);
+bool akita_mali_vm_map(int vm, uint64_t va, uint64_t phys, uint32_t flags);
+void akita_mali_vm_unmap(int vm, uint64_t va, uint64_t size);
+void akita_mali_vm_flush(int vm);
+void akita_mali_vm_flush_later(int vm);
+int akita_mali_vm_unflushed(int vm, uint64_t *stamp_now);
+int akita_mali_vm_stale(int vm, uint64_t stamp);
+int akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority);
+void akita_mali_group_free(int g);
+uint64_t akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size);
+uint64_t akita_mali_reached(int g, unsigned int q);
+bool akita_mali_lost(int g, unsigned int q, uint64_t seqno);
+void akita_mali_flush(void);
+int akita_mali_heap_new(int vm, uint32_t chunk_size, uint32_t initial, uint32_t max_chunks, uint32_t in_flight,
+    uint64_t *ctx_va, uint64_t *first_chunk_va);
+void akita_mali_heap_free(int h);
+void akita_mali_debug(void);
+extern "C" int mali_irq_event;
+void akita_mali_info(uint32_t *regs, uint32_t *csif);
+void akita_gpu_start(void);
+unsigned akita_mali_snapshot(uint64_t *snap, unsigned most);
+bool akita_mali_done(const uint64_t *snap, unsigned n);
+}
+
+/* ---- panthor_drm.h and drm.h, as much as is answered here ---- */
+
+struct drm_panthor_obj_array { uint32_t stride, count; uint64_t array; };
+struct drm_panthor_sync_op { uint32_t flags, handle; uint64_t timeline_value; };
+#define SYNC_OP_TIMELINE        1u              /* DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ */
+#define SYNC_OP_SIGNAL          (1u << 31)
+struct drm_panthor_dev_query { uint32_t type, size; uint64_t pointer; };
+struct drm_panthor_gpu_info {
+	uint32_t gpu_id, gpu_rev, csf_id, l2_features, tiler_features, mem_features, mmu_features, thread_features,
+	    max_threads, thread_max_workgroup_size, thread_max_barrier_size, coherency_features, texture_features[4],
+	    as_present, selected_coherency;
+	uint64_t shader_present, l2_present, tiler_present;
+	uint32_t core_features, pad;
+	uint64_t gpu_features;
+};
+struct drm_panthor_csif_info {
+	uint32_t csg_slot_count, cs_slot_count, cs_reg_count, scoreboard_slot_count, unpreserved_cs_reg_count, pad;
+};
+struct drm_panthor_timestamp_info {
+	uint64_t timestamp_frequency, current_timestamp, timestamp_offset;
+	uint32_t flags, duration_nsec;
+	uint64_t cycle_count, cpu_timestamp_sec, cpu_timestamp_nsec;
+};
+struct drm_panthor_group_priorities_info { uint8_t allowed_mask, pad[3]; };
+struct drm_panthor_vm_create { uint32_t flags, id; uint64_t user_va_range; };
+struct drm_panthor_vm_destroy { uint32_t id, pad; };
+struct drm_panthor_vm_bind_op {
+	uint32_t flags, bo_handle;
+	uint64_t bo_offset, va, size;
+	struct drm_panthor_obj_array syncs;
+};
+#define BIND_OP_TYPE_MASK       (0xfu << 28)
+#define BIND_OP_TYPE_MAP        (0u << 28)
+#define BIND_OP_TYPE_UNMAP      (1u << 28)
+struct drm_panthor_vm_bind { uint32_t vm_id, flags; struct drm_panthor_obj_array ops; };
+struct drm_panthor_vm_get_state { uint32_t vm_id, state; };
+struct drm_panthor_bo_create { uint64_t size; uint32_t flags, exclusive_vm_id, handle, pad; };
+struct drm_panthor_bo_mmap_offset { uint32_t handle, pad; uint64_t offset; };
+struct drm_panthor_queue_create { uint8_t priority, pad[3]; uint32_t ringbuf_size; };
+struct drm_panthor_group_create {
+	struct drm_panthor_obj_array queues;
+	uint8_t max_compute_cores, max_fragment_cores, max_tiler_cores, priority;
+	uint32_t pad;
+	uint64_t compute_core_mask, fragment_core_mask, tiler_core_mask;
+	uint32_t vm_id, group_handle;
+};
+struct drm_panthor_group_destroy { uint32_t group_handle, pad; };
+struct drm_panthor_queue_submit {
+	uint32_t queue_index, stream_size;
+	uint64_t stream_addr;
+	uint32_t latest_flush, pad;
+	struct drm_panthor_obj_array syncs;
+};
+struct drm_panthor_group_submit { uint32_t group_handle, pad; struct drm_panthor_obj_array queue_submits; };
+struct drm_panthor_group_get_state { uint32_t group_handle, state, fatal_queues, pad; };
+struct drm_panthor_tiler_heap_create { uint32_t vm_id, initial_chunk_count, chunk_size, max_chunks, target_in_flight, handle;
+	uint64_t tiler_heap_ctx_gpu_va, first_heap_chunk_gpu_va; };
+struct drm_panthor_tiler_heap_destroy { uint32_t handle, pad; };
+struct drm_gem_close { uint32_t handle, pad; };
+/* kHakiosSurface: the Adreno service's struct hakios_surface (drivers/gpu/hakios.gpu.cpp), the same layout */
+struct hakios_surface {
+	uint32_t surface;                       /* the IOSurface's ID */
+	uint32_t handle;                        /* kHakiosDescribe: no buffer wanted; else, back: the buffer, */
+	uint64_t size;                          /* how big it is, */
+	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
+	uint32_t width, height, pixelFormat, planes;    /* and what they are */
+};
+#define kHakiosDescribe         0xffffffffu
+/* kHakiosSurfaceBusy: HakiosMetal's mark on a surface while a command buffer that draws into it is being recorded or run */
+struct hakios_surface_busy { uint32_t surface; int32_t delta; };
+/* kHakiosMap: a buffer mapped for the calling program; the address comes back (the mapping goes with the buffer) */
+struct hakios_map { uint32_t handle, pad; uint64_t address, size; };
+struct drm_syncobj_create { uint32_t handle, flags; };
+#define SYNCOBJ_CREATE_SIGNALED 1u
+struct drm_syncobj_destroy { uint32_t handle, pad; };
+struct drm_syncobj_wait {
+	uint64_t handles; int64_t timeout_nsec; uint32_t count_handles, flags, first_signaled, pad; uint64_t deadline_nsec;
+};
+struct drm_syncobj_timeline_wait {
+	uint64_t handles, points; int64_t timeout_nsec; uint32_t count_handles, flags, first_signaled, pad;
+	uint64_t deadline_nsec;
+};
+#define WAIT_ALL                1u
+#define WAIT_FOR_SUBMIT         2u
+#define WAIT_AVAILABLE          4u
+struct drm_syncobj_array { uint64_t handles; uint32_t count_handles, pad; };
+struct drm_syncobj_timeline_array { uint64_t handles, points; uint32_t count_handles, flags; };
+struct drm_syncobj_transfer { uint32_t src_handle, dst_handle; uint64_t src_point, dst_point; uint32_t flags, pad; };
+
+enum {
+	kGemClose = 0x09,
+	kDevQuery = 0x40, kVmCreate, kVmDestroy, kVmBind, kVmGetState, kBoCreate, kBoMmapOffset, kGroupCreate,
+	kGroupDestroy, kGroupSubmit, kGroupGetState, kTilerHeapCreate, kTilerHeapDestroy, kBoSetLabel, kSetUserMmioOffset,
+	kBoSync, kBoQueryInfo,
+	kSyncobjCreate = 0xbf, kSyncobjDestroy = 0xc0, kSyncobjWait = 0xc3, kSyncobjReset = 0xc4, kSyncobjSignal = 0xc5,
+	kSyncobjTimelineWait = 0xca, kSyncobjQuery = 0xcb, kSyncobjTransfer = 0xcc, kSyncobjTimelineSignal = 0xcd,
+	kHakiosMap = 0x7c,              /* not Linux's: a buffer mapped for the program, the mapping kept HERE (see boMap) */
+	kHakiosSurfaceBusy = 0x7d,      /* not Linux's: a command buffer draws into an IOSurface (+1) or is done (-1) */
+	kHakiosSurfaceGate = 0x80,      /* not Linux's: wait until an IOSurface is not on the panel (before a submission) */
+	kHakiosSurface = 0x7e,          /* not Linux's: an IOSurface's memory as a buffer (as the Adreno service's) */
+	kHakiosDebug = 0x7f,            /* not Linux's: the queues' state into the kernel's log */
+};
+
+/* ---- the service ---- */
+
+static IOLock *gLock;
+static void busyChange(uint32_t sid, int32_t delta);
+extern "C" uint32_t hakios_fb_shown_surface(void);
+extern "C" void hakios_fb_swap_state(uint32_t *presented, uint32_t *presented_surface, uint32_t *shown);
+extern "C" void *hakios_fb_shown_event(void);  /* MiniIOMobileFramebuffer.cpp: woken when the panel's surface changes */  /* MiniIOMobileFramebuffer.cpp */        /* (the surfaces being drawn: see MiniIOSurfaceDrawn) */
+
+class HakiosGPU : public IOService
+{
+	OSDeclareDefaultStructors(HakiosGPU);
+public:
+	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(HakiosGPU, IOService);
+
+bool
+HakiosGPU::start(IOService *provider)
+{
+	if (!IOService::start(provider)) {
+		return false;
+	}
+	setProperty(kIOUserClientClassKey, "HakiosGPUUserClient");
+	setProperty("DRMDriver", "panthor");
+	setName("HakiosGPU");
+	registerService();
+	return true;
+}
+
+void
+akita_gpu_start(void)
+{
+	IOService *provider = (IOService *)IOService::getPlatform();
+	HakiosGPU *gpu;
+
+	gLock = IOLockAlloc();
+	gpu = OSTypeAlloc(HakiosGPU);
+	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
+		OSSafeReleaseNULL(gpu);
+		IOLog("HakiosGPU: cannot create the service\n");
+		return;
+	}
+	if (!gpu->start(provider)) {
+		gpu->detach(provider);
+		IOLog("HakiosGPU: the service did not start\n");
+	} else {
+		IOLog("HakiosGPU: the Mali-G715, with panthor's interface\n");
+	}
+	gpu->release();
+}
+
+/* ---- a client ---- */
+
+#define MAX_BOS                 8192    /* (11-12, was 1024: a client's buffers -- mediaserverd's MetalPerformanceShaders
+                                         * networks hold more than a thousand at once and were told "no GPU memory") */
+#define MAX_SYNCS               1024
+#define MAX_POINTS              32
+#define MAX_CLIENT_VMS          4
+#define MAX_CLIENT_GROUPS       8
+#define MAX_CLIENT_HEAPS        8
+
+/* what a sync object waits for: nothing yet, done, or a queue reaching a number */
+struct fence {
+	int16_t group;                  /* -1: done already (signalled) */
+	uint8_t queue;
+	uint64_t seqno;
+};
+
+struct syncobj {
+	bool used, binary_set;
+	struct fence binary;            /* point 0, a binary one's */
+	uint32_t points;                /* a timeline's: (point, fence), oldest first */
+	uint64_t point[MAX_POINTS];
+	struct fence pf[MAX_POINTS];
+};
+
+class HakiosGPUUserClient : public IOUserClient
+{
+	OSDeclareDefaultStructors(HakiosGPUUserClient);
+
+	/* a buffer: memory of its own, or an IOSurface's (held while the buffer is there) */
+	struct bo { IOMemoryDescriptor *memory; uint64_t size; MiniIOSurface *surface; IOMemoryMap *map; } *fBos;
+	IOReturn boMap(struct hakios_map *request);
+	void boRelease(int i);
+	IOReturn surfaceBuffer(struct hakios_surface *request);
+	struct syncobj *fSyncs;
+	int fVms[MAX_CLIENT_VMS];
+	int fGroups[MAX_CLIENT_GROUPS];
+	int fHeaps[MAX_CLIENT_HEAPS];              /* the kernel's heap slots (handle: index + 1) */
+	struct { uint32_t sid; int32_t count; } fBusy[16];     /* its kHakiosSurfaceBusy marks, undone at its close */
+
+	bool done(const struct fence *f);
+	bool syncPointDone(struct syncobj *s, uint64_t point, bool *submitted);
+	void syncSignal(uint32_t handle, uint64_t point, const struct fence *f);
+	bool waitPoints(const uint32_t *handles, const uint64_t *points, uint32_t count, uint32_t flags, int64_t timeout,
+	    uint32_t *first);
+	IOReturn devQuery(struct drm_panthor_dev_query *q);
+	IOReturn vmBind(struct drm_panthor_vm_bind *b);
+	IOReturn groupCreate(struct drm_panthor_group_create *c);
+	IOReturn groupSubmit(struct drm_panthor_group_submit *s);
+	bool ownsVm(uint32_t id);
+	int group(uint32_t handle);
+
+public:
+	virtual bool initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+	virtual void free(void) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
+	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(HakiosGPUUserClient, IOUserClient);
+
+bool
+HakiosGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties)
+{
+	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
+		return false;
+	}
+	fBos = (struct bo *)IOMallocZero(sizeof(*fBos) * MAX_BOS);
+	fSyncs = (struct syncobj *)IOMallocZero(sizeof(*fSyncs) * MAX_SYNCS);
+	for (int i = 0; i < MAX_CLIENT_VMS; i++) {
+		fVms[i] = -1;
+	}
+	bzero(fBusy, sizeof(fBusy));
+	for (int i = 0; i < MAX_CLIENT_GROUPS; i++) {
+		fGroups[i] = -1;
+	}
+	for (int i = 0; i < MAX_CLIENT_HEAPS; i++) {
+		fHeaps[i] = -1;
+	}
+	return fBos != NULL && fSyncs != NULL;
+}
+
+IOReturn
+HakiosGPUUserClient::clientClose(void)
+{
+	IOLockLock(gLock);
+	for (int i = 0; i < 16; i++) {
+		if (fBusy[i].count > 0) {
+			busyChange(fBusy[i].sid, -fBusy[i].count);
+		}
+		fBusy[i].sid = 0;
+		fBusy[i].count = 0;
+	}
+	for (int i = 0; i < MAX_CLIENT_GROUPS; i++) {
+		if (fGroups[i] >= 0) {
+			akita_mali_group_free(fGroups[i]);
+			fGroups[i] = -1;
+		}
+	}
+	for (int i = 0; i < MAX_CLIENT_HEAPS; i++) {
+		if (fHeaps[i] >= 0) {
+			akita_mali_heap_free(fHeaps[i]);
+			fHeaps[i] = -1;
+		}
+	}
+	for (int i = 0; i < MAX_CLIENT_VMS; i++) {
+		if (fVms[i] >= 0) {
+			akita_mali_vm_free(fVms[i]);
+			fVms[i] = -1;
+		}
+	}
+	IOLockUnlock(gLock);
+	terminate();
+	return kIOReturnSuccess;
+}
+
+void
+HakiosGPUUserClient::free(void)
+{
+	if (fBos != NULL) {
+		for (int i = 0; i < MAX_BOS; i++) {
+			boRelease(i);
+		}
+		IOFree(fBos, sizeof(*fBos) * MAX_BOS);
+	}
+	if (fSyncs != NULL) {
+		IOFree(fSyncs, sizeof(*fSyncs) * MAX_SYNCS);
+	}
+	IOUserClient::free();
+}
+
+IOReturn
+HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
+{
+	IOReturn ret = kIOReturnBadArgument;
+
+	IOLockLock(gLock);
+	if (type >= 1 && type <= MAX_BOS && fBos[type - 1].memory != NULL) {
+		fBos[type - 1].memory->retain();
+		*memory = fBos[type - 1].memory;
+		/* (a scan-out slot's pixels are RAM outside the kernel's: mapped as device memory by default, where an unaligned
+		 * access faults -- write-combined instead, as MiniIOSurface maps them) */
+		*options = fBos[type - 1].surface != NULL && fBos[type - 1].surface->scanoutSlot > 0 ? kIOMapWriteCombineCache : 0;
+		ret = kIOReturnSuccess;
+	}
+	IOLockUnlock(gLock);
+	return ret;
+}
+
+bool
+HakiosGPUUserClient::ownsVm(uint32_t id)
+{
+	for (int i = 0; i < MAX_CLIENT_VMS; i++) {
+		if (fVms[i] >= 0 && (uint32_t)fVms[i] == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+int
+HakiosGPUUserClient::group(uint32_t handle)
+{
+	for (int i = 0; i < MAX_CLIENT_GROUPS; i++) {
+		if (fGroups[i] >= 0 && (uint32_t)fGroups[i] + 1 == handle) {
+			return fGroups[i];
+		}
+	}
+	return -1;
+}
+
+bool
+HakiosGPUUserClient::done(const struct fence *f)
+{
+	return f->group < 0 || akita_mali_reached(f->group, f->queue) >= f->seqno;
+}
+
+/* is the point reached; *submitted: is there a fence for it at all */
+bool
+HakiosGPUUserClient::syncPointDone(struct syncobj *s, uint64_t point, bool *submitted)
+{
+	*submitted = false;
+	if (point == 0) {
+		*submitted = s->binary_set;
+		return s->binary_set && done(&s->binary);
+	}
+	for (uint32_t i = 0; i < s->points; i++) {
+		if (s->point[i] >= point) {
+			*submitted = true;
+			return done(&s->pf[i]);
+		}
+	}
+	return false;
+}
+
+void
+HakiosGPUUserClient::syncSignal(uint32_t handle, uint64_t point, const struct fence *f)
+{
+	struct syncobj *s;
+
+	if (handle == 0 || handle > MAX_SYNCS || !fSyncs[handle - 1].used) {
+		return;
+	}
+	s = &fSyncs[handle - 1];
+	if (point == 0) {
+		s->binary = *f;
+		s->binary_set = true;
+		return;
+	}
+	/* the oldest points that are done make way */
+	while (s->points == MAX_POINTS || (s->points > 1 && done(&s->pf[0]) && done(&s->pf[1]))) {
+		memmove(&s->point[0], &s->point[1], (s->points - 1) * sizeof(s->point[0]));
+		memmove(&s->pf[0], &s->pf[1], (s->points - 1) * sizeof(s->pf[0]));
+		s->points--;
+	}
+	s->point[s->points] = point;
+	s->pf[s->points] = *f;
+	s->points++;
+}
+
+/*
+ * The display asks before it puts a surface on the panel (MiniIOMobileFramebuffer's show()): is the GPU done drawing it?
+ * Here (the Mali) it waits until every queue has done what it had been given by now -- the frame's own work was submitted
+ * before its swap, so it is among it (a later frame's may be too: a frame's wait can include the next one's work). Without
+ * this the panel showed surfaces the Mali was still drawing (11-10). Upstream's Adreno driver marks each surface with its
+ * own submission (hakios.gpu.cpp); the Mali's submissions do not name their buffers, hence all of it. True if done in time.
+ */
+/*
+ * SURFACES BEING DRAWN (11-10): HakiosMetal marks a surface from the first draw a command buffer records into it until
+ * that command buffer is done (or dropped), and the display waits for the marks to go before it shows the surface --
+ * Apple's display waits on the surface's own GPU writes, whenever they were submitted. Waiting only for what had been
+ * submitted when the swap came was not enough: CoreAnimation draws some frames with several command buffers and presents
+ * from the first one's scheduled handler, before the others (the backdrop blur, a 3D layer) are even recorded -- the
+ * panel showed the home page without Spotlight's blur and keyboard, or the cube's row half drawn (white bands), in the
+ * tester's slow-motion clips with sb_debug's counter. Under gLock.
+ */
+#define BUSY_SURFACES 64
+static struct { uint32_t sid; int32_t count; } gBusy[BUSY_SURFACES];
+static uint64_t gBusyWaits, gBusyWaitAbs, gBusyStages, gIdleStages, gIdleGraces;
+/* when each surface's last mark went (mach_absolute_time), the last 16 surfaces so: see MiniIOSurfaceDrawn's grace */
+static struct { uint32_t sid; uint64_t at; } gReleased[16];
+static unsigned gReleasedNext;
+
+static void
+releasedNow(uint32_t sid)
+{
+	for (unsigned i = 0; i < 16; i++) {
+		if (gReleased[i].sid == sid) {
+			gReleased[i].at = mach_absolute_time();
+			return;
+		}
+	}
+	gReleased[gReleasedNext % 16].sid = sid;
+	gReleased[gReleasedNext % 16].at = mach_absolute_time();
+	gReleasedNext++;
+}
+
+static uint64_t
+releasedAt(uint32_t sid)
+{
+	for (unsigned i = 0; i < 16; i++) {
+		if (gReleased[i].sid == sid) {
+			return gReleased[i].at;
+		}
+	}
+	return 0;
+}
+
+/*
+ * THE WINDOW SERVER'S FRAME RECORDED (11-20): the grace above (fb_busy_grace_us, 2.5 ms after the surface's last mark)
+ * is for a later stage not recorded yet -- and it made a frame whose GPU work ended after ~5.6 ms into a refresh miss it
+ * (vsync-dtl: GPU done at 5.4 ms, shown-ready at 8.3; every frame done later went a refresh late). backboardd now says
+ * when CoreAnimation's display update is finished (AppleCLCDDisplay::finish_update returned, userland/src/inject.c:
+ * kern.hakios.ws_frame): every stage of that frame recorded by then, its marks made. A surface first marked before the
+ * last such word, its marks gone: drawn, no grace. Without the word (another drawer, no injection) the grace as before.
+ * Boot-arg fb_ws_frame=0: never trusted.
+ */
+static uint64_t gWSFinishAt, gWSFrames, gWSNoGrace;
+static struct { uint32_t sid; uint64_t at; } gMarked[16];
+static unsigned gMarkedNext;
+static uint32_t gWSOn = 0xffffffff;
+
+static void
+markedNow(uint32_t sid)
+{
+	for (unsigned i = 0; i < 16; i++) {
+		if (gMarked[i].sid == sid) {
+			gMarked[i].at = mach_absolute_time();
+			return;
+		}
+	}
+	gMarked[gMarkedNext % 16].sid = sid;
+	gMarked[gMarkedNext % 16].at = mach_absolute_time();
+	gMarkedNext++;
+}
+
+/* (gLock held) the window server finished a frame after this surface's first mark: every stage of it is recorded */
+static bool
+wsRecorded(uint32_t sid)
+{
+	if (gWSOn == 0xffffffff && !PE_parse_boot_argn("fb_ws_frame", &gWSOn, sizeof(gWSOn))) {
+		gWSOn = 1;
+	}
+	if (!gWSOn || gWSFinishAt == 0) {
+		return false;
+	}
+	for (unsigned i = 0; i < 16; i++) {
+		if (gMarked[i].sid == sid) {
+			return gMarked[i].at != 0 && gWSFinishAt > gMarked[i].at;
+		}
+	}
+	return false;
+}
+
+/* kern.hakios.ws_frame (hakios.akita_display.c): backboardd's display update finished */
+extern "C" void hakios_ws_frame_finished(void);
+
+void
+hakios_ws_frame_finished(void)
+{
+	if (gLock == NULL) {
+		return;
+	}
+	IOLockLock(gLock);
+	gWSFinishAt = mach_absolute_time();
+	gWSFrames++;
+	thread_wakeup((event_t)gBusy);         /* (a grace waiting on it ends) */
+	IOLockUnlock(gLock);
+}
+
+static void
+busyChange(uint32_t sid, int32_t delta)
+{
+	int free_slot = -1;
+
+	for (int i = 0; i < BUSY_SURFACES; i++) {
+		if (gBusy[i].sid == sid && gBusy[i].count > 0) {
+			gBusy[i].count += delta;
+			if (gBusy[i].count <= 0) {
+				gBusy[i].sid = 0;
+				gBusy[i].count = 0;
+				releasedNow(sid);
+			}
+			thread_wakeup((event_t)gBusy);         /* (any change: the grace watch below looks for new marks too) */
+			return;
+		}
+		if (free_slot < 0 && gBusy[i].count == 0) {
+			free_slot = i;
+		}
+	}
+	if (delta > 0 && sid == hakios_fb_shown_surface()) {
+		/* (11-10: a command buffer starts drawing into the surface the panel shows -- CoreAnimation had it back?) */
+		static uint32_t late;
+
+		if (late++ < 30 || late % 200 == 0) {
+			uint32_t presented, presented_sid, shown;
+
+			hakios_fb_swap_state(&presented, &presented_sid, &shown);
+			IOLog("HakiosGPU: surface %u drawn into while on the panel (%u times): swap %u presented (surface %u), %u "
+			    "counted shown\n", sid, late, presented, presented_sid, shown);
+		}
+	}
+	if (delta > 0 && free_slot >= 0) {
+		markedNow(sid);         /* (the frame's first mark of this surface: see wsRecorded) */
+		gBusy[free_slot].sid = sid;
+		gBusy[free_slot].count = delta;
+		thread_wakeup((event_t)gBusy);
+	}
+}
+
+static bool
+busyNow(uint32_t sid)
+{
+	for (int i = 0; i < BUSY_SURFACES; i++) {
+		if (gBusy[i].sid == sid && gBusy[i].count > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static uint64_t gDrawnWaits, gDrawnWaitAbs, gDrawnLate;
+static uint64_t gBoBytes, gBoPeak;      /* (11-10) the programs' GPU buffers (kBoCreate) now, and the most at once */
+static uint32_t gBoCount;
+/* (11-13) buffers given back while something else still had their memory (a mapping in the program not undone): how
+ * many, their bytes -- the kernel's wired memory grew by gigabytes that no count here showed */
+static uint64_t gBoHeldBytes, gBoHeldCount, gBoSurfaceHeldCount;
+/* (11-13) buffers given back and kept until their VM's update (boRelease, gKept): now, the most, all so far */
+static uint32_t gKeptCount, gKeptMost;
+static uint64_t gKeptBytes, gKeptEver;
+extern "C" uint64_t akita_mali_kernel_bytes(void);     /* hakios.akita_mali.c */
+
+bool
+MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
+{
+	uint64_t snap[192], deadline, t0 = mach_absolute_time();       /* (hakios.akita_mali.c: 48 groups of 4 queues) */
+	unsigned n;
+	bool done;
+
+	if (gLock == NULL || !akita_mali_ready()) {
+		return true;
+	}
+	clock_interval_to_deadline((uint32_t)milliseconds, kMillisecondScale, &deadline);
+	IOLockLock(gLock);
+	/* the command buffers drawing into it, recorded or running, done first (the marks: busyChange) -- and the grace
+	 * below whenever the GPU still has work at all: a frame presented before its main stage is recorded has no mark
+	 * yet (the screen recording: every half-drawn frame was recorded with the GPU busy) */
+	n = akita_mali_snapshot(snap, 192);
+	static uint32_t grace_us = 0xffffffff;
+	uint64_t grace_abs, until, released = 0;
+
+	if (grace_us == 0xffffffff && !PE_parse_boot_argn("fb_busy_grace_us", &grace_us, sizeof(grace_us))) {
+		grace_us = 2500;
+	}
+	nanoseconds_to_absolutetime((uint64_t)grace_us * NSEC_PER_USEC, &grace_abs);
+	/*
+	 * ... OR WITH ITS LAST COMMAND BUFFER JUST DONE (11-10): a frame CoreAnimation presents with its first stage, that
+	 * stage already finished and the GPU idle, the next not recorded yet -- shown at once before: the screen recording
+	 * caught the widgets page alone (no strip, cube or status bar) for a refresh in a swipe, and the tester saw such
+	 * glitches during swipes and Spotlight's opening once the GPU got faster (the memoryless attachments, a higher
+	 * touch row): the faster the first stage, the wider that window. The grace then runs from that finish.
+	 */
+	bool idle_recent = false;
+	static uint32_t idle_grace = 0xffffffff;        /* fb_idle_grace=0: not done (a comparison) */
+
+	if (idle_grace == 0xffffffff && !PE_parse_boot_argn("fb_idle_grace", &idle_grace, sizeof(idle_grace))) {
+		idle_grace = 1;
+	}
+	if (idle_grace && surface != NULL && milliseconds != 0 && grace_us != 0 && !busyNow(surface->sid) &&
+	    akita_mali_done(snap, n) && !wsRecorded(surface->sid)) {
+		released = releasedAt(surface->sid);
+		idle_recent = released != 0 && mach_absolute_time() - released < grace_abs;
+	}
+	if (surface != NULL && milliseconds != 0 && (busyNow(surface->sid) || !akita_mali_done(snap, n) || idle_recent)) {
+		uint64_t b0 = mach_absolute_time();
+
+		if (idle_recent) {
+			gIdleGraces++;
+		}
+
+		while (busyNow(surface->sid) && mach_absolute_time() < deadline) {
+			assert_wait_deadline((event_t)gBusy, THREAD_UNINT, deadline);
+			IOLockUnlock(gLock);
+			thread_block(THREAD_CONTINUE_NULL);
+			IOLockLock(gLock);
+		}
+		/*
+		 * ... AND A GRACE (11-10): CoreAnimation draws some frames in stages -- what a backdrop blurs is drawn and DONE
+		 * first, only then the blur and what is over it (the dock, Spotlight, the widgets page, sb_cube's windows) --
+		 * presenting with the first stage, before the next is even recorded. Marks gone while waiting, the next stage
+		 * may come: watched for fb_busy_grace_us (2500) more, a new mark waited for in turn. The screen recording
+		 * (rec=4) showed such frames: the home screen without its dock, the cube and the strip.
+		 */
+		until = idle_recent ? released + grace_abs : mach_absolute_time() + grace_abs;
+		while (grace_us != 0 && mach_absolute_time() < until && mach_absolute_time() < deadline) {
+			if (!busyNow(surface->sid) && wsRecorded(surface->sid)) {
+				gWSNoGrace++;
+				break;
+			}
+			if (busyNow(surface->sid)) {
+				gBusyStages++;
+				gIdleStages += idle_recent;
+				while (busyNow(surface->sid) && mach_absolute_time() < deadline) {
+					assert_wait_deadline((event_t)gBusy, THREAD_UNINT, deadline);
+					IOLockUnlock(gLock);
+					thread_block(THREAD_CONTINUE_NULL);
+					IOLockLock(gLock);
+				}
+				until = mach_absolute_time() + grace_abs;
+				continue;
+			}
+			assert_wait_deadline((event_t)gBusy, THREAD_UNINT, until);
+			IOLockUnlock(gLock);
+			thread_block(THREAD_CONTINUE_NULL);
+			IOLockLock(gLock);
+		}
+		gBusyWaits++;
+		gBusyWaitAbs += mach_absolute_time() - b0;
+	}
+	n = akita_mali_snapshot(snap, 192);
+	while (!(done = akita_mali_done(snap, n)) && mach_absolute_time() < deadline) {
+		/* until the GPU's JOB interrupt (a submission done) or a millisecond, the lock dropped meanwhile */
+		IOLockUnlock(gLock);
+		assert_wait_timeout((event_t)&mali_irq_event, THREAD_UNINT, 1000, NSEC_PER_USEC);
+		thread_block(THREAD_CONTINUE_NULL);
+		IOLockLock(gLock);
+	}
+	IOLockUnlock(gLock);
+	gDrawnWaitAbs += mach_absolute_time() - t0;
+	gDrawnLate += !done;
+	if (++gDrawnWaits % 1200 == 0) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(gDrawnWaitAbs, &ns);
+		IOLog("HakiosGPU: the display waited for the GPU %llu us a frame on average over %llu frames (%llu not in time)\n",
+		    ns / 1000 / gDrawnWaits, gDrawnWaits, gDrawnLate);
+		absolutetime_to_nanoseconds(gBusyWaitAbs, &ns);
+		IOLog("HakiosGPU: ... %llu of them waited for command buffers still drawing into the surface, %llu us each; %llu "
+		    "later stages caught in the grace (%llu of them after an idle GPU, %llu such graces); %llu graces cut short by "
+		    "the window server's word (%llu words)\n", gBusyWaits,
+		    gBusyWaits ? ns / 1000 / gBusyWaits : 0, gBusyStages, gIdleStages, gIdleGraces, gWSNoGrace, gWSFrames);
+		IOLog("HakiosGPU: memory of the phone's RAM the GPU holds: %llu MB in %u buffers of programs (the most so far %llu "
+		    "MB), %llu MB the driver's own (firmware, page tables, tiler heaps); IOSurfaces apart; given back while "
+		    "something else still had the memory: %llu buffers of %llu MB in all, %llu surfaces' buffers; kept until "
+		    "their VM's update: %u now (%llu MB), %u at most, %llu so far\n", gBoBytes >> 20,
+		    gBoCount, gBoPeak >> 20, akita_mali_kernel_bytes() >> 20, gBoHeldCount, gBoHeldBytes >> 20, gBoSurfaceHeldCount,
+		    gKeptCount, gKeptBytes >> 20, gKeptMost, gKeptEver);
+	}
+	return done;
+}
+
+/* waits, the lock dropped while it sleeps; true if they are done in time */
+bool
+HakiosGPUUserClient::waitPoints(const uint32_t *handles, const uint64_t *points, uint32_t count, uint32_t flags,
+    int64_t timeout, uint32_t *first)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline((uint32_t)MIN(timeout > 0 ? timeout / 1000 : 0, 10 * 1000 * 1000), kMicrosecondScale,
+	    &deadline);
+	for (;;) {
+		uint32_t reached = 0;
+		bool all = true;
+
+		for (uint32_t i = 0; i < count; i++) {
+			bool submitted;
+			struct syncobj *s = handles[i] && handles[i] <= MAX_SYNCS ? &fSyncs[handles[i] - 1] : NULL;
+
+			if (s != NULL && s->used && syncPointDone(s, points ? points[i] : 0, &submitted)) {
+				if (reached++ == 0 && first != NULL) {
+					*first = i;
+				}
+			} else {
+				all = false;
+			}
+		}
+		if ((flags & WAIT_ALL) ? all : reached > 0) {
+			akita_mali_flush();
+			return true;
+		}
+		if (mach_absolute_time() >= deadline) {
+			if (timeout > 0) {
+				akita_mali_debug();     /* where the queues stand, for the log */
+			}
+			return false;
+		}
+		/* until the GPU's JOB interrupt (a submission counted done: hakios.akita_mali.c's mali_irq) or a millisecond */
+		IOLockUnlock(gLock);
+		assert_wait_timeout((event_t)&mali_irq_event, THREAD_UNINT, 1000, NSEC_PER_USEC);
+		thread_block(THREAD_CONTINUE_NULL);
+		IOLockLock(gLock);
+	}
+}
+
+IOReturn
+HakiosGPUUserClient::devQuery(struct drm_panthor_dev_query *q)
+{
+	union {
+		struct drm_panthor_gpu_info gpu;
+		struct drm_panthor_csif_info csif;
+		struct drm_panthor_timestamp_info ts;
+		struct drm_panthor_group_priorities_info prio;
+	} u;
+	static uint32_t regs[256], csif[5];
+	uint32_t size;
+
+	bzero(&u, sizeof(u));
+	akita_mali_info(regs, csif);
+	switch (q->type) {
+	case 0:
+		size = sizeof(u.gpu);
+		u.gpu.gpu_id = regs[0];
+		u.gpu.csf_id = regs[0x1c / 4];
+		u.gpu.l2_features = regs[0x04 / 4];
+		u.gpu.tiler_features = regs[0x0c / 4];
+		u.gpu.mem_features = regs[0x10 / 4];
+		u.gpu.mmu_features = regs[0x14 / 4];
+		u.gpu.thread_features = regs[0xac / 4];
+		u.gpu.max_threads = regs[0xa0 / 4];
+		u.gpu.thread_max_workgroup_size = regs[0xa4 / 4];
+		u.gpu.thread_max_barrier_size = regs[0xa8 / 4];
+		u.gpu.coherency_features = regs[0x300 / 4];
+		for (int i = 0; i < 4; i++) {
+			u.gpu.texture_features[i] = regs[0xb0 / 4 + i];
+		}
+		u.gpu.as_present = regs[0x18 / 4];
+		u.gpu.selected_coherency = 31;          /* none: the GPU does not snoop the processors' caches */
+		u.gpu.shader_present = regs[0x100 / 4] | (uint64_t)regs[0x104 / 4] << 32;
+		u.gpu.tiler_present = regs[0x110 / 4] | (uint64_t)regs[0x114 / 4] << 32;
+		u.gpu.l2_present = regs[0x120 / 4] | (uint64_t)regs[0x124 / 4] << 32;
+		u.gpu.core_features = regs[0x08 / 4];
+		u.gpu.gpu_features = regs[0x60 / 4] | (uint64_t)regs[0x64 / 4] << 32;
+		break;
+	case 1:
+		size = sizeof(u.csif);
+		u.csif.csg_slot_count = csif[0];
+		u.csif.cs_slot_count = csif[1];
+		u.csif.cs_reg_count = csif[2];
+		u.csif.scoreboard_slot_count = csif[3];
+		u.csif.unpreserved_cs_reg_count = csif[4];
+		break;
+	case 2:
+		size = sizeof(u.ts);
+		u.ts.timestamp_frequency = 24576000;    /* the system counter's, which the GPU's timestamp counts */
+		u.ts.current_timestamp = regs[0x98 / 4] | (uint64_t)regs[0x9c / 4] << 32;
+		break;
+	case 3:
+		size = sizeof(u.prio);
+		u.prio.allowed_mask = 0xf;
+		break;
+	default:
+		return kIOReturnBadArgument;
+	}
+	if (q->pointer == 0) {
+		q->size = size;
+		return kIOReturnSuccess;
+	}
+	if (copyout(&u, (user_addr_t)q->pointer, MIN(q->size, size)) != 0) {
+		return kIOReturnBadArgument;
+	}
+	return kIOReturnSuccess;
+}
+
+IOReturn
+HakiosGPUUserClient::vmBind(struct drm_panthor_vm_bind *b)
+{
+	struct drm_panthor_vm_bind_op op;
+	bool unmapped = false;
+	static uint32_t binds, pages;
+
+	if (!ownsVm(b->vm_id) || b->ops.stride < sizeof(op) - sizeof(op.syncs)) {
+		return kIOReturnBadArgument;
+	}
+	for (uint32_t i = 0; i < b->ops.count; i++) {
+		bzero(&op, sizeof(op));
+		if (copyin((user_addr_t)(b->ops.array + (uint64_t)i * b->ops.stride), &op, MIN(b->ops.stride, sizeof(op))) != 0) {
+			return kIOReturnBadArgument;
+		}
+		if ((op.va | op.size) & 0xfff) {
+			return kIOReturnBadArgument;
+		}
+		switch (op.flags & BIND_OP_TYPE_MASK) {
+		case BIND_OP_TYPE_MAP: {
+			struct bo *bo = op.bo_handle && op.bo_handle <= MAX_BOS ? &fBos[op.bo_handle - 1] : NULL;
+
+			if (bo == NULL || bo->memory == NULL || op.bo_offset + op.size > bo->size || op.bo_offset & 0xfff) {
+				return kIOReturnBadArgument;
+			}
+			/* a physically contiguous piece at a time (getPhysicalSegment once a piece, not once a page) */
+			for (uint64_t off = 0; off < op.size;) {
+				IOByteCount len = 0;
+				addr64_t phys = bo->memory->getPhysicalSegment(op.bo_offset + off, &len, kIOMemoryMapperNone);
+
+				if (off == 0 && binds < 16) {
+					IOLog("HakiosGPU: bind of buffer %u at 0x%llx: its first page at 0x%llx (the first 16 said)\n",
+					    op.bo_handle, op.va, (unsigned long long)phys);
+				}
+				if (phys == 0 || len < 0x1000) {
+					return kIOReturnNoMemory;
+				}
+				for (uint64_t piece = 0; piece + 0x1000 <= len && off < op.size; piece += 0x1000, off += 0x1000) {
+					if (!akita_mali_vm_map((int)b->vm_id, op.va + off, phys + piece, op.flags & 7)) {
+						return kIOReturnNoMemory;
+					}
+					pages++;
+				}
+			}
+			if (++binds % 500 == 0) {
+				IOLog("HakiosGPU: %u binds (%u pages); a map's update waits for the next submission\n", binds, pages);
+			}
+			break;
+		}
+		case BIND_OP_TYPE_UNMAP:
+			akita_mali_vm_unmap((int)b->vm_id, op.va, op.size);
+			unmapped = true;
+			break;
+		default:
+			break;                          /* SYNC_ONLY: nothing to do here, the binds are done at once */
+		}
+		/* binds happen at once: their signal operations are done ones */
+		for (uint32_t k = 0; k < op.syncs.count; k++) {
+			struct drm_panthor_sync_op so;
+			struct fence f = { -1, 0, 0 };
+
+			if (copyin((user_addr_t)(op.syncs.array + (uint64_t)k * op.syncs.stride), &so, sizeof(so)) == 0 &&
+			    (so.flags & SYNC_OP_SIGNAL)) {
+				syncSignal(so.handle, (so.flags & 0xff) == SYNC_OP_TIMELINE ? so.timeline_value : 0, &f);
+			}
+		}
+	}
+	/* before the VM's next submission (akita_mali_submit) -- an unmap too since 11-13: the memory it leaves is kept
+	 * until then (boRelease, the kept ones). gpu_unmap_now=1: an unmap updates at once, as before */
+	static uint32_t unmap_now = 0xffffffff;
+	if (unmap_now == 0xffffffff && !PE_parse_boot_argn("gpu_unmap_now", &unmap_now, sizeof(unmap_now))) {
+		unmap_now = 0;
+	}
+	if (unmapped && unmap_now) {
+		akita_mali_vm_flush((int)b->vm_id);
+	} else {
+		akita_mali_vm_flush_later((int)b->vm_id);
+	}
+	return kIOReturnSuccess;
+}
+
+IOReturn
+HakiosGPUUserClient::groupCreate(struct drm_panthor_group_create *c)
+{
+	uint32_t sizes[4];
+	struct drm_panthor_queue_create qc;
+	int slot = -1, g;
+
+	if (!ownsVm(c->vm_id) || c->queues.count == 0 || c->queues.count > 4) {
+		return kIOReturnBadArgument;
+	}
+	for (uint32_t i = 0; i < c->queues.count; i++) {
+		bzero(&qc, sizeof(qc));
+		if (copyin((user_addr_t)(c->queues.array + (uint64_t)i * c->queues.stride), &qc, MIN(c->queues.stride, sizeof(qc))) != 0) {
+			return kIOReturnBadArgument;
+		}
+		sizes[i] = qc.ringbuf_size;
+	}
+	for (int i = 0; i < MAX_CLIENT_GROUPS; i++) {
+		if (fGroups[i] < 0) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0) {
+		return kIOReturnNoResources;
+	}
+	g = akita_mali_group_new((int)c->vm_id, c->queues.count, sizes, (uint8_t)(c->priority * 4 + 2));
+	if (g < 0) {
+		return kIOReturnNoResources;
+	}
+	fGroups[slot] = g;
+	c->group_handle = (uint32_t)g + 1;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+HakiosGPUUserClient::groupSubmit(struct drm_panthor_group_submit *s)
+{
+	int g = group(s->group_handle);
+	struct drm_panthor_queue_submit qs;
+	struct drm_panthor_sync_op so;
+
+	if (g < 0) {
+		return kIOReturnBadArgument;
+	}
+	for (uint32_t i = 0; i < s->queue_submits.count; i++) {
+		uint64_t seqno;
+		struct fence f;
+
+		bzero(&qs, sizeof(qs));
+		if (copyin((user_addr_t)(s->queue_submits.array + (uint64_t)i * s->queue_submits.stride), &qs,
+		    MIN(s->queue_submits.stride, sizeof(qs))) != 0) {
+			return kIOReturnBadArgument;
+		}
+		/* its wait operations: waited for here, before the stream goes to the GPU */
+		for (uint32_t k = 0; k < qs.syncs.count; k++) {
+			if (copyin((user_addr_t)(qs.syncs.array + (uint64_t)k * qs.syncs.stride), &so, sizeof(so)) != 0) {
+				return kIOReturnBadArgument;
+			}
+			if (!(so.flags & SYNC_OP_SIGNAL)) {
+				uint64_t point = (so.flags & 0xff) == SYNC_OP_TIMELINE ? so.timeline_value : 0;
+
+				if (!waitPoints(&so.handle, &point, 1, WAIT_ALL | WAIT_FOR_SUBMIT, 10000000000LL, NULL)) {
+					return kIOReturnTimeout;
+				}
+			}
+		}
+		if (qs.stream_size != 0) {
+			seqno = akita_mali_submit(g, qs.queue_index, qs.stream_addr, qs.stream_size);
+			if (seqno == 0) {
+				return kIOReturnNoSpace;
+			}
+		} else {
+			seqno = akita_mali_reached(g, qs.queue_index);  /* only syncs: what the queue has reached */
+		}
+		f.group = (int16_t)g;
+		f.queue = (uint8_t)qs.queue_index;
+		f.seqno = seqno;
+		for (uint32_t k = 0; k < qs.syncs.count; k++) {
+			if (copyin((user_addr_t)(qs.syncs.array + (uint64_t)k * qs.syncs.stride), &so, sizeof(so)) == 0 &&
+			    (so.flags & SYNC_OP_SIGNAL)) {
+				syncSignal(so.handle, (so.flags & 0xff) == SYNC_OP_TIMELINE ? so.timeline_value : 0, &f);
+			}
+		}
+	}
+	return kIOReturnSuccess;
+}
+
+/*
+ * BUFFERS GIVEN BACK WHOSE MEMORY THE GPU MAY STILL REACH (11-13): the client's unmap waits for its VM's next update
+ * (vmBind), so the memory is kept here until every VM of the client that had binds waiting has been updated -- or has
+ * lost its address space, or is gone. Looked through at each call of any client and after a buffer is given back;
+ * when a quarter of the places or 64 MB are taken the VMs are updated at once. (gLock held)
+ */
+#define KEPT_BOS        1024
+static struct kept_bo {
+	IOMemoryDescriptor *memory;
+	MiniIOSurface *surface;
+	uint64_t size;
+	int vm[MAX_CLIENT_VMS];
+	uint64_t stamp[MAX_CLIENT_VMS];
+} gKept[KEPT_BOS];
+
+static void
+keptRelease(bool force)
+{
+	for (uint32_t i = 0; i < KEPT_BOS && gKeptCount != 0; i++) {
+		struct kept_bo *k = &gKept[i];
+		bool stale = false;
+
+		if (k->memory == NULL) {
+			continue;
+		}
+		for (int v = 0; v < MAX_CLIENT_VMS; v++) {
+			if (k->vm[v] > 0 && akita_mali_vm_stale(k->vm[v], k->stamp[v])) {
+				if (force) {
+					akita_mali_vm_flush(k->vm[v]);
+				} else {
+					stale = true;
+				}
+			}
+		}
+		if (stale) {
+			continue;
+		}
+		OSSafeReleaseNULL(k->memory);
+		if (k->surface != NULL) {
+			MiniIOSurfaceDrop(k->surface);
+			k->surface = NULL;
+		}
+		gKeptBytes -= k->size;
+		gKeptCount--;
+	}
+}
+
+/* a buffer given back: its memory released, and its surface let go if it was one's (gLock held) */
+void
+HakiosGPUUserClient::boRelease(int i)
+{
+	if (i < 0 || i >= MAX_BOS) {
+		return;
+	}
+	if (fBos[i].memory != NULL && fBos[i].surface == NULL) {
+		gBoBytes -= fBos[i].size;               /* (a surface's buffer is the surface's memory: not counted) */
+		gBoCount--;
+	}
+	OSSafeReleaseNULL(fBos[i].map);         /* (the program's mapping of it goes with it: boMap) */
+	if (fBos[i].memory != NULL && fBos[i].memory->getRetainCount() != 1) {
+		if (fBos[i].surface == NULL) {
+			gBoHeldBytes += fBos[i].size;
+			gBoHeldCount++;
+		} else {
+			gBoSurfaceHeldCount++;
+		}
+	}
+	/* (kept while a VM of this client has binds waiting for its update: see gKept) */
+	if (fBos[i].memory != NULL) {
+		struct kept_bo k;
+		bool waiting = false;
+
+		bzero(&k, sizeof(k));
+		for (int v = 0; v < MAX_CLIENT_VMS; v++) {
+			k.vm[v] = fVms[v];
+			if (fVms[v] > 0 && akita_mali_vm_unflushed(fVms[v], &k.stamp[v])) {
+				waiting = true;
+			} else {
+				k.vm[v] = -1;
+			}
+		}
+		if (waiting && (gKeptCount >= KEPT_BOS / 4 || gKeptBytes >= (64ULL << 20))) {
+			keptRelease(true);              /* (too many: the VMs updated now, these freed) */
+			for (int v = 0; v < MAX_CLIENT_VMS; v++) {
+				if (k.vm[v] > 0) {
+					akita_mali_vm_flush(k.vm[v]);
+				}
+			}
+			waiting = false;
+		}
+		if (waiting) {
+			for (uint32_t at = 0; at < KEPT_BOS; at++) {
+				if (gKept[at].memory == NULL) {
+					k.memory = fBos[i].memory;
+					k.surface = fBos[i].surface;
+					k.size = fBos[i].size;
+					gKept[at] = k;
+					gKeptCount++;
+					gKeptBytes += k.size;
+					gKeptEver++;
+					gKeptMost = gKeptCount > gKeptMost ? gKeptCount : gKeptMost;
+					fBos[i].memory = NULL;
+					fBos[i].surface = NULL;
+					break;
+				}
+			}
+		}
+	}
+	OSSafeReleaseNULL(fBos[i].memory);
+	if (fBos[i].surface != NULL) {
+		MiniIOSurfaceDrop(fBos[i].surface);
+		fBos[i].surface = NULL;
+	}
+	fBos[i].size = 0;
+}
+
+/*
+ * A buffer mapped for the calling program, the mapping kept with the buffer and undone when it is given back (11-13).
+ * IOConnectMapMemory64 / IOConnectUnmapMemory64 LEAKED EVERY SURFACE'S BUFFER: an IOSurface's buffer is an
+ * IOSubMemoryDescriptor of the surface's memory, whose mappings are kept with the PARENT -- where the same program's
+ * IOSurface mapping of the whole surface is too. The unmap call looks for "a mapping of this memory in this task"
+ * (kIOMapReference, any address) and found that one, made a sub-mapping of it and released that: the buffer's real
+ * mapping stayed in this user client's set until the program ended, and with it the surface's memory, wired, after
+ * the surface was gone. In backboardd, which draws every program's surfaces and never ends: the kernel's wired memory
+ * went from 0.8 to 4.6 GB in four minutes of Speedometer 3 (27 MB a second; WebKit's tiles) and the phone reset --
+ * the tester's run of 11-13, and probably the whole-phone crash of 11-12. Here the mapping is this driver's own
+ * (kIOMapUnique: made afresh, never looked up) and boRelease lets it go. (gLock held)
+ */
+IOReturn
+HakiosGPUUserClient::boMap(struct hakios_map *request)
+{
+	struct bo *bo = request->handle >= 1 && request->handle <= MAX_BOS ? &fBos[request->handle - 1] : NULL;
+
+	if (bo == NULL || bo->memory == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (bo->map == NULL) {
+		/* (a scan-out slot's pixels: write-combined, as clientMemoryForType says; a buffer of ours is by its descriptor) */
+		bo->map = bo->memory->createMappingInTask(current_task(), 0, kIOMapAnywhere | kIOMapUnique |
+		    (bo->surface != NULL && bo->surface->scanoutSlot > 0 ? kIOMapWriteCombineCache : 0));
+		if (bo->map == NULL) {
+			return kIOReturnNoMemory;
+		}
+	}
+	request->address = bo->map->getAddress();
+	request->size = bo->map->getLength();
+	return kIOReturnSuccess;
+}
+
+/*
+ * The memory of an IOSurface as a buffer (the Adreno service's surfaceBuffer, for the panthor interface): its pixels,
+ * from the page after the surface's shared state on (MiniIOSurface.h), bound and mapped like any buffer. The surface
+ * is held while the buffer is there; a surface that is a buffer of this client's already is that buffer again. A
+ * surface around a program's own memory is refused, as there. kHakiosDescribe: only described. (gLock held)
+ */
+IOReturn
+HakiosGPUUserClient::surfaceBuffer(struct hakios_surface *request)
+{
+	MiniIOSurface *s = MiniIOSurfaceCopy(request->surface);
+	IOMemoryDescriptor *memory;
+	uint64_t size;
+	int h;
+
+	if (s == NULL) {
+		return kIOReturnNotFound;
+	}
+	/* (a surface around a client's memory: not; one in a display scan-out slot, MiniIOMobileFramebuffer's zero copy: its
+	 * pixels are that slot's physical memory, in `client`) */
+	if (s->client != NULL && s->scanoutSlot <= 0) {
+		MiniIOSurfaceDrop(s);
+		return kIOReturnUnsupported;
+	}
+	size = round_page_64(s->info.allocSize);
+	request->size = size;
+	request->offset = s->info.offset;
+	request->rowBytes = s->info.bytesPerRow;
+	request->width = s->info.width;
+	request->height = s->info.height;
+	request->pixelFormat = s->info.pixelFormat;
+	request->planes = s->info.planeCount;
+	if (request->handle == kHakiosDescribe || size == 0 || size > (512ULL << 20)) {
+		request->handle = 0;
+		MiniIOSurfaceDrop(s);
+		return size == 0 || size > (512ULL << 20) ? kIOReturnNoMemory : kIOReturnSuccess;
+	}
+	for (h = 0; h < MAX_BOS; h++) {
+		if (fBos[h].memory != NULL && fBos[h].surface == s) {
+			request->handle = (uint32_t)h + 1;
+			MiniIOSurfaceDrop(s);           /* (held once, by that buffer) */
+			return kIOReturnSuccess;
+		}
+	}
+	for (h = 0; h < MAX_BOS && fBos[h].memory != NULL; h++) {
+	}
+	memory = h >= MAX_BOS ? NULL : s->scanoutSlot > 0 ? IOSubMemoryDescriptor::withSubRange(s->client, 0, size, kIODirectionInOut) :
+	    IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
+	if (memory == NULL) {
+		MiniIOSurfaceDrop(s);
+		return h < MAX_BOS ? kIOReturnNoMemory : kIOReturnNoResources;
+	}
+	fBos[h].memory = memory;
+	fBos[h].size = size;
+	fBos[h].surface = s;
+	request->handle = (uint32_t)h + 1;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
+    OSObject *target, void *reference)
+{
+	union {
+		uint8_t raw[128];
+		struct drm_panthor_dev_query devQuery;
+		struct drm_panthor_vm_create vmCreate;
+		struct drm_panthor_vm_destroy vmDestroy;
+		struct drm_panthor_vm_bind vmBind;
+		struct drm_panthor_vm_get_state vmState;
+		struct drm_panthor_bo_create boCreate;
+		struct drm_panthor_bo_mmap_offset boMmap;
+		struct drm_panthor_group_create groupCreate;
+		struct drm_panthor_group_destroy groupDestroy;
+		struct drm_panthor_group_submit groupSubmit;
+		struct drm_panthor_group_get_state groupState;
+		struct drm_panthor_tiler_heap_create heapCreate;
+		struct drm_panthor_tiler_heap_destroy heapDestroy;
+		struct drm_gem_close gemClose;
+		struct hakios_surface surface;
+		struct hakios_surface_busy surfaceBusy;
+		struct hakios_map map;
+		struct drm_syncobj_create syncCreate;
+		struct drm_syncobj_destroy syncDestroy;
+		struct drm_syncobj_wait syncWait;
+		struct drm_syncobj_timeline_wait syncTlWait;
+		struct drm_syncobj_array syncArray;
+		struct drm_syncobj_timeline_array syncTlArray;
+		struct drm_syncobj_transfer syncTransfer;
+	} r;
+	size_t size = args->structureInputSize;
+	IOReturn ret = kIOReturnSuccess;
+
+	if (args->structureInput == NULL || size > sizeof(r)) {
+		return kIOReturnBadArgument;
+	}
+	bzero(&r, sizeof(r));
+	memcpy(&r, args->structureInput, size);
+	IOLockLock(gLock);
+	if (!akita_mali_ready()) {
+		IOLockUnlock(gLock);
+		return kIOReturnNotReady;
+	}
+	if (gKeptCount != 0) {
+		keptRelease(false);
+	}
+	switch (selector) {
+	case kDevQuery:
+		ret = devQuery(&r.devQuery);
+		break;
+	case kVmCreate: {
+		int vm = -1, slot = -1;
+
+		for (int i = 0; i < MAX_CLIENT_VMS; i++) {
+			if (fVms[i] < 0) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot >= 0) {
+			vm = akita_mali_vm_new();
+		}
+		if (vm < 0) {
+			ret = kIOReturnNoResources;
+		} else {
+			fVms[slot] = vm;
+			r.vmCreate.id = (uint32_t)vm;
+		}
+		break;
+	}
+	case kVmDestroy:
+		for (int i = 0; i < MAX_CLIENT_VMS; i++) {
+			if (fVms[i] >= 0 && (uint32_t)fVms[i] == r.vmDestroy.id) {
+				akita_mali_vm_free(fVms[i]);
+				fVms[i] = -1;
+			}
+		}
+		break;
+	case kVmBind:
+		ret = vmBind(&r.vmBind);
+		break;
+	case kVmGetState:
+		r.vmState.state = 0;                    /* usable */
+		break;
+	case kBoCreate: {
+		uint64_t bytes = round_page_64(r.boCreate.size);
+		IOBufferMemoryDescriptor *memory;
+		int h;
+
+		for (h = 0; h < MAX_BOS && fBos[h].memory != NULL; h++) {
+		}
+		if (bytes == 0 || bytes > (512ULL << 20) || h == MAX_BOS) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		IOLockUnlock(gLock);
+		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+		    kIOMapWriteCombineCache, (vm_size_t)bytes, PAGE_SIZE);
+		IOLockLock(gLock);
+		if (memory == NULL || fBos[h].memory != NULL) {
+			OSSafeReleaseNULL(memory);
+			ret = kIOReturnNoMemory;
+			break;
+		}
+		bzero(memory->getBytesNoCopy(), (size_t)bytes);
+		fBos[h].memory = memory;
+		fBos[h].size = bytes;
+		gBoBytes += bytes;
+		gBoCount++;
+		gBoPeak = gBoBytes > gBoPeak ? gBoBytes : gBoPeak;
+		r.boCreate.size = bytes;
+		r.boCreate.handle = (uint32_t)h + 1;
+		break;
+	}
+	case kBoMmapOffset:
+		if (r.boMmap.handle == 0 || r.boMmap.handle > MAX_BOS || fBos[r.boMmap.handle - 1].memory == NULL) {
+			ret = kIOReturnBadArgument;
+		} else {
+			r.boMmap.offset = (uint64_t)r.boMmap.handle << 12;
+		}
+		break;
+	case kGemClose:
+		if (r.gemClose.handle >= 1 && r.gemClose.handle <= MAX_BOS) {
+			/* (unmapped from VMs by the program's own UNMAP binds first, as panthor's users do) */
+			boRelease((int)r.gemClose.handle - 1);
+		}
+		break;
+	case kGroupCreate:
+		ret = groupCreate(&r.groupCreate);
+		break;
+	case kGroupDestroy:
+		for (int i = 0; i < MAX_CLIENT_GROUPS; i++) {
+			if (fGroups[i] >= 0 && (uint32_t)fGroups[i] + 1 == r.groupDestroy.group_handle) {
+				akita_mali_group_free(fGroups[i]);
+				fGroups[i] = -1;
+			}
+		}
+		break;
+	case kGroupSubmit:
+		ret = groupSubmit(&r.groupSubmit);
+		break;
+	case kGroupGetState:
+		r.groupState.state = 0;
+		r.groupState.fatal_queues = 0;
+		break;
+	case kTilerHeapCreate: {
+		int slot = -1, h = -1;
+
+		for (int i = 0; i < MAX_CLIENT_HEAPS; i++) {
+			if (fHeaps[i] < 0) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot < 0 || !ownsVm(r.heapCreate.vm_id)) {
+			ret = slot < 0 ? kIOReturnNoResources : kIOReturnBadArgument;
+			break;
+		}
+		h = akita_mali_heap_new((int)r.heapCreate.vm_id, r.heapCreate.chunk_size, r.heapCreate.initial_chunk_count,
+		    r.heapCreate.max_chunks, r.heapCreate.target_in_flight, &r.heapCreate.tiler_heap_ctx_gpu_va,
+		    &r.heapCreate.first_heap_chunk_gpu_va);
+		if (h < 0) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		fHeaps[slot] = h;
+		r.heapCreate.handle = (uint32_t)slot + 1;
+		break;
+	}
+	case kTilerHeapDestroy:
+		if (r.heapDestroy.handle >= 1 && r.heapDestroy.handle <= MAX_CLIENT_HEAPS && fHeaps[r.heapDestroy.handle - 1] >= 0) {
+			akita_mali_heap_free(fHeaps[r.heapDestroy.handle - 1]);
+			fHeaps[r.heapDestroy.handle - 1] = -1;
+		} else {
+			ret = kIOReturnBadArgument;
+		}
+		break;
+	case kBoSetLabel:
+	case kSetUserMmioOffset:
+	case kBoSync:
+	case kBoQueryInfo:
+		break;                                  /* nothing to do here */
+	case kSyncobjCreate: {
+		int h;
+
+		for (h = 0; h < MAX_SYNCS && fSyncs[h].used; h++) {
+		}
+		if (h == MAX_SYNCS) {
+			ret = kIOReturnNoResources;
+			break;
+		}
+		bzero(&fSyncs[h], sizeof(fSyncs[h]));
+		fSyncs[h].used = true;
+		if (r.syncCreate.flags & SYNCOBJ_CREATE_SIGNALED) {
+			fSyncs[h].binary.group = -1;
+			fSyncs[h].binary_set = true;
+		}
+		r.syncCreate.handle = (uint32_t)h + 1;
+		break;
+	}
+	case kSyncobjDestroy:
+		if (r.syncDestroy.handle >= 1 && r.syncDestroy.handle <= MAX_SYNCS) {
+			fSyncs[r.syncDestroy.handle - 1].used = false;
+		}
+		break;
+	case kSyncobjWait:
+	case kSyncobjTimelineWait: {
+		bool timeline = selector == kSyncobjTimelineWait;
+		uint32_t count = timeline ? r.syncTlWait.count_handles : r.syncWait.count_handles;
+		uint32_t handles[64], first = 0;
+		uint64_t points[64];
+
+		if (count == 0 || count > 64 ||
+		    copyin((user_addr_t)(timeline ? r.syncTlWait.handles : r.syncWait.handles), handles, count * 4) != 0 ||
+		    (timeline && copyin((user_addr_t)r.syncTlWait.points, points, count * 8) != 0)) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		if (!waitPoints(handles, timeline ? points : NULL, count, timeline ? r.syncTlWait.flags : r.syncWait.flags,
+		    timeline ? r.syncTlWait.timeout_nsec : r.syncWait.timeout_nsec, &first)) {
+			ret = kIOReturnTimeout;
+		}
+		if (timeline) {
+			r.syncTlWait.first_signaled = first;
+		} else {
+			/* not Linux's: pad = 1 when a binary sync object waited for stands for a submission a restart after
+			 * a GPU fault counted done, its work lost (hakios-metal ends that command buffer in error) */
+			r.syncWait.pad = 0;
+			for (uint32_t i = 0; ret == kIOReturnSuccess && i < count; i++) {
+				struct syncobj *s = handles[i] && handles[i] <= MAX_SYNCS ? &fSyncs[handles[i] - 1] : NULL;
+
+				if (s != NULL && s->used && s->binary_set && s->binary.group >= 0 &&
+				    akita_mali_lost(s->binary.group, s->binary.queue, s->binary.seqno)) {
+					r.syncWait.pad = 1;
+				}
+			}
+			r.syncWait.first_signaled = first;
+		}
+		break;
+	}
+	case kSyncobjReset:
+	case kSyncobjSignal: {
+		uint32_t handles[64];
+		uint32_t count = r.syncArray.count_handles;
+		struct fence f = { -1, 0, 0 };
+
+		if (count > 64 || copyin((user_addr_t)r.syncArray.handles, handles, count * 4) != 0) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			if (handles[i] >= 1 && handles[i] <= MAX_SYNCS && fSyncs[handles[i] - 1].used) {
+				if (selector == kSyncobjReset) {
+					fSyncs[handles[i] - 1].binary_set = false;
+				} else {
+					syncSignal(handles[i], 0, &f);
+				}
+			}
+		}
+		break;
+	}
+	case kSyncobjQuery:
+	case kSyncobjTimelineSignal: {
+		uint32_t handles[64];
+		uint64_t points[64];
+		uint32_t count = r.syncTlArray.count_handles;
+		struct fence f = { -1, 0, 0 };
+
+		if (count > 64 || copyin((user_addr_t)r.syncTlArray.handles, handles, count * 4) != 0 ||
+		    copyin((user_addr_t)r.syncTlArray.points, points, count * 8) != 0) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			struct syncobj *s = handles[i] >= 1 && handles[i] <= MAX_SYNCS ? &fSyncs[handles[i] - 1] : NULL;
+
+			if (s == NULL || !s->used) {
+				continue;
+			}
+			if (selector == kSyncobjTimelineSignal) {
+				syncSignal(handles[i], points[i], &f);
+			} else {
+				uint64_t value = 0;
+
+				for (uint32_t k = 0; k < s->points; k++) {
+					if ((r.syncTlArray.flags & 1) || done(&s->pf[k])) {
+						value = MAX(value, s->point[k]);
+					}
+				}
+				points[i] = value;
+			}
+		}
+		if (selector == kSyncobjQuery && copyout(points, (user_addr_t)r.syncTlArray.points, count * 8) != 0) {
+			ret = kIOReturnBadArgument;
+		}
+		break;
+	}
+	case kSyncobjTransfer: {
+		struct syncobj *src = r.syncTransfer.src_handle >= 1 && r.syncTransfer.src_handle <= MAX_SYNCS ?
+		    &fSyncs[r.syncTransfer.src_handle - 1] : NULL;
+		struct fence f = { -1, 0, 0 };
+
+		if (src == NULL || !src->used) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		if (r.syncTransfer.src_point == 0) {
+			if (src->binary_set) {
+				f = src->binary;
+			}
+		} else {
+			for (uint32_t k = 0; k < src->points; k++) {
+				if (src->point[k] >= r.syncTransfer.src_point) {
+					f = src->pf[k];
+					break;
+				}
+			}
+		}
+		syncSignal(r.syncTransfer.dst_handle, r.syncTransfer.dst_point, &f);
+		break;
+	}
+	case kHakiosSurface:
+		ret = surfaceBuffer(&r.surface);
+		break;
+	case kHakiosMap:
+		ret = boMap(&r.map);
+		break;
+	case kHakiosSurfaceBusy: {
+		int at = -1;
+
+		/* the client's own account first: it can only take back what it marked */
+		for (int i = 0; i < 16; i++) {
+			if (fBusy[i].count > 0 && fBusy[i].sid == r.surfaceBusy.surface) {
+				at = i;
+				break;
+			}
+			if (at < 0 && fBusy[i].count == 0 && r.surfaceBusy.delta > 0) {
+				at = i;
+			}
+		}
+		if (at < 0 || r.surfaceBusy.delta == 0 || r.surfaceBusy.delta > 1 || r.surfaceBusy.delta < -1 ||
+		    (r.surfaceBusy.delta < 0 && fBusy[at].count <= 0)) {
+			break;                          /* (no room, or nothing of its to take back: not marked) */
+		}
+		/*
+		 * NOT INTO THE SURFACE ON THE PANEL (11-10): a command buffer beginning to draw into the surface the panel shows
+		 * waits until the panel has moved on (25 ms at most) -- as Apple's GPU holds work for a surface the display still
+		 * scans. CoreAnimation, double buffered, begins its next frame in the surface shown (the screen recording's half
+		 * drawn frames); SwapWait need not hold it back for this (it answers at once again: fb_swapwait=0 default).
+		 */
+		static uint32_t hold = 0xffffffff;
+
+		if (hold == 0xffffffff && !PE_parse_boot_argn("gpu_hold", &hold, sizeof(hold))) {
+			hold = 0;       /* (off: with SwapWait answered once a swap's switch is set up it is not needed, and it can
+					 * stall -- CoreAnimation's thread held for the surface on the panel while the frame that would
+					 * move the panel on waits for that same thread: 12 ms a frame, 55 a second) */
+		}
+		if (hold && r.surfaceBusy.delta > 0 && r.surfaceBusy.surface == hakios_fb_shown_surface()) {
+			static uint32_t held, held_ms;
+
+			held++;
+			for (int ms = 0; ms < 25 && r.surfaceBusy.surface == hakios_fb_shown_surface(); ms++) {
+				IOLockUnlock(gLock);
+				IOSleep(1);
+				IOLockLock(gLock);
+				held_ms++;
+			}
+			if (held % 2000 == 1) {
+				IOLog("HakiosGPU: %u command buffers held until the panel left their surface, %u ms in all\n", held,
+				    held_ms);
+			}
+		}
+		fBusy[at].sid = r.surfaceBusy.surface;
+		fBusy[at].count += r.surfaceBusy.delta;
+		busyChange(r.surfaceBusy.surface, r.surfaceBusy.delta);
+		break;
+	}
+	case kHakiosSurfaceGate: {
+		/*
+		 * NOT WHILE THE PANEL READS IT (11-10): a command buffer about to be submitted that draws into the surface on the
+		 * panel waits here until the panel has moved on to the next frame (25 ms at most). CoreAnimation, double
+		 * buffered, records its next frame into the surface the panel still shows -- it does not wait for SwapWait
+		 * (another thread) -- and the GPU then overwrote what the panel was reading: ~37 % of frames with the cube
+		 * turning, tearing the tester saw in every swipe (the screen recording, made as the panel begins reading a
+		 * frame, never shows it). Held at the SUBMISSION, not at the first draw as gpu_hold did: the recording of the
+		 * next frame still overlaps the GPU's work on this one, so 120 a second stays possible. The panel's switch
+		 * wakes the wait (hakios_fb_shown_event). Boot-arg gpu_gate=0: not done.
+		 */
+		static uint32_t gate = 0xffffffff, gated, timeouts;
+		static uint64_t gated_abs;
+
+		if (gate == 0xffffffff && !PE_parse_boot_argn("gpu_gate", &gate, sizeof(gate))) {
+			gate = 1;
+		}
+		if (!gate || r.surfaceBusy.surface == 0 || r.surfaceBusy.surface != hakios_fb_shown_surface()) {
+			break;
+		}
+		uint64_t t0 = mach_absolute_time(), deadline;
+
+		clock_interval_to_deadline(25, kMillisecondScale, &deadline);
+		IOLockUnlock(gLock);
+		while (r.surfaceBusy.surface == hakios_fb_shown_surface()) {
+			assert_wait_deadline(hakios_fb_shown_event(), THREAD_UNINT, deadline);
+			if (r.surfaceBusy.surface != hakios_fb_shown_surface()) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+				break;
+			}
+			if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+				timeouts++;
+				break;
+			}
+		}
+		IOLockLock(gLock);
+		gated++;
+		gated_abs += mach_absolute_time() - t0;
+		if (gated % 2000 == 1) {
+			uint64_t ns;
+
+			absolutetime_to_nanoseconds(gated_abs, &ns);
+			IOLog("HakiosGPU: %u submissions held until the panel left their surface, %llu us each, %u after 25 ms\n", gated,
+			    ns / 1000 / gated, timeouts);
+		}
+		break;
+	}
+	case kHakiosDebug:
+		akita_mali_debug();
+		break;
+	default:
+		IOLog("HakiosGPU: request %#x (%zu bytes) is not answered here yet\n", selector, size);
+		ret = kIOReturnUnsupported;
+		break;
+	}
+	IOLockUnlock(gLock);
+	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
+		memcpy(args->structureOutput, &r, MIN(args->structureOutputSize, sizeof(r)));
+	}
+	return ret;
+}
