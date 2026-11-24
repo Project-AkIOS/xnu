@@ -1,0 +1,368 @@
+/*
+ * /dev/hakios-touch: a queue of touch samples (see sys/hakios.input.h).
+ */
+#include <kern/clock.h>
+#include <kern/locks.h>
+#include <kern/thread_call.h>
+#include <libkern/libkern.h>
+#include <miscfs/devfs/devfs.h>
+#include <sys/conf.h>
+#include <sys/errno.h>
+#include <sys/proc.h>
+#include <sys/hakios.input.h>
+#include <sys/systm.h>
+#include <sys/uio.h>
+#include <pexpert/pexpert.h>
+
+#define TOUCH_QUEUE     512             /* records; a power of two */
+
+/*
+ * Boot-arg touch_lat=1: for measuring how long a touch takes to reach the panel, a line for every
+ * sample posted ("tl: p TYPE FINGER X Y at US", the time in microseconds of mach_absolute_time),
+ * to be matched with the window server's lines about reading it (userland/src/inject.c), drawing
+ * (eagl.c) and the display driver's about the frame (MiniIOMobileFramebuffer.cpp): see
+ * tools/latency.py.
+ */
+static uint32_t touch_lat = 2;          /* 2: not yet looked up */
+
+extern void loader_log_line(const char *line);
+
+/*
+ * A "tl:" line, for the kernel's drivers: into the loader's log as it is written -- the kernel's own
+ * log keeps only the last of a run, and a live look at the loader's (XL_FOLLOW) then misses nothing.
+ */
+void hakios_tl(const char *format, ...) __printflike(1, 2);
+
+void
+hakios_tl(const char *format, ...)
+{
+	char line[192];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	loader_log_line(line);
+}
+
+static bool
+latency_lines(void)
+{
+	if (touch_lat == 2) {
+		uint32_t on = 0;
+
+		touch_lat = PE_parse_boot_argn("touch_lat", &on, sizeof(on)) && on != 0;
+	}
+	return touch_lat != 0;
+}
+
+static LCK_GRP_DECLARE(touch_lck_grp, "hakios-touch");
+static LCK_MTX_DECLARE(touch_lock, &touch_lck_grp);
+static struct hakios_touch touch_queue[TOUCH_QUEUE];
+static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
+/*
+ * /dev/hakios-touch-tap (minor 1): a copy of every sample for a watcher, beside the queue the window server reads
+ * (minor 0; a second reader of that one would take its samples). Filled only while someone has it open; boot-arg
+ * show_taps=1 draws the fingers on the screen from it (userland/src/inject_cube.m, in SpringBoard).
+ */
+static struct hakios_touch tap_queue[TOUCH_QUEUE];
+static uint32_t tap_head, tap_tail;
+static int tap_readers;
+
+/*
+ * The way out when nothing else is at hand: five fingers held on the screen for a second and a
+ * half end the run -- control goes back to the loader, as when loader_return_after expires.
+ * Only a driver's fingers count, not samples a program writes to the device.
+ */
+#define EXIT_FINGERS    5
+#define EXIT_HOLD_MS    1500
+
+extern void loader_return(void);
+
+static thread_call_t exit_call;
+static uint32_t fingers_down;           /* one bit for each finger a driver says is down */
+
+static void
+exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	printf("\n--- %d fingers held on the screen for %d ms: back to the loader ---\n", EXIT_FINGERS, EXIT_HOLD_MS);
+	hakios_adreno_stop();
+	loader_return();
+}
+
+/* With touch_lock held. */
+static void
+count_fingers(uint32_t type, uint32_t finger)
+{
+	int before = __builtin_popcount(fingers_down), now;
+	uint64_t deadline;
+
+	if (finger >= 32 || exit_call == NULL || (type != HAKIOS_TOUCH_DOWN && type != HAKIOS_TOUCH_UP)) {
+		return;
+	}
+	if (type == HAKIOS_TOUCH_DOWN) {
+		fingers_down |= 1u << finger;
+	} else {
+		fingers_down &= ~(1u << finger);
+	}
+	now = __builtin_popcount(fingers_down);
+	if (now >= EXIT_FINGERS && before < EXIT_FINGERS) {
+		clock_interval_to_deadline(EXIT_HOLD_MS, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(exit_call, deadline);
+	} else if (now < EXIT_FINGERS && before >= EXIT_FINGERS) {
+		thread_call_cancel(exit_call);
+	}
+}
+
+/*
+ * What the fingers' samples were like, said every 8 strokes: the lines of touch_lat=1 are many, and a long run's log keeps only its
+ * beginning and its end. From the first move after a finger came down, between moves, and from the last move to its lift.
+ */
+static struct {
+	uint64_t last;
+	uint32_t strokes, moves, firsts, slow_moves, longest_move, first_sum, first_longest, lift_sum, lift_longest;
+	uint32_t finger;
+	bool down, moved;
+} touch_feel;
+
+static void
+touch_feel_add(uint32_t type, uint32_t finger, uint64_t now)
+{
+	uint64_t nanos;
+	uint32_t ms;
+
+	if (type == HAKIOS_TOUCH_DOWN && !touch_feel.down) {
+		touch_feel.down = true;
+		touch_feel.moved = false;
+		touch_feel.finger = finger;
+		touch_feel.last = now;
+		return;
+	}
+	if (!touch_feel.down || finger != touch_feel.finger) {
+		return;
+	}
+	absolutetime_to_nanoseconds(now - touch_feel.last, &nanos);
+	ms = (uint32_t)(nanos / 1000000);
+	touch_feel.last = now;
+	if (type == HAKIOS_TOUCH_UP) {
+		touch_feel.down = false;
+		touch_feel.strokes++;
+		touch_feel.lift_sum += ms;
+		touch_feel.lift_longest = ms > touch_feel.lift_longest ? ms : touch_feel.lift_longest;
+		if (touch_feel.strokes % 8 == 0) {
+			printf("touch: %u strokes: first move after %u ms on average, %u at most; %u moves, %u of them over 13 ms apart, %u at most; "
+			    "the lift %u ms after the last move on average, %u at most\n", touch_feel.strokes,
+			    touch_feel.firsts != 0 ? touch_feel.first_sum / touch_feel.firsts : 0, touch_feel.first_longest, touch_feel.moves,
+			    touch_feel.slow_moves, touch_feel.longest_move, touch_feel.lift_sum / touch_feel.strokes, touch_feel.lift_longest);
+		}
+	} else if (!touch_feel.moved) {
+		touch_feel.moved = true;
+		touch_feel.firsts++;
+		touch_feel.first_sum += ms;
+		touch_feel.first_longest = ms > touch_feel.first_longest ? ms : touch_feel.first_longest;
+	} else {
+		touch_feel.moves++;
+		touch_feel.slow_moves += ms > 13;
+		touch_feel.longest_move = ms > touch_feel.longest_move ? ms : touch_feel.longest_move;
+	}
+}
+
+/* a device's governor told of each touch (the Pixel 8a's DVFS raises the GPU's clock for a while), or NULL */
+void (*hakios_touch_interaction)(void);
+
+static void
+touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
+{
+	struct hakios_touch *t;
+
+	lck_mtx_lock(&touch_lock);
+	if (touch_tail - touch_head == TOUCH_QUEUE) {
+		touch_head++;                   /* nobody reads: drop the oldest */
+	}
+	t = &touch_queue[touch_tail++ % TOUCH_QUEUE];
+	t->time = mach_absolute_time();
+	if (from_driver) {
+		touch_feel_add(type, finger, t->time);
+	}
+	if (latency_lines()) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(t->time, &ns);
+		hakios_tl("tl: p %u %u %u %u at %llu\n", type, finger, x, y, ns / 1000);
+	}
+	t->type = type;
+	t->finger = finger;
+	t->x = x > 65535 ? 65535 : x;
+	t->y = y > 65535 ? 65535 : y;
+	if (from_driver) {
+		count_fingers(type, finger);
+	}
+	if (tap_readers > 0) {
+		if (tap_tail - tap_head == TOUCH_QUEUE) {
+			tap_head++;
+		}
+		tap_queue[tap_tail++ % TOUCH_QUEUE] = *t;
+	}
+	lck_mtx_unlock(&touch_lock);
+	wakeup(&touch_queue);
+	if (tap_readers > 0) {
+		wakeup(&tap_queue);
+	}
+	if (hakios_touch_interaction != NULL && (type == HAKIOS_TOUCH_DOWN || type == HAKIOS_TOUCH_MOVE)) {
+		hakios_touch_interaction();     /* (a device's clocks raised while a finger is on the glass) */
+	}
+}
+
+/* the displayed area on the panel (MiniIOMobileFramebuffer's: left, top, width, height in 65536ths of the panel) */
+extern uint32_t hakios_touch_view[4];
+
+/* a coordinate on the panel as one in the displayed area, both 0..65535 (a finger outside it at the nearest edge) */
+static uint32_t
+touch_into_view(uint32_t v, uint32_t from, uint32_t size)
+{
+	if (size == 0 || size >= 65536) {
+		return v;
+	}
+	if (v <= from) {
+		return 0;
+	}
+	v = (uint32_t)((uint64_t)(v - from) * 65535 / size);
+	return v > 65535 ? 65535 : v;
+}
+
+void
+hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+	touch_post(type, finger, touch_into_view(x, hakios_touch_view[0], hakios_touch_view[2]),
+	    touch_into_view(y, hakios_touch_view[1], hakios_touch_view[3]), true);
+}
+
+static int
+touch_open(dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+{
+	if (minor(dev) == 1) {
+		lck_mtx_lock(&touch_lock);
+		if (tap_readers++ == 0) {
+			tap_head = tap_tail = 0;        /* (from now, not what was left) */
+		}
+		lck_mtx_unlock(&touch_lock);
+	}
+	return 0;
+}
+
+static int
+touch_close(dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+{
+	if (minor(dev) == 1) {
+		lck_mtx_lock(&touch_lock);
+		if (tap_readers > 0) {
+			tap_readers--;
+		}
+		lck_mtx_unlock(&touch_lock);
+	}
+	return 0;
+}
+
+static int
+touch_read(dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct hakios_touch t;
+	int error = 0, moved = 0;
+	/* minor 0: the queue; minor 1: the watcher's copy of it */
+	struct hakios_touch *ring = minor(dev) == 1 ? tap_queue : touch_queue;
+	uint32_t *head = minor(dev) == 1 ? &tap_head : &touch_head, *tail = minor(dev) == 1 ? &tap_tail : &touch_tail;
+
+	/* a buffer smaller than one record can never be served: say so, instead of blocking for data and then returning 0 (end of file) */
+	if (uio_resid(uio) == 0) {
+		return 0;
+	}
+	if (uio_resid(uio) < (user_ssize_t)sizeof(t)) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&touch_lock);
+	while (*head == *tail) {
+		error = msleep(ring, &touch_lock, PZERO | PCATCH, "hakios-touch", NULL);
+		if (error) {
+			lck_mtx_unlock(&touch_lock);
+			return error;
+		}
+	}
+	while (*head != *tail && uio_resid(uio) >= (user_ssize_t)sizeof(t)) {
+		t = ring[(*head)++ % TOUCH_QUEUE];
+		lck_mtx_unlock(&touch_lock);
+		error = uiomove((caddr_t)&t, sizeof(t), uio);
+		lck_mtx_lock(&touch_lock);
+		if (error) {
+			/* the copy-out failed: put the record back at the head so a lost DOWN or UP does not leave a finger stuck (only if the ring still has room for it) */
+			if (*tail - *head < TOUCH_QUEUE) {
+				ring[--(*head) % TOUCH_QUEUE] = t;
+			}
+			break;
+		}
+		moved++;
+	}
+	lck_mtx_unlock(&touch_lock);
+	return moved ? 0 : error;
+}
+
+static int
+touch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct hakios_touch t;
+	int error = 0;
+
+	while (uio_resid(uio) >= (user_ssize_t)sizeof(t)) {
+		error = uiomove((caddr_t)&t, sizeof(t), uio);
+		if (error) {
+			break;
+		}
+		if (t.type < HAKIOS_TOUCH_DOWN || t.type > HAKIOS_BUTTON_UP) {
+			return EINVAL;
+		}
+		touch_post(t.type, t.finger, t.x, t.y, false);
+	}
+	return error;
+}
+
+/*
+ * (11-23) touches and buttons from the kernel itself, the way /dev/hakios-touch takes them (x, y 0..65535 across the
+ * screen; buttons: finger = HAKIOS_BUTTON_*): the USB cable's touch ports (drivers/usb/hakios.akita_usbmux.c,
+ * devices/akita/tools/usbmux-touch.py), so the host can tap with nobody at the phone.
+ */
+void hakios_touch_inject(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+void
+hakios_touch_inject(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+	if (type >= HAKIOS_TOUCH_DOWN && type <= HAKIOS_BUTTON_UP) {
+		touch_post(type, finger, x, y, false);
+	}
+}
+
+static const struct cdevsw touch_cdevsw = {
+	.d_open = touch_open, .d_close = touch_close, .d_read = touch_read, .d_write = touch_write,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+void
+hakios_input_init(void)
+{
+	int major = cdevsw_add(-1, &touch_cdevsw);
+
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-touch") == NULL ||
+	    devfs_make_node(makedev(major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0444, "hakios-touch-tap") == NULL) {
+		printf("hakios-touch: cannot create the device\n");
+	}
+	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	hakios_cpufreq_init();
+	hakios_virtio_input_init();
+	hakios_goodix_init();
+	hakios_buttons_init();
+	hakios_battery_init();
+	hakios_ufs_init();
+	hakios_net_init();
+	hakios_adreno_init();
+	hakios_wifi_init();
+	hakios_adsp_init();
+	hakios_mpss_init();
+}
