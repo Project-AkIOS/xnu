@@ -71,6 +71,7 @@
 #include <libkern/kernel_mach_header.h>
 #include <libkern/stack_protector.h>
 #include <libkern/section_keywords.h>
+#include <arm64/akios_pstore.h>
 #if HAKIOS_USER_PAC
 #include <arm64/hakios_pac.h>
 #endif /* HAKIOS_USER_PAC */
@@ -373,6 +374,7 @@ arm_init(
 	/* If kernel integrity is supported, use a constant copy of the boot args. */
 	const_boot_args = *args;
 	BootArgs = args = &const_boot_args;
+	akios_pstore_early(args);       /* the console into the phone's persistent RAM from here on */
 
 #if APPLEVIRTUALPLATFORM
 	reset_vector_vaddr = (vm_offset_t) &LowResetVectorBase;
@@ -598,6 +600,7 @@ arm_init(
 	pmap_first_pnum = (ppnum_t)atop(gDramBase);
 
 	arm_vm_init(xmaxmem, args);
+	akios_pstore_init();
 	loader_checkpoint(17);
 
 	if (debug_boot_arg) {

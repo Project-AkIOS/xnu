@@ -25,6 +25,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
+#include <arm64/akios_pstore.h>
 #include <vm/vm_page.h>
 #if __has_include(<vm/vm_compressor_xnu.h>)
 /* xnu-12377 split vm_compressor.h; the compressor object and its counters are here now. */
@@ -134,6 +135,7 @@ loader_log_line(const char *line)
 static void
 loader_log_put_locked(char c)
 {
+	akios_pstore_putc(c);           /* the console in the phone's persistent RAM too (akios_pstore.c) */
 	if (!loader_log_linear) {
 		loader_log_total++;
 	}

@@ -40,6 +40,7 @@
 
 #include <machine/atomic.h>
 #include <arm64/proc_reg.h>
+#include <arm64/akios_pstore.h>
 #include <arm64/lowglobals.h>
 #include <arm/cpu_data_internal.h>
 #include <arm/misc_protos.h>
@@ -2166,6 +2167,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 	ml_enable_monitor();
 
+	akios_pstore_suspend();         /* its early mapping is in the identity map that goes now */
 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
 
 	flush_mmu_tlb();

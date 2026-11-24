@@ -134,6 +134,7 @@ osfmk/kern/memory_error_logging.c	standard
 # HakiOS
 osfmk/arm64/generic_arm64_support.c	optional nos_arm_asm
 osfmk/arm64/loader_return.c	optional nos_arm_asm
+osfmk/arm64/akios_pstore.c	optional nos_arm_asm
 osfmk/arm64/user_exception_trace.c	standard
 osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 osfmk/arm64/psci_smp.c	optional nos_arm_asm
