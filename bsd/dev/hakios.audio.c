@@ -17,7 +17,7 @@
  *
  *               With rec_sound_fed=1 as well, the recording has instead what the speakers' guard
  *               let through (hakios.guard.c, on the phone): what reaches the amplifiers. With
- *               rec_sound_mic=1, what the main microphone hears (hakios.mic.c, mic=3), in both
+ *               rec_sound_mic=1, what the main microphone hears (hakios.akita_aoc.c, aocrec=1), in both
  *               channels.
  *
  * When the writer has stopped, a line in the log says how long it wrote, at what rate, how much
@@ -72,7 +72,7 @@ static hakios_audio_sink_t audio_sink;
 
 static uint8_t *rec_base;
 static bool rec_fed;                    /* boot-arg rec_sound_fed=1: what the guard let through is recorded, not what was written */
-static bool rec_mic;                    /* boot-arg rec_sound_mic=1: what the microphone hears (hakios.mic.c) */
+static bool rec_mic;                    /* boot-arg rec_sound_mic=1: what the microphone hears (hakios.akita_aoc.c) */
 static uint64_t rec_size, rec_used;
 static uint64_t rec_frames, rec_frames_max;
 
@@ -255,7 +255,7 @@ audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 }
 
 /* the speakers' volume, as Darwin sets it (sys/hakios.audio.h): kept for the sink's driver to look at */
-#define HAKIOS_AUDIO_BELOW_MAX  (90 * 8)        /* eighths of a dB: the amplifiers' own lowest volume (speaker.c VOLUME_LOWEST) */
+#define HAKIOS_AUDIO_BELOW_MAX  (90 * 8)        /* eighths of a dB: the amplifiers' own lowest volume */
 static uint32_t volume_below, volume_generation;
 static bool volume_muted;
 
@@ -269,7 +269,7 @@ audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags
 		return ENOTTY;
 	}
 	/*
-	 * The amplifiers go no lower than -90 dB (hakios.speaker.c's VOLUME_LOWEST, the "mute volume"): a larger `below'
+	 * The amplifiers go no lower than -90 dB (the "mute volume"): a larger `below'
 	 * means nothing there, and from user space (the node is open to all) it would make the sums made with it
 	 * (sound_below + below) wrap round to a level far louder than the one asked for.
 	 */
@@ -356,7 +356,6 @@ hakios_audio_init(void)
 	}
 	report_call = thread_call_allocate(audio_report, NULL);
 	audio_recording_init();
-	hakios_speaker_init();
 	hakios_haptic_init();
 	hakios_torch_init();
 	hakios_camera_init();

@@ -1,7 +1,7 @@
 /*
  * A file of one of this port's RAM disks, by path, for the drivers that want one before there is
- * a root or without asking it: the GPU's firmware (hakios.adreno.c), the Wi-Fi DSP's
- * (hakios.wifi.c), the audio DSP's (hakios.adsp.c) -- "fw/NAME" of the image that travels with
+ * a root or without asking it: the Pixel 8a's GPU, Wi-Fi, Bluetooth, modem, haptics and
+ * AoC firmware (hakios.akita_*.c) -- "fw/NAME" of the image that travels with
  * the kernel (md1; md0 when there is nothing else) or of the resident one (md0).
  *
  * The image is an APFS container (tools/apfs/mkapfs.py: what userland/build.sh makes).  A file

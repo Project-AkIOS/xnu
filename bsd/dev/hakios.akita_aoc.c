@@ -929,7 +929,7 @@ aoc_talk(void)
 
 /* ---- Darwin's sound through the AoC (aocsound=1, with aoc=3 and amp=2) -------------------------------------------------
  * What the audio server mixes (userland/src/audio_plugin.c -> /dev/hakios-audio, drivers/audio/hakios.audio.c) to the
- * speakers, as redwood's sound=4 does it (drivers/audio/hakios.sound.c): the writer's frames into a ring of ours (never
+ * speakers, as redwood's sound=4 did it: the writer's frames into a ring of ours (never
  * waiting); a feeder thread keeps audio_playback0's ring (80 ms) three 20 ms blocks full, each block from our ring (the
  * rest silence) through the speakers' guard (drivers/audio/hakios.guard.c: the CS35L41s run without their protection
  * DSP), so the AoC's stream never stops; the amplifiers are powered up when a write is not silence and down after three
@@ -1360,7 +1360,7 @@ aoc_mic_stop(void)
 }
 
 /*
- * aocrec=1: the microphone for Darwin -- /dev/hakios-mic, as redwood's hakios.mic.c (mic=4) gives it to
+ * aocrec=1: the microphone for Darwin -- /dev/hakios-mic, as redwood's mic=4 gave it to
  * HakiosAudio.driver's device "Codec" (userland/src/audio_plugin.c), of which the virtual audio device makes the
  * built-in microphone: 16-bit samples, one channel (mic 0), 48 kHz; a read never waits, keeping the reader about 40 ms
  * behind; nothing until that much is there. The AoC records (aoc_mic_start) only while the device is open -- an

@@ -111,7 +111,7 @@ battery_poll(void)
 }
 
 /*
- * What the audio DSP's battery manager says (drivers/audio/hakios.adsp.c, with adsp=1 unless battmgr=0):
+ * What the battery's driver says (hakios_battery_report(): hakios.akita_battery.c on the Pixel 8a):
  * the values that Android shows, from where Android takes them. They are kept here for the sysctls
  * and passed on to the power source that Darwin reads (drivers/power/hakios.battery.cpp).
  */

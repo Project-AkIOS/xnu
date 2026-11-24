@@ -9,8 +9,8 @@
  * and everything else follows from that: the status bar's battery, the lock screen's "Charging",
  * the Batteries widget, Settings > Battery.
  *
- * What the values are comes from the audio DSP's battery manager (drivers/audio/hakios.adsp.c,
- * with adsp=1, unless battmgr=0), by way of drivers/power/hakios.battery.c, which calls
+ * What the values are comes from the battery's driver (hakios.akita_battery.c on the Pixel 8a),
+ * by way of drivers/power/hakios.battery.c, which calls
  * HakiosBatteryReport() with every reading; the first one makes the service. Nothing here asks
  * the charger anything or tells it anything.
  *

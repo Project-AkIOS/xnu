@@ -10,7 +10,7 @@
  * A driver that is built gets none of this: every block below is for one driver, and empty when that one is in.
  *
  * What is not here, on purpose: a call from one driver to another that it cannot work without. That is a `requires`
- * of its conf (SOUND requires ADSP and SPEAKER, MODEM requires QMI and UFS, ...), and tools/hakios-config.py refuses
+ * of its conf (MODEM requires QMI and UFS, ...), and tools/hakios-config.py refuses
  * the configuration that would need a stand-in for it.
  */
 #include <stdbool.h>
@@ -22,14 +22,11 @@
 #include <sys/hakios.net.h>
 
 /* the ends of a run (loader_return.c, the guards), which have no header of their own */
-void hakios_adsp_stop(void);
-void hakios_adsp_quiesce(void);
 void hakios_mpss_stop(void);
 void hakios_mpss_quiesce(void);
 void hakios_ddr_quiesce(void);
 void hakios_ufs_quiesce(void);
 void hakios_var_save_on_return(void);
-void hakios_mic_quiesce(void);
 void HakiosWLANStart(const char *interface, const uint8_t *address);
 
 #ifndef HAKIOS_GOODIX
@@ -129,32 +126,10 @@ hakios_wifi_tell(const char *format, ...)
 }
 #endif
 
-#ifndef HAKIOS_ADSP
-void hakios_adsp_init(void) {}
-void hakios_adsp_stop(void) {}
-void hakios_adsp_quiesce(void) {}
-#endif
-
 #ifndef HAKIOS_MODEM
 void hakios_mpss_init(void) {}
 void hakios_mpss_stop(void) {}
 void hakios_mpss_quiesce(void) {}
-#endif
-
-#ifndef HAKIOS_SPEAKER
-void hakios_speaker_init(void) {}
-#endif
-
-#ifndef HAKIOS_SOUND
-void hakios_sound_dsp_up(void) {}
-void hakios_sound_dsp_down(void) {}
-void hakios_sound_quiesce(void) {}
-#endif
-
-#ifndef HAKIOS_MIC
-void hakios_mic_dsp_up(void) {}
-void hakios_mic_dsp_down(void) {}
-void hakios_mic_quiesce(void) {}
 #endif
 
 #if !defined(HAKIOS_HAPTIC) && !defined(HAKIOS_AKITA_HAPTIC)

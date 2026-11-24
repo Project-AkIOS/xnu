@@ -119,11 +119,7 @@ bsd/dev/hakios.net.c                     standard
 bsd/dev/hakios.image.c                   standard
 bsd/dev/hakios.sparse.c                  standard
 bsd/dev/hakios.apfs_check.c              optional apfs
-bsd/dev/hakios.adsp.c                    optional hakios_adsp
-bsd/dev/hakios.speaker.c                 optional hakios_speaker
 bsd/dev/hakios.guard.c                   optional hakios_guard
-bsd/dev/hakios.sound.c                   optional hakios_sound
-bsd/dev/hakios.mic.c                     optional hakios_mic
 bsd/dev/hakios.bt.c                      optional hakios_bt
 bsd/dev/hakios.bthost.c                  optional hakios_bt_host
 bsd/dev/hakios.btsk.c                    optional hakios_bt_host
