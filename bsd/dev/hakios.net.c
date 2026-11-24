@@ -10,8 +10,8 @@
  *
  * What carries the frames is a link driver's business; sys/hakios.net.h is all that the two
  * know of each other.
- * There can be two interfaces: en0 for the Wi-Fi, en1 for the modem's packets
- * through the IPA (hakios.cell.c); each has its link, its state and its thread.
+ * There can be two interfaces: en0 for the Wi-Fi, en1 for the modem's packets; each has its
+ * link, its state and its thread.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>

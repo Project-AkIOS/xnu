@@ -2383,7 +2383,7 @@ scan_all(void)
 
 /*
  * The network to join: fw/network of the small image (fw-wifi/network of the build, the tester's, never in a
- * repository): its name on the first line, its passphrase on the second (as upstream's hakios_wifi_network). Only
+ * repository): its name on the first line, its passphrase on the second (as the Qualcomm port's Wi-Fi driver read it). Only
  * their lengths go into the log.
  */
 static bool

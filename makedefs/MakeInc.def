@@ -1157,9 +1157,6 @@ LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp $(TARGET)/sy
 #
 LD_KERNEL_LIBS	   = -lcc_kext
 LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel -lpthread_kext
-# Darwin-on-hakios: objects made outside this tree, linked when the build is given any (the
-# Wi-Fi driver, see bsd/dev/hakios.lx.c)
-LD_KERNEL_ARCHIVES += $(HAKIOS_OBJECTS)
 
 # Link binary support library
 # (HakiOS: not for BCM2837, which has no lib$(CURRENT_MACHINE_CONFIG).os.*.a in any KDK; 8796 only

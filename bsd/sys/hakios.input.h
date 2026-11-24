@@ -78,30 +78,8 @@ void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps o
 void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
 void hakios_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
-void hakios_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
-void hakios_mpss_init(void);           /* boot-arg modem=1: the phone's modem started and linked; modem_step=N: the first N steps */
-void hakios_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */
-int hakios_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line of the Wi-Fi steps' log */
-int hakios_wifi_tell(const char *format, ...) __printflike(1, 2);     /* ... one that is said even with wifi=1 */
+int hakios_wifi_tell(const char *format, ...) __printflike(1, 2);     /* a line of the Wi-Fi station's, always said */
 extern void (*hakios_touch_interaction)(void);  /* called at each touch down and move (a device's governor), or NULL */
-uint32_t hakios_wifi_option(const char *name);                         /* a boot-arg's number, or what wifi=1 stands for */
-const uint8_t *hakios_wifi_file(const char *name, uint64_t *size);     /* a file of fw/ in the small image, in place */
-bool hakios_wlfw_exchange(uint32_t step);                              /* step 15 of wifi_step=N: hakios.wlfw.c */
-bool hakios_wlfw_registers(uint64_t *address, uint32_t *size, bool *mission); /* ... and what it learnt for step 16 */
-void hakios_wlfw_stop(uint32_t step);                                  /* ... and its end, before the DSP is stopped */
-void hakios_wifi_quiesce(void);        /* on the way back to the loader: the Wi-Fi DSP, if it still runs, shut down */
-/* ath11k's object and the kernel's side of it (drivers/wifi/hakios.lx.c), and what that asks of the phone's radio */
-int hakios_lx_start(void);             /* the driver brought up on the radio as far as it is built: 0 or an errno */
-void hakios_lx_stop(void);             /* ... and down again, if it stayed up (a network joined) */
-int hakios_lx_prepare(void);           /* before all that: the memory the radio will be shown, taken; 0 or an errno */
-void hakios_lx_net_early(void);        /* ... and en0 made on the radio now, if the kernel was given its address */
-bool hakios_wifi_dsp_is_up(void);      /* the DSP that runs the radio's firmware has been started and has a link */
-const uint8_t *hakios_wifi_driver_file(const char *name, uint64_t *size);     /* a file by the name Linux has for it */
-bool hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
-bool hakios_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
-bool hakios_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
-/* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
-bool hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);
 
 /*
  * The GPU kept on (boot-arg adreno_keep=1), for drivers/gpu/hakios.gpu.cpp: see "the GPU kept on"

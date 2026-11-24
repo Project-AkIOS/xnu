@@ -10,7 +10,7 @@
  * A driver that is built gets none of this: every block below is for one driver, and empty when that one is in.
  *
  * What is not here, on purpose: a call from one driver to another that it cannot work without. That is a `requires`
- * of its conf (MODEM requires QMI and UFS, ...), and tools/hakios-config.py refuses
+ * of its conf, and tools/hakios-config.py refuses
  * the configuration that would need a stand-in for it.
  */
 #include <stdbool.h>
@@ -22,8 +22,6 @@
 #include <sys/hakios.net.h>
 
 /* the ends of a run (loader_return.c, the guards), which have no header of their own */
-void hakios_mpss_stop(void);
-void hakios_mpss_quiesce(void);
 void hakios_ddr_quiesce(void);
 void hakios_ufs_quiesce(void);
 void hakios_var_save_on_return(void);
@@ -96,11 +94,6 @@ void hakios_adreno_stop(void) {}
 void hakios_adreno_minute(void) {}
 #endif
 
-#ifndef HAKIOS_WIFI
-void hakios_wifi_init(void) {}
-void hakios_wifi_stop(void) {}
-void hakios_wifi_quiesce(void) {}
-#endif
 #if !defined(HAKIOS_AKITA_WIFI)
 void hakios_akita_wifi_early(void) {}
 #endif
@@ -108,10 +101,10 @@ void hakios_akita_wifi_early(void) {}
 errno_t hakios_apple80211_ioctl(__unused u_long command, __unused void *data) { return EOPNOTSUPP; }
 void HakiosWLANStart(__unused const char *interface, __unused const uint8_t *address) {}
 #endif
-#if defined(HAKIOS_WIFI_STATION) && !defined(HAKIOS_WIFI)
+#ifdef HAKIOS_WIFI_STATION
 #include <stdarg.h>
 #include <sys/systm.h>
-/* (the station side's way of saying what went wrong: hakios.wifi.c's, which says it even when its own log is quiet) */
+/* (the station side's way of saying what went wrong, said even when the radio's own log is quiet) */
 int
 hakios_wifi_tell(const char *format, ...)
 {
@@ -124,12 +117,6 @@ hakios_wifi_tell(const char *format, ...)
 	printf("%s", line);
 	return 0;
 }
-#endif
-
-#ifndef HAKIOS_MODEM
-void hakios_mpss_init(void) {}
-void hakios_mpss_stop(void) {}
-void hakios_mpss_quiesce(void) {}
 #endif
 
 #if !defined(HAKIOS_HAPTIC) && !defined(HAKIOS_AKITA_HAPTIC)

@@ -54,10 +54,6 @@ void loader_return(void);
 extern void hakios_adreno_quiesce(void);
 extern void hakios_adreno_stop(void);
 extern void hakios_adreno_minute(void);
-extern void hakios_wifi_stop(void);
-extern void hakios_wifi_quiesce(void);
-extern void hakios_mpss_stop(void);
-extern void hakios_mpss_quiesce(void);
 extern void hakios_ddr_quiesce(void);
 extern void hakios_haptic_quiesce(void);
 extern void hakios_torch_quiesce(void);
@@ -421,8 +417,6 @@ loader_return(void)
 #endif
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
-	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
-	hakios_mpss_quiesce();         /* nor the modem */
 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
@@ -487,8 +481,6 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	if (!as_panic) {
 		hakios_var_save_on_return();   /* the data volume kept, while the system is still whole */
 		hakios_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
-		hakios_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
-		hakios_mpss_stop();            /* and the modem */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
@@ -533,7 +525,6 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		}
 		hakios_var_save_on_return();
 		hakios_adreno_stop();
-		hakios_wifi_stop();
 		loader_return();
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);

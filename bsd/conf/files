@@ -120,7 +120,6 @@ bsd/dev/hakios.image.c                   standard
 bsd/dev/hakios.sparse.c                  standard
 bsd/dev/hakios.apfs_check.c              optional apfs
 bsd/dev/hakios.guard.c                   optional hakios_guard
-bsd/dev/hakios.bt.c                      optional hakios_bt
 bsd/dev/hakios.bthost.c                  optional hakios_bt_host
 bsd/dev/hakios.btsk.c                    optional hakios_bt_host
 bsd/dev/hakios.camera.c                  optional hakios_camera
@@ -130,11 +129,6 @@ bsd/dev/hakios.adreno.c                  optional hakios_adreno
 bsd/dev/hakios.haptic.c                  optional hakios_haptic
 bsd/dev/hakios.goodix.c                  optional hakios_goodix
 bsd/dev/hakios.buttons.c                 optional hakios_buttons
-bsd/dev/hakios.qmi.c                     optional hakios_qmi
-bsd/dev/hakios.mpss.c                    optional hakios_modem
-bsd/dev/hakios.cell.c                    optional hakios_modem
-bsd/dev/hakios.nas.c                     optional hakios_modem
-bsd/dev/hakios.ipa.c                     optional hakios_modem
 bsd/dev/hakios.battery.c                 optional hakios_battery
 bsd/dev/hakios.cpufreq.c                 optional hakios_cpufreq
 bsd/dev/hakios.thermal.c                 optional hakios_thermal
@@ -144,9 +138,6 @@ bsd/dev/hakios.ufs.c                     optional hakios_ufs
 bsd/dev/hakios.ufshc.c                   optional hakios_ufs
 bsd/dev/hakios.sta.c                     optional hakios_wifi_station
 bsd/dev/hakios.apple80211.c              optional hakios_wifi_station
-bsd/dev/hakios.wifi.c                    optional hakios_wifi
-bsd/dev/hakios.wlfw.c                    optional hakios_wifi
-bsd/dev/hakios.lx.c                      optional hakios_wifi
 bsd/dev/hakios.akita_aoc.c               optional hakios_akita_aoc
 bsd/dev/hakios.akita_amp.c               optional hakios_akita_amp
 bsd/dev/hakios.akita_bt.c                optional hakios_akita_bt
