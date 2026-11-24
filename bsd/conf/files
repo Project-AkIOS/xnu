@@ -122,7 +122,6 @@ bsd/dev/hakios.apfs_check.c              optional apfs
 bsd/dev/hakios.guard.c                   optional hakios_guard
 bsd/dev/hakios.bthost.c                  optional hakios_bt_host
 bsd/dev/hakios.btsk.c                    optional hakios_bt_host
-bsd/dev/hakios.adreno.c                  optional hakios_adreno
 bsd/dev/hakios.battery.c                 optional hakios_battery
 bsd/dev/hakios.ufs.c                     optional hakios_ufs
 bsd/dev/hakios.ufshc.c                   optional hakios_ufs

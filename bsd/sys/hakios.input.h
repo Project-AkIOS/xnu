@@ -68,31 +68,8 @@ struct hakios_battery_state {
 };
 void hakios_battery_report(const struct hakios_battery_state *state);
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
-void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
-void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
-void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
-void hakios_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
 int hakios_wifi_tell(const char *format, ...) __printflike(1, 2);     /* a line of the Wi-Fi station's, always said */
 extern void (*hakios_touch_interaction)(void);  /* called at each touch down and move (a device's governor), or NULL */
-
-/*
- * The GPU kept on (boot-arg adreno_keep=1), for drivers/gpu/hakios.gpu.cpp: see "the GPU kept on"
- * in drivers/gpu/hakios.adreno.c. One caller at a time.
- */
-bool hakios_gpu_ready(void);
-bool hakios_gpu_parameter(uint32_t which, uint64_t *value);
-uint64_t hakios_gpu_address(uint64_t size);
-void hakios_gpu_address_free(uint64_t address, uint64_t size);
-bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
-void hakios_gpu_mapped(void);
-void hakios_gpu_unmap(uint64_t address, uint64_t size);
-void hakios_gpu_to_memory(void *start, uint64_t size);
-uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
-bool hakios_gpu_done(uint32_t fence);
-uint32_t hakios_gpu_last(void);
-void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
-void hakios_gpu_report(const char *why);
-void hakios_gpu_stop(void);
 #endif
 
 #endif /* _SYS_HAKIOS_INPUT_H_ */

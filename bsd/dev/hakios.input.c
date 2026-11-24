@@ -86,7 +86,6 @@ static void
 exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	printf("\n--- %d fingers held on the screen for %d ms: back to the loader ---\n", EXIT_FINGERS, EXIT_HOLD_MS);
-	hakios_adreno_stop();
 	loader_return();
 }
 
@@ -357,5 +356,4 @@ hakios_input_init(void)
 	hakios_battery_init();
 	hakios_ufs_init();
 	hakios_net_init();
-	hakios_adreno_init();
 }

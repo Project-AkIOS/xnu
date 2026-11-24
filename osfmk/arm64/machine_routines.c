@@ -911,7 +911,6 @@ ml_get_machine_mem(void)
 }
 
 extern void loader_return(void);
-extern void hakios_adreno_stop(void);
 /*
  * A device that can power itself off or restart (the Pixel 8a: PSCI SYSTEM_OFF, a reset into the active slot):
  * devices/akita/drivers/power/hakios.akita_power.c. Returns when it does not (drivers/core/hakios.stubs.c), and the way
@@ -932,7 +931,6 @@ halt_all_cpus(boolean_t reboot)
 	}
 	/* the device's own power off or restart, if it has one; else hand control (and the log) back to the loader */
 	hakios_platform_halt(reboot ? 1 : 0);
-	hakios_adreno_stop();
 	loader_return();
 	while (1) {
 		;

@@ -1,6 +1,6 @@
 /*
  * The GPU of the Pixel 8a (akita): zuma's Mali-G715 (arch 11.8, r1p2, 7 shader cores), woken step by step -- what
- * drivers/gpu/hakios.adreno.c is for redwood's Adreno, here for a Mali with its command-stream front end (CSF): a
+ * the Adreno's driver was for redwood, here for a Mali with its command-stream front end (CSF): a
  * small processor of its own, the MCU, runs Arm's firmware (mali_csffw-r54p2.bin, the phone's own, /vendor/firmware of
  * its Android, in fw/ of the small image from fw-gpu/), and everything the GPU is given to do later goes through that
  * firmware's interface in memory both sides share.

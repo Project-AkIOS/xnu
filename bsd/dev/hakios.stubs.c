@@ -72,13 +72,6 @@ void hakios_platform_halt(int reboot);
 void hakios_platform_halt(__unused int reboot) {}
 #endif
 
-#ifndef HAKIOS_ADRENO
-void hakios_adreno_init(void) {}
-void hakios_adreno_quiesce(void) {}
-void hakios_adreno_stop(void) {}
-void hakios_adreno_minute(void) {}
-#endif
-
 #if !defined(HAKIOS_AKITA_WIFI)
 void hakios_akita_wifi_early(void) {}
 #endif

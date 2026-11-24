@@ -4,8 +4,8 @@
  * hakios.akita_mali.c brings the GPU up and, with boot-arg mali_keep=1, keeps it on and starts this service. A program
  * that opens it speaks the interface of Linux's panthor DRM driver, the one Mesa's panfrost and panvk know: every
  * request is a call of the user client with the request's number as the selector (DRM's: 0x40 + panthor's own number,
- * 0x09 GEM_CLOSE, 0xbf.. the sync objects) and the request's structure passed in and back -- as redwood's HakiosGPU does
- * with msm's for freedreno (drivers/gpu/hakios.gpu.cpp; the userland side, tools/mesa/hakios-drm, stands in for libdrm).
+ * 0x09 GEM_CLOSE, 0xbf.. the sync objects) and the request's structure passed in and back -- as redwood's HakiosGPU did
+ * with msm's for freedreno (the userland side, tools/mesa/hakios-drm, stands in for libdrm).
  * A buffer's memory is the client memory of the type that is its handle (BO_MMAP_OFFSET answers the handle << 12).
  *
  * What there is: the device's description; VMs (each its own address space of the GPU, with its own tables); buffers
@@ -125,7 +125,7 @@ struct drm_panthor_tiler_heap_create { uint32_t vm_id, initial_chunk_count, chun
 	uint64_t tiler_heap_ctx_gpu_va, first_heap_chunk_gpu_va; };
 struct drm_panthor_tiler_heap_destroy { uint32_t handle, pad; };
 struct drm_gem_close { uint32_t handle, pad; };
-/* kHakiosSurface: the Adreno service's struct hakios_surface (drivers/gpu/hakios.gpu.cpp), the same layout */
+/* kHakiosSurface: the Adreno service's struct hakios_surface, the same layout */
 struct hakios_surface {
 	uint32_t surface;                       /* the IOSurface's ID */
 	uint32_t handle;                        /* kHakiosDescribe: no buffer wanted; else, back: the buffer, */
@@ -445,8 +445,8 @@ HakiosGPUUserClient::syncSignal(uint32_t handle, uint64_t point, const struct fe
  * The display asks before it puts a surface on the panel (MiniIOMobileFramebuffer's show()): is the GPU done drawing it?
  * Here (the Mali) it waits until every queue has done what it had been given by now -- the frame's own work was submitted
  * before its swap, so it is among it (a later frame's may be too: a frame's wait can include the next one's work). Without
- * this the panel showed surfaces the Mali was still drawing (11-10). Upstream's Adreno driver marks each surface with its
- * own submission (hakios.gpu.cpp); the Mali's submissions do not name their buffers, hence all of it. True if done in time.
+ * this the panel showed surfaces the Mali was still drawing (11-10). Upstream's Adreno driver marked each surface with its
+ * own submission; the Mali's submissions do not name their buffers, hence all of it. True if done in time.
  */
 /*
  * SURFACES BEING DRAWN (11-10): HakiosMetal marks a surface from the first draw a command buffer records into it until

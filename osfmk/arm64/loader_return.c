@@ -51,9 +51,6 @@ extern void gic_v3_irq_cpu_shutdown(void);
 
 void loader_log_putc(char c);
 void loader_return(void);
-extern void hakios_adreno_quiesce(void);
-extern void hakios_adreno_stop(void);
-extern void hakios_adreno_minute(void);
 extern void hakios_haptic_quiesce(void);
 extern void hakios_torch_quiesce(void);
 extern void hakios_ufs_quiesce(void);
@@ -414,7 +411,6 @@ loader_return(void)
 	psci_smp_stop_others();
 #endif
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
-	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
 	/*
@@ -476,7 +472,6 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
 	if (!as_panic) {
 		hakios_var_save_on_return();   /* the data volume kept, while the system is still whole */
-		hakios_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
@@ -520,7 +515,6 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 			loader_log_putc(*c);
 		}
 		hakios_var_save_on_return();
-		hakios_adreno_stop();
 		loader_return();
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
@@ -616,7 +610,6 @@ memory_report(void)
 
 	hakios_memory_line(line, sizeof(line));
 	printf("%s", line);
-	hakios_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
 /* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */
