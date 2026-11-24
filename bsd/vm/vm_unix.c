@@ -1300,10 +1300,12 @@ shared_region_check_np(
 					error = ENOMEM;
 				}
 			}
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || HAKIOS_USER_PAC
 			/*
 			 * Remap any section of the shared library that
 			 * has authenticated pointers into private memory.
+			 * (HakiOS PATH 2: only for a PAC-on task; a no-op for every other
+			 * task and with hakios_pac=0.)
 			 */
 			if ((error == 0) && (vm_shared_region_auth_remap(shared_region) != KERN_SUCCESS)) {
 				SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] "
@@ -1314,7 +1316,7 @@ shared_region_check_np(
 				    (uint64_t)uap->start_address));
 				error = ENOMEM;
 			}
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* __has_feature(ptrauth_calls) || HAKIOS_USER_PAC */
 			/* Give the start address to the caller */
 			if (error == 0) {
 				error = copyout(&start_address,
@@ -1724,7 +1726,19 @@ after_root_check:
 #define PREBOOT_CRYPTEX_PATH "/private/preboot/Cryptexes"
 #endif
 			error = vnode_lookup(PREBOOT_CRYPTEX_PATH, 0, &preboot_vp, vfs_context_current());
-			if (error || srfmp->vp->v_mount != preboot_vp->v_mount) {
+			/*
+			 * (redwood) Or a volume of its own mounted on a directory right inside it: Darwin
+			 * grafts each cryptex image into the Preboot volume (graftdmg), so its files are
+			 * that volume's; this port mounts the image there as it is (bsd/miscfs/apfs), a
+			 * mount of its own whose covered directory is Preboot's Cryptexes/<name>.
+			 */
+			if (error == 0 && srfmp->vp->v_mount != preboot_vp->v_mount &&
+			    srfmp->vp->v_mount != NULL && srfmp->vp->v_mount->mnt_vnodecovered != NULLVP &&
+			    srfmp->vp->v_mount->mnt_vnodecovered->v_mount == preboot_vp->v_mount &&
+			    srfmp->vp->v_mount->mnt_vnodecovered->v_parent == preboot_vp) {
+				(void)vnode_put(preboot_vp);
+				preboot_vp = NULL;
+			} else if (error || srfmp->vp->v_mount != preboot_vp->v_mount) {
 				SHARED_REGION_TRACE_ERROR(
 					("shared_region: %p [%d(%s)] map(%p:'%s'): "
 					"not on process' root volume nor preboot volume\n",
@@ -2336,6 +2350,17 @@ shared_region_map_and_slide_2_np(
 
 	kr = _shared_region_map_and_slide(p, files_count, shared_files, mappings_count, mappings);
 done:
+#if HAKIOS_USER_PAC
+	/*
+	 * HakiOS PATH 2: several of the ways this call fails say nothing in the log (the copyins, the
+	 * MAC check, ...), and dyld then reports only "no dyld cache". With hakios_pac on, say it.
+	 */
+	if (kr != 0) {
+		extern void hakios_pac_log(const char *fmt, ...) __printflike(1, 2);
+		hakios_pac_log("hakios_pac: shared_region_map_and_slide_2_np by pid %d (%s) FAILED: %d (%u file(s), %u mapping(s))\n",
+		    proc_getpid(p), p->p_comm, (int)kr, files_count, mappings_count);
+	}
+#endif /* HAKIOS_USER_PAC */
 	kfree_data(shared_files, files_count * sizeof(shared_files[0]));
 	kfree_data(mappings, mappings_count * sizeof(mappings[0]));
 

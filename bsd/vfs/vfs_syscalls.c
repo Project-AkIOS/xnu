@@ -7745,6 +7745,26 @@ pathconf(__unused proc_t p, struct pathconf_args *uap, int32_t *retval)
 	}
 
 	error = vn_pathconf(nd.ni_vp, uap->name, retval, ctx);
+	if (error == EINVAL) {
+		/* AkIOS (11-22): sys_probe=1 sys_probe_name=NAME -- which name a pathconf of NAME's fails for, on what */
+		static int on = -1;
+		static char who[MAXCOMLEN + 1] = "lsd";
+		static uint32_t said;
+		char me[MAXCOMLEN + 1];
+
+		if (on < 0) {
+			uint32_t v = 0;
+
+			on = PE_parse_boot_argn("sys_probe", &v, sizeof(v)) && v != 0;
+			(void)PE_parse_boot_argn("sys_probe_name", who, sizeof(who));
+		}
+		proc_selfname(me, sizeof(me));
+		if (on > 0 && said < 24 && strcmp(me, who) == 0) {
+			said++;
+			printf("sys_probe: %s: pathconf(name %d) EINVAL on a %s vnode of %s\n", me, uap->name,
+			    nd.ni_vp->v_type == VDIR ? "directory" : "file", vfs_statfs(vnode_mount(nd.ni_vp))->f_fstypename);
+		}
+	}
 
 	vnode_put(nd.ni_vp);
 	nameidone(&nd);
@@ -9307,6 +9327,73 @@ clonefile_internal(vnode_t fvp, boolean_t data_read_authorised, int dst_dirfd,
 #endif
 
 	error = VNOP_CLONEFILE(fvp, tdvp, &tvp, cnp, nvap, vnop_flags, ctx);
+
+	/*
+	 * (hakios) A filesystem that cannot clone -- the phone's data volume is HFS Plus, or a memory filesystem -- gets
+	 * a copy of a regular file instead: installd's helper stages an application with clonefile() and nothing else
+	 * ("Failed to clonefile .../Icon.png", the Pixel 8a, 11-13), so no application could be installed. The file is
+	 * made with the attributes prepared above and the data copied; a copy that fails is removed again.
+	 */
+	if (error == ENOTSUP && v_type == VREG) {
+		tvp = NULLVP;
+		/*
+		 * AkIOS (11-22): flags that say how the SOURCE is stored are not the copy's. The data is written plain, so
+		 * UF_COMPRESSED on it would send every read through decmpfs, which finds no compressed data and fails; and
+		 * the copy has its data, so it is not dataless either.
+		 */
+		if (VATTR_IS_ACTIVE(nvap, va_flags)) {
+			nvap->va_flags &= ~(UF_COMPRESSED | SF_DATALESS);
+		}
+		/* (VNOP_CREATE, not vn_create: nvap is prepared above already and cleaned up at "out"; vn_create prepares and
+		 * cleans it again, and on xnu-12377 that freed an inherited ACL twice -- zfree_drop: double free, 11-21) */
+		error = VNOP_CREATE(tdvp, &tvp, cnp, nvap, ctx);
+		if (!error && tvp) {
+			const int chunk = 64 * 1024;
+			char *data = kalloc_data(chunk, Z_WAITOK);
+			off_t offset = 0;
+			int opened_from = 0, opened_to = 0;
+
+			if (data == NULL) {
+				error = ENOMEM;
+			}
+			if (!error && !(error = VNOP_OPEN(fvp, FREAD, ctx))) {
+				opened_from = 1;
+			}
+			if (!error && !(error = VNOP_OPEN(tvp, FWRITE, ctx))) {
+				opened_to = 1;
+			}
+			while (!error) {
+				int resid = 0, got;
+
+				error = vn_rdwr(UIO_READ, fvp, data, chunk, offset, UIO_SYSSPACE, IO_NODELOCKED,
+				    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+				got = chunk - resid;
+				if (error || got <= 0) {
+					break;
+				}
+				error = vn_rdwr(UIO_WRITE, tvp, data, got, offset, UIO_SYSSPACE, IO_NODELOCKED,
+				    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+				if (!error && resid != 0) {
+					error = ENOSPC;
+				}
+				offset += got;
+			}
+			if (opened_to) {
+				(void)VNOP_CLOSE(tvp, FWRITE, ctx);
+			}
+			if (opened_from) {
+				(void)VNOP_CLOSE(fvp, FREAD, ctx);
+			}
+			if (data != NULL) {
+				kfree_data(data, chunk);
+			}
+			if (error) {
+				(void)VNOP_REMOVE(tdvp, tvp, cnp, 0, ctx);
+				vnode_put(tvp);
+				tvp = NULLVP;
+			}
+		}
+	}
 
 	if (!error && tvp) {
 		int     update_flags = 0;
@@ -11128,6 +11215,11 @@ unionread:
 	}
 #endif /* CONFIG_UNION_MOUNTS */
 
+	{
+		extern void akios_open_probe(const char *what, vnode_t vp, int64_t n, int error);
+
+		akios_open_probe("getdirentries", vp, (int64_t)(bufsize - uio_resid(auio)), error);   /* AkIOS (11-22) */
+	}
 	vnode_put(vp);
 	if (offset) {
 		*offset = loff;
@@ -12785,6 +12877,38 @@ vfs_context_is_dataless_manipulator(vfs_context_t ctx __no_dataless_unused)
 #endif /* CONFIG_DATALESS_FILES */
 }
 
+/*
+ * AkIOS (11-22): two KPIs of xnu-13432 that Apple's iOS 27 APFS kext calls (the kext is prelinked into this kernel:
+ * tools/mkprelink.py). As in 13432 (KDK 26B131 kernel): the process of the context (or the kernel's), and one bit of
+ * its p_vfs_iopolicy -- IGNORE_CONTENT_PROTECTION (0x20, set through setiopolicy_np IOPOL_TYPE_VFS_IGNORE_CONTENT_PROTECTION)
+ * and 13432's STRICT_CONTENT_PROTECTION (0x8000; nothing here sets it yet).
+ */
+#define AKIOS_P_VFS_IOPOLICY_STRICT_CONTENT_PROTECTION 0x8000
+
+static proc_t
+akios_context_proc(vfs_context_t ctx)
+{
+	proc_t p = ctx != NULL ? vfs_context_proc(ctx) : NULL;
+
+	return p != NULL ? p : current_proc();
+}
+
+int
+vfs_context_ignores_content_protection(vfs_context_t ctx)
+{
+	proc_t p = akios_context_proc(ctx);
+
+	return p != NULL && (os_atomic_load(&p->p_vfs_iopolicy, relaxed) & P_VFS_IOPOLICY_IGNORE_CONTENT_PROTECTION) != 0;
+}
+
+int
+vfs_context_is_strict_content_protection(vfs_context_t ctx)
+{
+	proc_t p = akios_context_proc(ctx);
+
+	return p != NULL && (os_atomic_load(&p->p_vfs_iopolicy, relaxed) & AKIOS_P_VFS_IOPOLICY_STRICT_CONTENT_PROTECTION) != 0;
+}
+
 #if CONFIG_DATALESS_FILES
 static void
 log_materialization_prevented(vnode_t vp, uint64_t op)
@@ -13677,6 +13801,16 @@ unlock:
 		}
 		/* Invoke the filesystem-specific code */
 		error = VNOP_IOCTL(vp, cmd, data, (int)options, ctx);
+		/*
+		 * AkIOS (11-24): APFS's "mark purgeable" (_IOWR('J', 0x44, uint64_t flags), APFSIOC_MARK_PURGEABLE) on a
+		 * file system that has no purgeable files (the data volume here is HFS+): done, as a request the volume may
+		 * honour by never purging the file. PosterBoard marks every poster file so and gives up the whole poster on
+		 * a refusal -- iOS 27 had no lock-screen wallpaper, and Setup's hello no background.
+		 */
+		if (error != 0 && cmd == _IOWR('J', 0x44, uint64_t) && vp->v_mount != NULL &&
+		    strncmp(vp->v_mount->mnt_vfsstat.f_fstypename, "apfs", MFSNAMELEN) != 0) {
+			error = 0;
+		}
 	}
 	} /* end switch stmt */
 

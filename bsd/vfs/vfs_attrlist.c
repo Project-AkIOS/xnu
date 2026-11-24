@@ -678,7 +678,7 @@ static struct getattrlist_attrtab getattrlistbulk_common_extended_tab[] = {
 	                         ATTR_CMN_USERACCESS | ATTR_CMN_FILEID | \
 	                         ATTR_CMN_PARENTID | ATTR_CMN_RETURNED_ATTRS | \
 	                         ATTR_CMN_DOCUMENT_ID | ATTR_CMN_GEN_COUNT | \
-	                         ATTR_CMN_DATA_PROTECT_FLAGS)
+	                         ATTR_CMN_DATA_PROTECT_FLAGS | ATTR_CMN_FULLPATH)   /* AkIOS 11-22: built here for any fs; iOS 27 needs it listed (canonical paths) */
 
 #define VFS_DFLT_ATTR_CMN_EXT   (ATTR_CMNEXT_PRIVATESIZE | ATTR_CMNEXT_LINKID |  \
 	                         ATTR_CMNEXT_NOFIRMLINKPATH | ATTR_CMNEXT_REALDEVID |  \
@@ -988,6 +988,83 @@ getattrlist_findnamecomp(const char *mn, const char **np, ssize_t *nl)
 }
 
 
+/*
+ * AkIOS (11-21): gal_probe=1 -- which attributes iOS 27's LaunchServices asks our file systems (bsd/miscfs/apfs,
+ * bsd/hfs) for and does not get. lsd's FSNode getResourceValue failed with -10813 for every framework it looked at;
+ * each distinct (process, file system, requested attributes, missing va_ bits) is said once, up to 96 of them.
+ */
+#include <pexpert/pexpert.h>
+#include <pexpert/pexpert.h>
+/* AkIOS (11-21): the same for volume attributes (gal_probe=1): which f_ bits a file system leaves unanswered */
+static void
+hakios_gal_probe_vol(mount_t mp, struct attrlist *alp, uint64_t active, uint64_t supported)
+{
+	static uint32_t said;
+	static uint64_t seen[32];
+	char name[32] = "";
+	uint32_t v = 0;
+	uint64_t key;
+
+	if (!PE_parse_boot_argn("gal_probe", &v, sizeof(v)) || v == 0 || said >= 32) {
+		return;
+	}
+	proc_selfname(name, sizeof(name));
+	if (strcmp(name, "lsd") != 0 && strcmp(name, "coreservicesd") != 0 && strcmp(name, "installd") != 0 &&
+	    strcmp(name, "SpringBoard") != 0) {
+		return;
+	}
+	key = (active & ~supported) ^ ((uint64_t)alp->volattr << 20) ^ ((uint64_t)name[0] << 56);
+	for (uint32_t i = 0; i < said; i++) {
+		if (seen[i] == key) {
+			return;
+		}
+	}
+	seen[said++] = key;
+	printf("gal_probe: %s volume on %s: volattr %#x common %#x: f_ missing %#llx (active %#llx)\n", name,
+	    vfs_statfs(mp)->f_fstypename, alp->volattr, alp->commonattr, active & ~supported, active);
+}
+
+static void
+hakios_gal_probe(vnode_t vp, struct attrlist *alp, struct vnode_attr *vap, int return_valid)
+{
+	static int on = -1;
+	static uint32_t said;
+	static uint64_t seen[96];
+	char name[32] = "";
+	uint64_t missing, key;
+	const char *fs = "?";
+	mount_t mp;
+
+	if (on < 0) {
+		uint32_t v = 0;
+
+		on = PE_parse_boot_argn("gal_probe", &v, sizeof(v)) && v != 0;
+	}
+	if (on <= 0 || said >= 96) {
+		return;
+	}
+	proc_selfname(name, sizeof(name));
+	if (strcmp(name, "lsd") != 0 && strcmp(name, "coreservicesd") != 0 && strcmp(name, "installd") != 0 &&
+	    strcmp(name, "SpringBoard") != 0) {
+		return;
+	}
+	missing = vap->va_active & ~vap->va_supported;
+	key = missing ^ ((uint64_t)alp->commonattr << 1) ^ ((uint64_t)alp->volattr << 33) ^ ((uint64_t)alp->fileattr << 17) ^
+	    ((uint64_t)alp->forkattr << 47) ^ ((uint64_t)name[0] << 56) ^ ((uint64_t)name[1] << 48);
+	for (uint32_t i = 0; i < said; i++) {
+		if (seen[i] == key) {
+			return;
+		}
+	}
+	seen[said++] = key;
+	if (vp != NULL && (mp = vnode_mount(vp)) != NULL) {
+		fs = vfs_statfs(mp)->f_fstypename;
+	}
+	printf("gal_probe: %s on %s: common %#x vol %#x dir %#x file %#x fork %#x%s: va_ missing %#llx (active %#llx)\n",
+	    name, fs, alp->commonattr, alp->volattr, alp->dirattr, alp->fileattr, alp->forkattr,
+	    return_valid ? " +returned" : " (no returned-attrs: EINVAL)", missing, vap->va_active);
+}
+
 static int
 getvolattrlist(vfs_context_t ctx, vnode_t vp, struct attrlist *alp,
     user_addr_t attributeBuffer, size_t bufferSize, uint64_t options,
@@ -1119,6 +1196,7 @@ getvolattrlist(vfs_context_t ctx, vnode_t vp, struct attrlist *alp,
 		 * Did we ask for something the filesystem doesn't support?
 		 */
 		if (!VFSATTR_ALL_SUPPORTED(&vs)) {
+			hakios_gal_probe_vol(mnt, alp, vs.f_active, vs.f_supported);
 			/* default value for volume subtype */
 			if (VFSATTR_IS_ACTIVE(&vs, f_fssubtype)
 			    && !VFSATTR_IS_SUPPORTED(&vs, f_fssubtype)) {
@@ -2926,6 +3004,7 @@ vfs_attr_pack_internal(mount_t mp, vnode_t vp, uio_t auio, struct attrlist *alp,
 
 		/* check again */
 		if (!VATTR_ALL_SUPPORTED(vap)) {
+			hakios_gal_probe(vp, alp, vap, return_valid);
 			if (return_valid && pack_invalid) {
 				/* Fix up valid mask for post processing */
 				getattrlist_fixupattrs(&ab.valid, vap, use_fork);
@@ -3623,6 +3702,39 @@ getattrlistat_internal(vfs_context_t ctx, user_addr_t path,
 	return error;
 }
 
+/*
+ * AkIOS (11-22): sys_probe=1 sys_probe_name=NAME -- a getattrlist of NAME's that fails with EINVAL, with its path,
+ * bitmaps, buffer size and options (coreservicesd's volume scan got EINVAL and registered no volume).
+ */
+static void
+akios_gal_einval(user_addr_t path, struct attrlist *alp, size_t bufsize, uint64_t options)
+{
+	static int on = -1;
+	static char who[MAXCOMLEN + 1] = "lsd";
+	static uint32_t said;
+	char name[MAXCOMLEN + 1], p[256] = "";
+	size_t len = 0;
+
+	if (on < 0) {
+		uint32_t v = 0;
+
+		on = PE_parse_boot_argn("sys_probe", &v, sizeof(v)) && v != 0;
+		(void)PE_parse_boot_argn("sys_probe_name", who, sizeof(who));
+	}
+	if (on <= 0 || said >= 24) {
+		return;
+	}
+	proc_selfname(name, sizeof(name));
+	if (strcmp(name, who) != 0) {
+		return;
+	}
+	said++;
+	(void)copyinstr(path, p, sizeof(p), &len);
+	printf("sys_probe: %s: getattrlist(\"%s\") EINVAL: bitmapcount %u common %#x vol %#x dir %#x file %#x fork %#x, "
+	    "buffer %zu, options %#llx\n", name, p, alp->bitmapcount, alp->commonattr, alp->volattr, alp->dirattr,
+	    alp->fileattr, alp->forkattr, bufsize, options);
+}
+
 int
 getattrlist(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
 {
@@ -3640,10 +3752,14 @@ getattrlist(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
 		return error;
 	}
 
-	return getattrlistat_internal(vfs_context_current(),
-	           CAST_USER_ADDR_T(uap->path), &al,
-	           CAST_USER_ADDR_T(uap->attributeBuffer), uap->bufferSize,
-	           (uint64_t)uap->options, segflg, segflg, AT_FDCWD);
+	error = getattrlistat_internal(vfs_context_current(),
+	    CAST_USER_ADDR_T(uap->path), &al,
+	    CAST_USER_ADDR_T(uap->attributeBuffer), uap->bufferSize,
+	    (uint64_t)uap->options, segflg, segflg, AT_FDCWD);
+	if (error == EINVAL) {
+		akios_gal_einval(CAST_USER_ADDR_T(uap->path), &al, uap->bufferSize, (uint64_t)uap->options);
+	}
+	return error;
 }
 
 int
@@ -4480,6 +4596,9 @@ getattrlistbulk(proc_t p, struct getattrlistbulk_args *uap, int32_t *retval)
 	FV_UNLOCK(fvdata);
 out:
 	if (dvp) {
+		extern void akios_open_probe(const char *what, vnode_t vp, int64_t n, int error);
+
+		akios_open_probe("getattrlistbulk", dvp, (int64_t)*retval, error);   /* AkIOS (11-22), open_probe=1 */
 		vnode_put(dvp);
 	}
 

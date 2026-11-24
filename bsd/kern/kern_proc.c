@@ -3906,12 +3906,15 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 		size_t length;
 		struct cs_blob* blob;
 
+		/*
+		 * hakios: no signature is checked here, so no process is CS_VALID and no blob has the OSEntitlements object
+		 * the real AMFI makes for it: asked this way, every process had no entitlements at all, and user space's own
+		 * checks (Security's SecTask, XPC's, a framework testing itself -- lockdownd's RemotePairing refused to pair:
+		 * "Missing required entitlement com.apple.dt.remotepairing.pairingmanagement") all said no. The entitlements
+		 * written in the signature are given as they are instead, as the AMFI stand-in does for the kernel's own
+		 * questions (libkern/amfi/miniamfi_entitlements.cpp). A program without a signature still has none.
+		 */
 		proc_lock(pt);
-		if ((proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED)) == 0) {
-			proc_unlock(pt);
-			error = EINVAL;
-			goto out;
-		}
 		blob = csproc_get_blob(pt);
 		proc_unlock(pt);
 
@@ -3922,6 +3925,9 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 
 		void* osent = csblob_os_entitlements_get(blob);
 		if (!osent) {
+			if (csblob_get_entitlements(blob, &start, &length) == 0 && start != NULL && length > 0) {
+				error = csops_copy_token(start, length, usize, uaddr);
+			}
 			goto out;
 		}
 		CS_GenericBlob* xmlblob = NULL;
@@ -3941,18 +3947,28 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 		size_t length;
 		struct cs_blob* blob;
 
+		/* hakios: as for CS_OPS_ENTITLEMENTS_BLOB above: the DER entitlements of the signature, CS_VALID or not */
 		proc_lock(pt);
-		if ((proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED)) == 0) {
-			proc_unlock(pt);
-			error = EINVAL;
-			goto out;
-		}
 		blob = csproc_get_blob(pt);
 		proc_unlock(pt);
 
 		if (!blob) {
 			error = EBADEXEC;
 			goto out;
+		}
+
+		{
+			const CS_GenericBlob *der = csblob_get_der_entitlements_unsafe(blob);
+			static int said;
+
+			if (der != NULL) {
+				if (said++ < 3) {
+					printf("hakios: csops: the DER entitlements of %s's signature, as they are (%u bytes)\n",
+					    pt->p_comm, ntohl(der->length));
+				}
+				error = csops_copy_token(der, ntohl(der->length), usize, uaddr);
+				goto out;
+			}
 		}
 
 		error = csblob_get_der_entitlements(blob, (const CS_GenericBlob **)&start, &length);

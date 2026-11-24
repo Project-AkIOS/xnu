@@ -275,6 +275,9 @@ mmap_sanitize(
  * XXX usage is PROT_* from an interface perspective.  Thus the values of
  * XXX VM_PROT_* and PROT_* need to correspond.
  */
+extern int hakios_shm_probe_enabled(void);
+extern void hakios_shm_probe(const char *, const char *, vm_map_t, uint64_t, uint64_t, uint64_t, int);
+
 int
 mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 {
@@ -917,6 +920,19 @@ map_file_retry:
 	}
 
 	if (!mapanon) {
+		if (result == KERN_SUCCESS && hakios_shm_probe_enabled()) {
+			char path[MAXPATHLEN];
+			int len = sizeof(path);
+
+			char who[MAXCOMLEN + 1];
+
+			proc_selfname(who, sizeof(who));
+			if (vn_getpath(vp, path, &len) == 0 && (strnstr(path, "csstore", sizeof(path)) != NULL ||
+			    ((flags & MAP_SHARED) && (strcmp(who, "coreservicesd") == 0 || strcmp(who, "pathcheck") == 0)))) {
+				printf("shm_probe: mmap of %s: file size %lld, flags %x\n", path, (long long)ubc_getsize(vp), flags);
+				hakios_shm_probe("mmap", path, user_map, user_addr + (file_pos & user_mask), user_size, file_pos, prot);
+			}
+		}
 		(void)vnode_put(vp);
 	}
 
@@ -1055,7 +1071,45 @@ msync_nocancel(__unused proc_t p, struct msync_nocancel_args *uap, __unused int3
 
 	sync_flags |= VM_SYNC_CONTIGUOUS;       /* complain if holes */
 
-	rv = mach_vm_msync(user_map, addr, size, sync_flags);
+	{
+		/*
+		 * AkIOS (11-23): msync_probe=NAME -- NAME's msync calls: the first 20 each (flags, size, how long), then a
+		 * total every 200 (audiomxd compiles its audio models at every start, ~100 s, with msync on top of the stack).
+		 */
+		extern void loader_log_line(const char *line);
+		static int on = -1;
+		static char who[MAXCOMLEN + 1];
+		static uint64_t calls, total_abs, bytes;
+		uint64_t t0 = 0;
+		bool probed;
+
+		if (on < 0) {
+			on = PE_parse_boot_arg_str("msync_probe", who, sizeof(who)) && who[0] != '\0';
+		}
+		probed = on > 0 && strcmp(current_proc()->p_comm, who) == 0;
+		if (probed) {
+			t0 = mach_absolute_time();
+		}
+		rv = mach_vm_msync(user_map, addr, size, sync_flags);
+		if (probed) {
+			uint64_t dt = mach_absolute_time() - t0, ns;
+			char line[160];
+
+			calls++;
+			total_abs += dt;
+			bytes += size;
+			absolutetime_to_nanoseconds(dt, &ns);
+			if (calls <= 20 || calls % 200 == 0) {
+				uint64_t total_ns;
+
+				absolutetime_to_nanoseconds(total_abs, &total_ns);
+				snprintf(line, sizeof(line), "msync_probe: %s call %llu: flags %#x size %llu: %llu us (all: %llu ms, %llu MB)\n",
+				    who, calls, flags, (unsigned long long)size, ns / 1000, total_ns / 1000000, bytes >> 20);
+				printf("%s", line);
+				loader_log_line(line);
+			}
+		}
+	}
 
 	switch (rv) {
 	case KERN_SUCCESS:

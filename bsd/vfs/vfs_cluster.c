@@ -3895,6 +3895,48 @@ cluster_update_state(vnode_t vp, vm_object_offset_t s_offset, vm_object_offset_t
 }
 
 
+/*
+ * AkIOS (11-22): xnu-13432's cluster_update_range_with_callback, which Apple's iOS 27 APFS kext calls, as the KDK 26B131
+ * kernel does it: the range [offset, offset + length) (inside the file's size rounded to a page) is taken in chunks of
+ * 64 MB from its first to its last page; for each, the file system's callback runs first (it may refuse: its error is
+ * returned) and then the chunk's pages are put in the vnode's write-behind clusters (cluster_update_state).
+ */
+typedef int (*akios_cluster_range_cb)(vnode_t vp, off_t offset, off_t length, off_t filesize, off_t start, off_t end,
+    void *ctx);
+
+int cluster_update_range_with_callback(vnode_t vp, off_t offset, off_t length, off_t filesize,
+    akios_cluster_range_cb callback, void *ctx);
+
+int
+cluster_update_range_with_callback(vnode_t vp, off_t offset, off_t length, off_t filesize,
+    akios_cluster_range_cb callback, void *ctx)
+{
+	off_t end, start, last, chunk_end;
+	int error;
+
+	if (callback == NULL || offset < 0 || length < 0 || filesize < 0 || os_add_overflow(offset, length, &end)) {
+		return EINVAL;
+	}
+	if ((off_t)round_page_64((uint64_t)filesize) < end) {
+		return EINVAL;
+	}
+	if (length == 0) {
+		return 0;
+	}
+	start = (off_t)trunc_page_64((uint64_t)offset);
+	last = (off_t)round_page_64((uint64_t)end);
+	while (start < last) {
+		chunk_end = MIN(start + (64LL << 20), last);
+		error = callback(vp, offset, length, filesize, start, chunk_end, ctx);
+		if (error) {
+			return error;
+		}
+		cluster_update_state(vp, (vm_object_offset_t)start, (vm_object_offset_t)chunk_end, FALSE);
+		start = chunk_end;
+	}
+	return 0;
+}
+
 static void
 cluster_update_state_internal(vnode_t vp, struct cl_extent *cl, int flags, boolean_t defer_writes,
     boolean_t *first_pass, off_t write_off, int write_cnt, off_t newEOF,

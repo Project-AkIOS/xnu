@@ -1605,6 +1605,26 @@ __attribute__((noreturn))
 void
 exit(proc_t p, struct exit_args *uap, int *retval)
 {
+	{
+		/* AkIOS (11-23): exit_probe=NAME -- where NAME calls exit() from (the "userabort:" line's printer; audiomxd
+		 * quits with exit(1) after ~108 s and says no reason) */
+		extern void user_abort_trace(void);
+		static int on = -1;
+		static char who[MAXCOMLEN + 1];
+
+		if (on < 0) {
+			on = PE_parse_boot_arg_str("exit_probe", who, sizeof(who)) && who[0] != '\0';
+		}
+		if (on > 0 && strcmp(p->p_comm, who) == 0) {
+			printf("exit_probe: %s[%d] exit(%d)\n", p->p_comm, proc_getpid(p), uap->rval);
+			user_abort_trace();
+			{
+				extern void ustacks_current(void);
+
+				ustacks_current();      /* (11-24) and where every other thread of it stands */
+			}
+		}
+	}
 	p->p_xhighbits = ((uint32_t)(uap->rval) & 0xFF000000) >> 24;
 	exit1(p, W_EXITCODE((uint32_t)uap->rval, 0), retval);
 

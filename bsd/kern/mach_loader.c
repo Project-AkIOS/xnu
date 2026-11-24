@@ -760,9 +760,9 @@ load_machfile(
 
 	result->is_64bit_addr = ((imgp->ip_flags & IMGPF_IS_64BIT_ADDR) == IMGPF_IS_64BIT_ADDR);
 	result->is_64bit_data = ((imgp->ip_flags & IMGPF_IS_64BIT_DATA) == IMGPF_IS_64BIT_DATA);
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	pmap_flags |= (imgp->ip_flags & IMGPF_NOJOP) ? PMAP_CREATE_DISABLE_JOP : 0;
-#endif /* defined(HAS_APPLE_PAC) */
+#endif /* defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC */
 #if CONFIG_ROSETTA
 	pmap_flags |= (imgp->ip_flags & IMGPF_ROSETTA) ? PMAP_CREATE_ROSETTA : 0;
 #endif

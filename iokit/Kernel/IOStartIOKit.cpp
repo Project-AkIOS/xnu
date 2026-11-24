@@ -77,8 +77,11 @@ IOKitInitializeTime( void )
 	t.tv_sec = 30;
 	t.tv_nsec = 0;
 
+// RTC is not present on this target (HakiOS: 8796's own #ifndef BCM2837, which 12377 dropped with the board)
+#if !defined(ARM64_BOARD_CONFIG_BCM2837)
 	IOService::waitForService(
 		IOService::resourceMatching("IORTC"), &t );
+#endif
 #if defined(__i386__) || defined(__x86_64__)
 	IOService::waitForService(
 		IOService::resourceMatching("IONVRAM"), &t );

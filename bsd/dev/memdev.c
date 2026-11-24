@@ -159,7 +159,8 @@ static const struct cdevsw mdevcdevsw = {
 
 struct mdev {
 	uint64_t        mdBase;         /* base page number (pages are assumed to be 4K). Multiply by 4096 to find actual address */
-	uint32_t        mdSize;         /* size in pages (pages are assumed to be 4K). Multiply by 4096 to find actual size. */
+	uint64_t        mdSize;         /* size in pages (pages are assumed to be 4K). Multiply by 4096 to find actual size.
+	                                 * 64 bits wide so that "mdSize << 12" does not wrap for a disk of 4 GB or more. */
 	int                     mdFlags;        /* flags */
 	int                     mdSecsize;      /* sector size */
 	int                     mdBDev;         /* Block device number */
@@ -179,6 +180,7 @@ int mdevCMajor = -1;
 static int      mdevioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p, int is_char);
 dev_t           mdevadd(int devid, uint64_t base, unsigned int size, int phys);
 dev_t           mdevlookup(int devid);
+int             mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
 void            mdevremoveall(void);
 int             mdevgetrange(int devid, uint64_t *base, uint64_t *size);
 
@@ -245,7 +247,9 @@ mdevrw(dev_t dev, struct uio *uio, __unused int ioflag)
 	if (uio->uio_offset > (mdev[devid].mdSize << 12)) {
 		count = 0;
 	} else {
-		count = imin(uio_resid(uio), (mdev[devid].mdSize << 12) - uio->uio_offset);
+		uint64_t room = (mdev[devid].mdSize << 12) - (uint64_t)uio->uio_offset;
+
+		count = (uint64_t)uio_resid(uio) < room ? (int)uio_resid(uio) : (int)(room > INT_MAX ? INT_MAX : room);
 	}
 
 	status = uiomove64(mdata, count, uio);     /* Move the data */
@@ -450,8 +454,8 @@ mdevioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag,
 		}
 		memdev_info->mi_mdev = TRUE;
 		memdev_info->mi_phys = (mdev[devid].mdFlags & mdPhys) ? TRUE : FALSE;
-		memdev_info->mi_base = (uint32_t)mdev[devid].mdBase;
-		memdev_info->mi_size = mdev[devid].mdSize;
+		memdev_info->mi_base = mdev[devid].mdBase;
+		memdev_info->mi_size = (typeof(memdev_info->mi_size))mdev[devid].mdSize;
 		break;
 
 	default:
@@ -697,6 +701,14 @@ mdevadd(int devid, uint64_t base, unsigned int size, int phys)
 
 	mdev[devid].mdBase = base;                                                      /* Set the base address of ram disk */
 	mdev[devid].mdSize = size;                                                      /* Set the length of the ram disk */
+	{
+		/* HakiOS (11-21): an IOMedia for it, as for the phone's storage (iokit/Kernel/MiniIOMedia.cpp) */
+		extern void hakios_iomedia_publish(const char *, int, int, unsigned long long, unsigned int, int, const char *, int);
+		char bsd[16];
+
+		snprintf(bsd, sizeof(bsd), "md%d", devid);
+		hakios_iomedia_publish(bsd, mdevBMajor, devid, (unsigned long long)size << 12, 4096, 1, "Apple_APFS", 1);
+	}
 	mdev[devid].mdSecsize = DEV_BSIZE;                                      /* Set starting block size */
 	if (phys) {
 		mdev[devid].mdFlags |= mdPhys;                          /* Show that we are in physical memory */
@@ -718,6 +730,26 @@ mdevlookup(int devid)
 		return -1;                                      /* This one hasn't been defined */
 	}
 	return mdev[devid].mdBDev;                                                      /* Return the device number */
+}
+
+/*
+ * For a filesystem that reads a memory disk in place: where the disk is in the kernel's
+ * address space. Not for disks given by physical address (those are not mapped).
+ */
+int
+mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size)
+{
+	for (int i = 0; i < NB_MAX_MDEVICES; i++) {
+		if ((mdev[i].mdFlags & mdInited) && mdev[i].mdBDev == dev) {
+			if (mdev[i].mdFlags & mdPhys) {
+				return ENOTSUP;
+			}
+			*base = (vm_offset_t)(mdev[i].mdBase << 12);
+			*size = mdev[i].mdSize << 12;
+			return 0;
+		}
+	}
+	return ENXIO;
 }
 
 void

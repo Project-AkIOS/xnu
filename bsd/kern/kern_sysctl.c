@@ -2358,10 +2358,10 @@ sysctl_sysctl_bootargs
 (__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
 {
 	int error;
-	char buf[BOOT_LINE_LENGTH];
+	char buf[1024];         /* HakiOS: the command line and the kernel's built-in arguments (pexpert/arm/pe_bootargs.c) */
 
-	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
-	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
+	strlcpy(buf, PE_boot_args(), sizeof(buf));
+	error = sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
 	return error;
 }
 

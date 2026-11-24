@@ -146,6 +146,14 @@
 #include <net/if_ether.h>               /* for ether_family_init() */
 #include <net/if_gif.h>                 /* for gif_init() */
 #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
+#include <sys/hakios.input.h>
+#include <sys/hakios.audio.h>
+#include <sys/hakios.virtio_blk.h>
+#include <sys/hakios.sparse.h>
+#include <sys/hakios.version.h>
+#if APFS
+#include <sys/hakios.apfs_check.h>
+#endif
 #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
 #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
 #include <netinet/flow_divert.h>        /* flow_divert_init() */
@@ -409,8 +417,13 @@ LCK_MTX_DECLARE_ATTR(proc_list_mlock, &proc_mlock_grp, &proc_lck_attr);
 #if XNU_TARGET_OS_OSX
 /* hook called after root is mounted XXX temporary hack */
 void (*mountroot_post_hook)(void);
-void (*unmountroot_pre_hook)(void);
 #endif
+/*
+ * AkIOS (11-22): on all targets, as in xnu-13432: Apple's iOS APFS kext (prelinked, tools/mkprelink.py) stores its
+ * root-unmount callback here at start. Only macOS's shutdown path calls it so far (kern_shutdown.c); APFS's callback
+ * takes an argument in 13432 -- check that before calling it here.
+ */
+void (*unmountroot_pre_hook)(void);
 void set_rootvnode(vnode_t);
 
 extern lck_rw_t rootvnode_rw_lock;
@@ -498,17 +511,31 @@ bsd_init(void)
 	check_for_failure_injection(XNU_STAGE_BSD_INIT_START);
 #endif
 
-#define DEBUG_BSDINIT 0
+#define DEBUG_BSDINIT 1 /* bring-up: trace bsd_init steps (only visible with -enable_kprintf_spam) */
 
-#if DEBUG_BSDINIT
+#if DEBUG_BSDINIT && defined(ARM64_BOARD_CONFIG_BCM2837)
+/* HakiOS bring-up: each step is a numbered loader checkpoint too (osfmk/kern/startup.c, hakios_boot_step_log) */
+extern void hakios_boot_step_log(const char *prefix, const char *message);
+#define bsd_init_kprintf(x, ...) hakios_boot_step_log("bsd_init: ", x)
+#elif DEBUG_BSDINIT
 #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
 #else
 #define bsd_init_kprintf(x, ...)
 #endif
 
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	extern void loader_checkpoint(uint64_t n);
+	loader_checkpoint(72);  /* HakiOS bring-up */
+#endif
 	throttle_init();
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	loader_checkpoint(73);
+#endif
 
 	printf(copyright);
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	loader_checkpoint(74);
+#endif
 
 #if CONFIG_DEV_KMEM
 	bsd_init_kprintf("calling dev_kmem_init\n");
@@ -1002,6 +1029,25 @@ bsd_init(void)
 
 		bsd_init_kprintf("calling devfs_kernel_mount\n");
 		devfs_kernel_mount(mounthere);
+		hakios_version_init();         /* kern.hakios.version, and the version in the boot log */
+		hakios_input_init();           /* /dev/hakios-touch */
+		{
+			extern void hakios_console_log_init(void);
+
+			hakios_console_log_init();   /* /dev/hakios-console: this boot's console log, for init's boot-N.log (11-22) */
+		}
+		{
+			extern void hakios_haptics_ready_init(void);
+
+			hakios_haptics_ready_init(); /* AHSFirmwareReadyNotifier: audiomxd's haptic server waits for it (11-23) */
+		}
+		hakios_audio_init();           /* /dev/hakios-audio */
+		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
+		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
+#if APFS
+		/* mounts and walks /dev/rvblk0 once userland has /private/var up */
+		hakios_apfs_check_init();
+#endif
 	}
 #endif /* DEVFS */
 

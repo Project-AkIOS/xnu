@@ -4290,6 +4290,17 @@ unmount_callback(mount_t mp, void *arg)
 	    && ((mp->mnt_flag & MNT_ROOTFS) || (mp->mnt_kern_flag & MNTK_SYSTEM))) { //MNTK_BACKS_ROOT
 		printf("unmount(%d) %s skipped\n", uip->u_only_non_system, mntname);
 		mount_iterdrop(mp);     // VFS_ITERATE_CB_DROPREF
+	} else if (!uip->u_only_non_system && ((mp->mnt_flag & MNT_RDONLY) ||
+	    strcmp(mp->mnt_vfsstat.f_fstypename, "devfs") == 0)) {
+		/*
+		 * hakios: on the way down, the system's last pass leaves devfs and every read-only file system mounted. Forced off,
+		 * /dev and then the read-only root never came back on the Pixel 8a -- iOS's Shut Down and Restart hung here, inside
+		 * dounmount, before the file system was even asked -- and neither holds anything to write: every file system with
+		 * data was unmounted in the pass before this one (the data volume among them).
+		 */
+		printf("unmount(%d) %s left mounted (%s)\n", uip->u_only_non_system, mntname,
+		    (mp->mnt_flag & MNT_RDONLY) ? "read-only" : "devfs");
+		mount_iterdrop(mp);     // VFS_ITERATE_CB_DROPREF
 	} else {
 		printf("unmount(%d) %s\n", uip->u_only_non_system, mntname);
 

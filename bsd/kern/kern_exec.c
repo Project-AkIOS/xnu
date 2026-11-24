@@ -1919,6 +1919,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
  *		activators should not be given the opportunity to attempt
  *		to activate the image.
  */
+/* Bring-up aid: with boot-arg systrace set, say which stage of an exec refused the image. */
+static TUNABLE(uint32_t, exec_trace, "systrace", 0);
+
 static int
 exec_mach_imgact(struct image_params *imgp)
 {
@@ -2031,6 +2034,24 @@ grade:
 		goto bad;
 	}
 
+#if HAKIOS_USER_PAC && !defined(HAS_APPLE_PAC)
+	/*
+	 * HakiOS PATH 2: an image runs with user pointer authentication only if it is arm64e (current
+	 * ptrauth ABI) AND the boot-arg policy selects it (hakios_pac_exec_wants_pac(); never with
+	 * hakios_pac=0). Everything else -- arm64, and arm64e not selected -- is PAC-off: IMGPF_NOJOP,
+	 * which becomes the pmap's disable_jop and the task's/thread's disable_user_jop.
+	 */
+	if (mach_header->cputype == CPU_TYPE_ARM64 &&
+	    (mach_header->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E &&
+	    CPU_SUBTYPE_ARM64_PTR_AUTH_VERSION(mach_header->cpusubtype) == CPU_SUBTYPE_ARM64_PTR_AUTH_CURRENT_VERSION &&
+	    hakios_pac_exec_wants_pac(imgp->ip_ndp->ni_cnd.cn_nameptr,
+	    (size_t)imgp->ip_ndp->ni_cnd.cn_namelen, true)) {
+		imgp->ip_flags &= ~IMGPF_NOJOP;
+	} else {
+		imgp->ip_flags |= IMGPF_NOJOP;
+	}
+#endif /* HAKIOS_USER_PAC && !defined(HAS_APPLE_PAC) */
+
 #if defined(HAS_APPLE_PAC)
 	assert(mach_header->cputype == CPU_TYPE_ARM64
 	    );
@@ -2076,6 +2097,9 @@ grade:
 	 * Actually load the image file we previously decided to load.
 	 */
 	lret = load_machfile(imgp, mach_header, thread, &map, &load_result);
+	if (lret != LOAD_SUCCESS && exec_trace) {
+		printf("exectrace: %s: load_machfile failed: %d\n", imgp->ip_ndp->ni_cnd.cn_pnbuf, lret);
+	}
 	if (lret != LOAD_SUCCESS) {
 		error = load_return_to_errno(lret);
 
@@ -2228,6 +2252,14 @@ grade:
 	 * a pre-existing task.
 	 */
 	int cpu_subtype = 0;     /* all cpu_subtypes use the same shared region */
+	/*
+	 * HakiOS PATH 2: PAC-on and PAC-off processes use the SAME shared region (cpu_subtype 0 for
+	 * both). The region's nested map holds the cache with its auth pointers unsigned, for the
+	 * PAC-off tasks; a PAC-on task gets private, signed mappings of the auth sections laid over
+	 * it (vm_shared_region_auth_remap()). A second, arm64e-keyed region for PAC-on tasks was
+	 * tried and left the subtype-0 region without a cache (launchd: "NO DYLD CACHE"): the auth
+	 * sections are now found by their slide info (v3), not by the region's subtype.
+	 */
 #if __has_feature(ptrauth_calls)
 	char *shared_region_id = NULL;
 	size_t len;
@@ -2949,6 +2981,11 @@ struct execsw {
  *	<ex_imgact>:???			[anything an imgact can return]
  *	EDEADLK				Process is being terminated
  */
+#if CONFIG_PERSONAS
+static void akios_cred_probe(const char *what, proc_t p, struct _posix_spawn_persona_info *pp);   /* AkIOS (11-22) */
+#else
+#define akios_cred_probe(w, p, pp) do { } while (0)
+#endif
 static int
 exec_activate_image(struct image_params *imgp)
 {
@@ -3018,6 +3055,9 @@ again:
 	}
 
 	error = exec_check_permissions(imgp);
+	if (error && exec_trace) {
+		printf("exectrace: %s: exec_check_permissions failed: %d\n", imgp->ip_ndp->ni_cnd.cn_pnbuf, error);
+	}
 	if (error) {
 		goto bad;
 	}
@@ -3119,6 +3159,17 @@ encapsulated_binary:
 			kauth_authorize_fileop(vfs_context_ucred(imgp->ip_vfs_context),
 			    KAUTH_FILEOP_EXEC,
 			    (uintptr_t)ndp->ni_vp, 0);
+		}
+	}
+	if (error == 0) {
+		/* AkIOS (11-22): cred_probe=1, the credential these daemons run with (see akios_cred_probe) */
+		static const char *const watched[] = { "coreservicesd", "lsd", "configd", "SpringBoard", "cfprefsd", "powerd",
+			                               "xpcproxy" };
+		for (unsigned w = 0; w < sizeof(watched) / sizeof(watched[0]); w++) {
+			if (strcmp(p->p_comm, watched[w]) == 0) {
+				akios_cred_probe("exec", p, NULL);
+				break;
+			}
 		}
 	}
 bad:
@@ -3481,6 +3532,57 @@ done:
 
 
 /*
+ * Bring-up aid, boot-arg applog=1: what applications and other programs started without a
+ * terminal say is worth reading here. Their standard output and error, which launchd opens on
+ * /dev/null, go to the console instead (that shows NSLog and the "Terminating app due to
+ * uncaught exception" kind of message). With applog=2 every program also gets
+ * OS_ACTIVITY_DT_MODE in its environment, which makes os_log write to standard error as well:
+ * everything any program logs, and a much slower system. applog_name=NAME[,NAME...] with
+ * applog=1 does that for the programs whose file names begin with one of the NAMEs only,
+ * which is how to read what one application extension has to say (launchd starts those for
+ * whoever asks, so there is no job description of ours to put the variable in).
+ */
+static TUNABLE(uint32_t, exec_applog, "applog", 0);
+static TUNABLE_STR(exec_applog_name, 128, "applog_name", "");
+
+static bool
+exec_applog_oslog(struct image_params *imgp)
+{
+	const char *name, *p = exec_applog_name;
+
+	if (exec_applog >= 2) {
+		return true;
+	}
+	if (exec_applog == 0 || *p == 0 || imgp->ip_ndp == NULL) {
+		return false;
+	}
+	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
+	while (*p != 0) {
+		const char *word = p;
+
+		while (*p != 0 && *p != ',') {
+			p++;
+		}
+		if (p != word && (size_t)(p - word) <= imgp->ip_ndp->ni_cnd.cn_namelen && strncmp(word, name, (size_t)(p - word)) == 0) {
+			return true;
+		}
+		if (*p == ',') {
+			p++;
+		}
+	}
+	return false;
+}
+
+static const char *
+exec_applog_path(int fd, const char *path)
+{
+	if (exec_applog && (fd == 1 || fd == 2) && strcmp(path, "/dev/null") == 0) {
+		return "/dev/console";
+	}
+	return path;
+}
+
+/*
  * exec_handle_exception_port_actions
  *
  * Description:	Go through the saved exception ports in exec_port_actions,
@@ -3587,7 +3689,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
 			AUDIT_SUBCALL_ENTER(OPEN, p, uthread);
 
 			NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
-			    CAST_USER_ADDR_T(psfa->psfaa_openargs.psfao_path),
+			    CAST_USER_ADDR_T(exec_applog_path(psfa->psfaa_filedes, psfa->psfaa_openargs.psfao_path)),
 			    imgp->ip_vfs_context);
 
 			error = open1(imgp->ip_vfs_context, ndp,
@@ -3963,6 +4065,14 @@ spawn_coalitions_release_all(coalition_t coal[COALITION_NUM_TYPES])
 #endif
 
 #if CONFIG_PERSONAS
+/*
+ * AkIOS (11-22): the checks relaxed below date from iOS 16.5, when this port had no personas. On iOS 27 they exist
+ * (usermanagerd --init makes them before launchd), so the stock xnu-12377 checks can be had again with the boot-arg
+ * persona_strict=1. Off by default: init and launchd spawn into personas without the entitlement being visible here,
+ * and refusing them would stop the boot.
+ */
+static TUNABLE(bool, spawn_persona_strict, "persona_strict", false);
+
 static int
 spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
 {
@@ -3970,10 +4080,21 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
 	struct persona *persona = NULL;
 	kauth_cred_t mycred = kauth_cred_get();
 
-	if (!IOCurrentTaskHasEntitlement( PERSONA_MGMT_ENTITLEMENT)) {
+	/* AkIOS (11-22): stock check, only with persona_strict=1 (see above) */
+	if (spawn_persona_strict && !IOCurrentTaskHasEntitlement( PERSONA_MGMT_ENTITLEMENT)) {
 		return EPERM;
 	}
 
+	/*
+	 * hakios: two of the three checks below cannot be passed in this port, and both stand in
+	 * the way of something ordinary. The entitlement is one nobody carries here (nothing is
+	 * signed, AMFI is a stub), and the persona is one nobody makes -- yet a package manager
+	 * becomes root by asking for exactly this: Sileo spawns apt and dpkg into persona 99 with
+	 * the uid it wants (its APTWrapper). Refused here, the spawn failed before the program was
+	 * ever started, and the application waited for an answer that could not come. The check
+	 * that still means something -- the size of the group list -- stays; see
+	 * spawn_persona_adopt() below for what happens then.
+	 */
 	if (px_persona->pspi_flags & POSIX_SPAWN_PERSONA_GROUPS) {
 		if (px_persona->pspi_ngroups > NGROUPS_MAX) {
 			return EINVAL;
@@ -3981,12 +4102,18 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
 	}
 
 	persona = persona_lookup(px_persona->pspi_id);
-	if (!persona) {
+	/* AkIOS (11-22): stock check, only with persona_strict=1 */
+	if (spawn_persona_strict && !persona) {
 		return ESRCH;
 	}
 
 	// non-root process should not be allowed to set persona with uid/gid 0
-	if (!kauth_cred_issuser(mycred) &&
+	/*
+	 * HAKIOS-12377: this check is new in 12377. Applied to a persona that does not exist it
+	 * would refuse exactly what the hakios path is for (Sileo, running as mobile, asking for
+	 * persona 99 with uid 0), so it is kept only for a persona that exists.
+	 */
+	if (persona != NULL && !kauth_cred_issuser(mycred) &&
 	    (px_persona->pspi_uid == 0 || px_persona->pspi_gid == 0)) {
 		error = EPERM;
 	}
@@ -4027,8 +4154,54 @@ kauth_cred_model_setpersona(
 	return updated;
 }
 
+static void akios_cred_probe(const char *what, proc_t p, struct _posix_spawn_persona_info *pp);
+static int akios_spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona);
 static int
 spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+{
+	struct persona *persona = NULL;
+	int akios_error;
+
+	akios_error = akios_spawn_persona_adopt(p, px_persona);
+	akios_cred_probe("persona", p, px_persona);
+	return akios_error;
+}
+
+/*
+ * AkIOS (11-22): cred_probe=1 -- each persona a process is spawned into (launchd -> xpcproxy: the persona id, its flags,
+ * the uid/gid asked for) and the credential it ends up with; and, after exec, the credential of a few daemons
+ * (coreservicesd builds the system's volume table only as root, and lsd/SpringBoard depend on it).
+ */
+static void
+akios_cred_probe(const char *what, proc_t p, struct _posix_spawn_persona_info *pp)
+{
+	static int on = -1;
+	static uint32_t said;
+	kauth_cred_t cred;
+
+	if (on < 0) {
+		uint32_t v = 0;
+
+		on = PE_parse_boot_argn("cred_probe", &v, sizeof(v)) && v != 0;
+	}
+	if (on <= 0 || said >= 400) {
+		return;
+	}
+	said++;
+	cred = kauth_cred_proc_ref(p);
+	if (pp != NULL) {
+		printf("cred_probe: %s pid %d (%s): persona id %u flags %#x uid %u gid %u -> ruid %u euid %u rgid %u\n",
+		    what, proc_getpid(p), p->p_comm, pp->pspi_id, pp->pspi_flags, pp->pspi_uid, pp->pspi_gid,
+		    kauth_cred_getruid(cred), kauth_cred_getuid(cred), kauth_cred_getrgid(cred));
+	} else {
+		printf("cred_probe: %s pid %d (%s): ruid %u euid %u rgid %u\n", what, proc_getpid(p), p->p_comm,
+		    kauth_cred_getruid(cred), kauth_cred_getuid(cred), kauth_cred_getrgid(cred));
+	}
+	kauth_cred_unref(&cred);
+}
+
+static int
+akios_spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
 {
 	struct persona *persona = NULL;
 
@@ -4037,8 +4210,46 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
 	 * the kauth with a different UID/GID combo
 	 */
 	persona = persona_lookup(px_persona->pspi_id);
-	if (!persona) {
+	/* AkIOS (11-22): stock behaviour with persona_strict=1: no persona, no spawn */
+	if (!persona && spawn_persona_strict) {
 		return ESRCH;
+	}
+	if (!persona) {
+		/*
+		 * hakios: there are no personas in this port -- nothing makes them, and
+		 * kpersona_find_by_type() answers "no such process" to everyone who asks. Darwin's own
+		 * programs get along without them, but a package manager becomes root by way of one:
+		 * Sileo asks posix_spawn for persona 99 with OVERRIDE and uid 0 (its APTWrapper), and
+		 * that is how it runs apt and dpkg. With the persona missing the lookup failed, the
+		 * whole spawn failed with ESRCH, and the application sat for ever waiting for an
+		 * answer from a program that was never started. What the caller is after is the
+		 * credential, not the persona, so the credential is what it gets: the uid, gid and
+		 * groups it asked for, set on the process being spawned.
+		 *
+		 * The thread's own credential is not touched here: the thread running this is the
+		 * parent's, and the new process gets its credential when its image is activated.
+		 *
+		 * And the count of processes per real uid follows, as persona_proc_adopt() keeps it:
+		 * fork1() counted the new process under the parent's uid (mobile's), its exit takes
+		 * it off under the one it has then (root's). Without that, every program Sileo ran as
+		 * root took one away from root's count that had never been given -- and once Sileo's
+		 * own mv, cp and rm ran at all, a few dozen of them brought root's count to nothing,
+		 * and the next process of root's to exit panicked the kernel ("chgproccnt: lost user").
+		 */
+		/* proc_ucred_unsafe() is OK because p is a fork/exec/... child */
+		uid_t old_ruid = kauth_cred_getruid(proc_ucred_unsafe(p));
+		uid_t new_ruid;
+
+		(void)kauth_cred_proc_update(p, PROC_SETTOKEN_SETUGID,
+		    ^bool (kauth_cred_t parent __unused, kauth_cred_t model) {
+			return kauth_cred_model_setpersona(model, px_persona);
+		});
+		new_ruid = kauth_cred_getruid(proc_ucred_unsafe(p));
+		if (old_ruid != new_ruid) {
+			(void)chgproccnt(new_ruid, 1);
+			(void)chgproccnt(old_ruid, -1);
+		}
+		return 0;
 	}
 
 	return persona_proc_adopt(p, persona,
@@ -5064,7 +5275,7 @@ do_fork1:
 	 * as 0 and pretends the call succeeded.
 	 */
 	error = exec_activate_image(imgp);
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	const uint8_t disable_user_jop = imgp->ip_flags & IMGPF_NOJOP ? TRUE : FALSE;
 	ml_task_set_jop_pid_from_shared_region(new_task, disable_user_jop);
 	ml_task_set_disable_user_jop(new_task, disable_user_jop);
@@ -6138,7 +6349,7 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
 		 * for vfexec.
 		 */
 		new_task = get_threadtask(imgp->ip_new_thread);
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 		ml_task_set_disable_user_jop(new_task, imgp->ip_flags & IMGPF_NOJOP ? TRUE : FALSE);
 		ml_thread_set_disable_user_jop(imgp->ip_new_thread, imgp->ip_flags & IMGPF_NOJOP ? TRUE : FALSE);
 #endif
@@ -6193,12 +6404,12 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
 	}
 
 
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	if (imgp->ip_new_thread && !error) {
 		ml_task_set_jop_pid_from_shared_region(new_task, imgp->ip_flags & IMGPF_NOJOP);
 		ml_thread_set_jop_pid(imgp->ip_new_thread, new_task);
 	}
-#endif /* defined(HAS_APPLE_PAC) */
+#endif /* defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC */
 
 	/* flag exec has occurred, notify only if it has not failed due to FP Key error */
 	if (exec_done && ((p->p_lflag & P_LTERM_DECRYPTFAIL) == 0)) {
@@ -6724,10 +6935,109 @@ bad:
  * Note:	The argument and environment vectors are user space pointers
  *		to arrays of user space pointers.
  */
+/*
+ * Bring-up aid: the sysctl kern.exec_inject holds "LIBRARY NAME NAME ..."; every program
+ * whose file name is one of the NAMEs is started with DYLD_INSERT_LIBRARIES=LIBRARY in its
+ * environment, so that dyld loads our library into it. Several such groups may follow each
+ * other, separated by ";". A program named in more than one group gets every one of those
+ * libraries, joined with ":" in the one DYLD_INSERT_LIBRARIES, so SpringBoard can carry both
+ * our window-server library and the tweak loader. launchd refuses to pass DYLD_ variables
+ * from a job description, which is why the kernel adds this one. Set once by our init (from
+ * etc/inject.conf) before it hands over to launchd.
+ */
+/* 4 KB (11-20): 512 was too small -- the default list is ~460 bytes, and one more line (INJECT_LOG) made init's write
+ * fail with EINVAL, so NOTHING was inserted: backboardd without our library, the boot logo for ever. init reads 4 KB. */
+static char exec_inject_conf[4096];
+SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
+    "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
+
+static bool
+exec_inject_env(struct image_params *imgp, char *env, size_t size)
+{
+	const char *name, *p = exec_inject_conf;
+	size_t namelen, used;
+	bool any = false;
+
+	if (*p == 0) {
+		return false;
+	}
+	if (imgp->ip_ndp == NULL || imgp->ip_ndp->ni_cnd.cn_nameptr == NULL) {
+		printf("exec_inject: no name to match (ip_ndp %p), %s left alone\n", imgp->ip_ndp,
+		    imgp->ip_strings ? imgp->ip_strings : "?");
+		return false;
+	}
+	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
+	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
+	used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
+	bool quiet = true;                      /* (a "*" match says nothing: every program would have a line) */
+	while (*p != 0) {
+		const char *library;
+		size_t liblen;
+		bool matched = false;
+
+		while (*p == ' ' || *p == ';') {
+			p++;
+		}
+		library = p;
+		while (*p != 0 && *p != ' ' && *p != ';') {
+			p++;
+		}
+		liblen = (size_t)(p - library);
+		bool excluded = false;
+		while (*p == ' ') {
+			const char *word = ++p;
+
+			while (*p != 0 && *p != ' ' && *p != ';') {
+				p++;
+			}
+			/* "!NAME" (11-21): this group never for NAME, whatever else in it matches (log_all's "*") */
+			if (word[0] == '!' && (size_t)(p - word) == namelen + 1 && strncmp(word + 1, name, namelen) == 0) {
+				excluded = true;
+				continue;
+			}
+			if (!matched && (size_t)(p - word) == namelen && namelen != 0 && liblen != 0 &&
+			    strncmp(word, name, namelen) == 0) {
+				matched = true;         /* this group names this program; its library is added once */
+				quiet = false;
+			}
+			/*
+			 * "*" (11-21, the whole system's logs at once: init's log_all=1): every program but launchd and
+			 * xpcproxy, which start everything else and are left as Apple made them, and usermanagerd, which traps
+			 * in os_log_set_client_type with the log library in it (and everything waits for it: 11-21), and logd, the
+			 * log daemon itself, whose exit is a panic ("logd[40] exited", 11-21)
+			 */
+			if (!matched && (size_t)(p - word) == 1 && word[0] == '*' && liblen != 0 &&
+			    !(namelen == 7 && strncmp(name, "launchd", 7) == 0) &&
+			    !(namelen == 8 && strncmp(name, "xpcproxy", 8) == 0) &&
+			    !(namelen == 12 && strncmp(name, "usermanagerd", 12) == 0) &&
+			    !(namelen == 4 && strncmp(name, "logd", 4) == 0)) {
+				matched = true;
+			}
+		}
+		if (excluded) {
+			matched = false;
+		}
+		if (matched && liblen != 0 && used + 1 + liblen < size) {
+			if (any) {
+				env[used++] = ':';      /* dyld takes several libraries separated by ":" */
+			}
+			memcpy(env + used, library, liblen);
+			used += liblen;
+			env[used] = 0;
+			any = true;
+		}
+	}
+	if (any && !quiet) {
+		printf("exec_inject: %.*s <- %s\n", (int)namelen, name, env + strlen("DYLD_INSERT_LIBRARIES="));
+	}
+	return any;
+}
+
 __attribute__((noinline))
 static int
 exec_extract_strings(struct image_params *imgp)
 {
+	char            inject_env[512];
 	int error = 0;
 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
@@ -6894,6 +7204,33 @@ exec_extract_strings(struct image_params *imgp)
 			goto bad;
 		}
 		imgp->ip_argspace -= new_ptr_size; /* to hold envv[] entry */
+		imgp->ip_envc++;
+	}
+
+	/* one more variable for the programs that get our library inside them (see exec_inject_env) */
+	if (exec_inject_env(imgp, inject_env, sizeof(inject_env))) {
+		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
+		if (error) {
+			goto bad;
+		}
+		if (imgp->ip_argspace < new_ptr_size) {
+			error = E2BIG;
+			goto bad;
+		}
+		imgp->ip_argspace -= new_ptr_size;
+		imgp->ip_envc++;
+	}
+	/* ... and one for everybody when the logs are wanted on the console (see exec_applog_path) */
+	if (exec_applog_oslog(imgp)) {
+		error = exec_add_user_string(imgp, CAST_USER_ADDR_T("OS_ACTIVITY_DT_MODE=YES"), UIO_SYSSPACE, TRUE);
+		if (error) {
+			goto bad;
+		}
+		if (imgp->ip_argspace < new_ptr_size) {
+			error = E2BIG;
+			goto bad;
+		}
+		imgp->ip_argspace -= new_ptr_size;
 		imgp->ip_envc++;
 	}
 
@@ -7788,12 +8125,28 @@ handle_mac_transition:
 	/* Update the process' identity version and set the security token.
 	 * Also, ensure we always see a modified identity version (rdar://129775819).
 	 */
-	int previous_pid_version = proc_get_ro(p)->p_idversion;
-	int new_pid_version;
-	do {
-		new_pid_version = OSIncrementAtomic(&nextpidversion);
-	} while (new_pid_version == previous_pid_version);
-	proc_setpidversion(p, new_pid_version);
+	{
+		/*
+		 * (redwood) Except when xpcproxy becomes the service it was spawned for: then the process keeps
+		 * xpcproxy's identity version, as if launchd had spawned the service itself, which is what launchd
+		 * means by eliding xpcproxy ("service will attempt to elide xpcproxy"; here it spawns xpcproxy
+		 * all the same). RunningBoard keeps the audit token of such a process from before the exec and
+		 * never takes the newer one: every entitlement check it made for it failed (SecTaskLoadEntitlements
+		 * error 3, a thousand times a minute with Safari open), and Safari's web processes got no
+		 * assertions ("target is not running or doesn't have entitlement
+		 * com.apple.runningboard.assertions.webkit"). Boot-arg xpcproxy_idversion=1: a new version, as XNU.
+		 */
+		static TUNABLE(uint32_t, xpcproxy_idversion, "xpcproxy_idversion", 0);
+
+		if (xpcproxy_idversion || strncmp(p->p_comm, "xpcproxy", sizeof(p->p_comm)) != 0) {
+			int previous_pid_version = proc_get_ro(p)->p_idversion;
+			int new_pid_version;
+			do {
+				new_pid_version = OSIncrementAtomic(&nextpidversion);
+			} while (new_pid_version == previous_pid_version);
+			proc_setpidversion(p, new_pid_version);
+		}
+	}
 	task_set_uniqueid(proc_task(p));
 
 	/*
@@ -8767,6 +9120,11 @@ process_signature(proc_t p, struct image_params *imgp)
 	}
 
 done:
+	if (error && exec_trace) {
+		printf("exectrace: %s[%d]: process_signature failed: %d (csflags 0x%x, mac %d, cs_error %d)\n",
+		    p->p_comm, proc_getpid(p), error, imgp->ip_csflags, imgp->ip_mac_return,
+		    signature_failure_reason != OS_REASON_NULL);
+	}
 	if (0 == error) {
 		/*
 		 * Update the new process's signature-dependent process state.

@@ -831,6 +831,12 @@ error_out:
 		volfs_vp = NULLVP;
 	}
 
+	if (error != 0 && error != ERECYCLE && cnp->cn_pnbuf != NULL) {
+		/* AkIOS (11-23), open_probe=1: a path the probed process looks for and does not get (vfs_vnops.c) */
+		extern void akios_open_probe_path(const char *what, const char *path, int error);
+
+		akios_open_probe_path("lookup-failed", cnp->cn_pnbuf, error);
+	}
 	if ((cnp->cn_flags & HASBUF)) {
 		cnp->cn_flags &= ~HASBUF;
 		namei_free(cnp->cn_pnbuf, cnp->cn_pnlen);

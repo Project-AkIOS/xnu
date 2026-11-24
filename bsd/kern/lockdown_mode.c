@@ -40,6 +40,20 @@ int lockdown_mode_state = 0;
 SYSCTL_DECL(_security_mac);
 SYSCTL_INT(_security_mac, OID_AUTO, lockdown_mode_state, CTLFLAG_RD | CTLFLAG_LOCKED, &lockdown_mode_state, 0, "Lockdown Mode state");
 
+/*
+ * HakiOS: iOS 27's libsystem reads security.mac.lockdown_mode_state_public (8 bytes, 1 = on) and aborts when it is
+ * missing (os_lockdown_mode_enabled(): launchd died at once). Newer than xnu-12377: the same state, as 64 bits.
+ */
+static int
+sysctl_lockdown_mode_state_public SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	uint64_t state = (uint64_t)lockdown_mode_state;
+	return SYSCTL_OUT(req, &state, sizeof(state));
+}
+SYSCTL_PROC(_security_mac, OID_AUTO, lockdown_mode_state_public, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
+    0, 0, sysctl_lockdown_mode_state_public, "Q", "Lockdown Mode state (public)");
+
 __startup_func
 void
 lockdown_mode_init(void)

@@ -84,6 +84,7 @@
 #include <sys/mount_internal.h>
 #include <sys/namei.h>
 #include <sys/vnode_internal.h>
+#include <pexpert/pexpert.h>   /* AkIOS: open_probe boot-args */
 #include <sys/ioctl.h>
 #include <sys/fsctl.h>
 #include <sys/tty.h>
@@ -391,6 +392,116 @@ out:
  * XXX:		We should enummerate the possible errno values here, and where
  *		in the code they originated.
  */
+
+/*
+ * AkIOS (11-22, 11-23): open_probe=1 [open_probe_name=NAME, default lsd] [open_probe_max=N, default 600] -- every file
+ * NAME opens, every directory it reads (getattrlistbulk: entries returned; getdirentries: bytes) and every path whose
+ * lookup fails (namei: ENOENT and the rest, with the path as asked), into the console ring (serial) and the kernel log:
+ * what a process like SpringBoard reads, and what it looks for and does not find.
+ */
+void akios_open_probe(const char *what, vnode_t vp, int64_t n, int error);
+void akios_open_probe_path(const char *what, const char *path, int error);
+
+static uint32_t akios_open_probe_said;
+#define said akios_open_probe_said
+
+static int
+akios_open_probe_wanted(proc_t *pp)
+{
+	static int on = -1;
+	static uint32_t max = 600;
+	static char who[MAXCOMLEN + 1] = "lsd";
+	proc_t p = current_proc();
+
+	if (on < 0) {
+		uint32_t v = 0;
+
+		on = PE_parse_boot_argn("open_probe", &v, sizeof(v)) && v != 0;
+		(void)PE_parse_boot_argn("open_probe_name", who, sizeof(who));
+		(void)PE_parse_boot_argn("open_probe_max", &max, sizeof(max));
+	}
+	if (on <= 0 || said >= max || p == NULL || strcmp(p->p_comm, who) != 0) {
+		return 0;
+	}
+	*pp = p;
+	return 1;
+}
+
+/* each (kind, path, error) said once a boot: optional files are looked up hundreds of times (FeatureFlags) */
+static uint32_t akios_open_probe_seen[8192];
+
+static int
+akios_open_probe_new(const char *what, const char *path, int error)
+{
+	uint32_t h = 2166136261u ^ (uint32_t)error;
+
+	for (const char *c = what; *c; c++) {
+		h = (h ^ (uint8_t)*c) * 16777619u;
+	}
+	for (const char *c = path; *c; c++) {
+		h = (h ^ (uint8_t)*c) * 16777619u;
+	}
+	h |= 1;
+	for (uint32_t i = 0, slot = h % 8192; i < 8192; i++, slot = (slot + 1) % 8192) {
+		if (akios_open_probe_seen[slot] == h) {
+			return 0;
+		}
+		if (akios_open_probe_seen[slot] == 0) {
+			akios_open_probe_seen[slot] = h;
+			return 1;
+		}
+	}
+	return 1;       /* the table full: say it */
+}
+
+static void
+akios_open_probe_say(proc_t p, const char *what, const char *path, int64_t n, int error)
+{
+	extern void loader_log_line(const char *line);
+	char line[MAXPATHLEN + 96];
+
+	if (!akios_open_probe_new(what, path, error)) {
+		return;
+	}
+	said++;
+	snprintf(line, sizeof(line), "open_probe: %s[%d] %s %s -> %lld err %d\n", p->p_comm, proc_getpid(p), what, path,
+	    (long long)n, error);
+	printf("%s", line);
+	loader_log_line(line);
+}
+
+#undef said
+
+void
+akios_open_probe(const char *what, vnode_t vp, int64_t n, int error)
+{
+	char *path;
+	int len = MAXPATHLEN;
+	proc_t p;
+
+	if (!akios_open_probe_wanted(&p)) {
+		return;
+	}
+	path = zalloc(ZV_NAMEI);
+	path[0] = 0;
+	if (vp == NULLVP || vn_getpath(vp, path, &len) != 0) {
+		strlcpy(path, "?", MAXPATHLEN);
+	}
+	akios_open_probe_say(p, what, path, n, error);
+	zfree(ZV_NAMEI, path);
+}
+
+void
+akios_open_probe_path(const char *what, const char *path, int error)
+{
+	proc_t p;
+
+	if (path == NULL || !akios_open_probe_wanted(&p)) {
+		return;
+	}
+	akios_open_probe_say(p, what, path, 0, error);
+}
+
 int
 vn_open_auth(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
 {
@@ -761,6 +872,7 @@ continue_create_lookup:
 
 	*fmodep = fmode;
 	nameidone(ndp);
+	akios_open_probe("open", ndp->ni_vp, *fmodep, 0);
 	return 0;
 
 bad:

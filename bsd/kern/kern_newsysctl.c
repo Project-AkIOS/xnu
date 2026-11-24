@@ -1198,6 +1198,35 @@ name2oid(char *name, int *oid, size_t *len)
  *		length be PATH_MAX, and that authors of new sysctl's refrain
  *		from exceeding this string length.
  */
+/*
+ * AkIOS (11-22): open_probe=1 [open_probe_name=NAME, default lsd] -- each sysctl name NAME asks for that this kernel
+ * does not have (iOS userland gives up on missing ones silently), into the console ring and the kernel log.
+ */
+static void
+akios_sysctl_name_probe(const char *name, int error)
+{
+	extern void loader_log_line(const char *line);
+	static int on = -1;
+	static uint32_t said;
+	static char who[MAXCOMLEN + 1] = "lsd";
+	char line[160];
+	proc_t p = current_proc();
+
+	if (on < 0) {
+		uint32_t v = 0;
+
+		on = PE_parse_boot_argn("open_probe", &v, sizeof(v)) && v != 0;
+		(void)PE_parse_boot_argn("open_probe_name", who, sizeof(who));
+	}
+	if (on <= 0 || said >= 100 || p == NULL || strcmp(p->p_comm, who) != 0) {
+		return;
+	}
+	said++;
+	snprintf(line, sizeof(line), "sysctl_probe: %s[%d] no sysctl \"%s\" (err %d)\n", who, proc_getpid(p), name, error);
+	printf("%s", line);
+	loader_log_line(line);
+}
+
 STATIC int
 sysctl_sysctl_name2oid(__unused struct sysctl_oid *oidp, __unused void *arg1,
     __unused int arg2, struct sysctl_req *req)
@@ -1233,6 +1262,9 @@ sysctl_sysctl_name2oid(__unused struct sysctl_oid *oidp, __unused void *arg1,
 	lck_rw_lock_shared(&sysctl_geometry_lock);
 	error = name2oid(p, oid, &len);
 	lck_rw_done(&sysctl_geometry_lock);
+	if (error) {
+		akios_sysctl_name_probe(p, error);
+	}
 
 	kfree_data(p, req->newlen + 1);
 
@@ -1753,6 +1785,7 @@ sysctl_root(boolean_t from_kernel, boolean_t string_is_canonical,
 		/* namestring is actually canonical, name/namelen needs to be populated */
 		error = name2oid(namestring, name, &namelen);
 		if (error) {
+			akios_sysctl_name_probe(namestring, error);   /* AkIOS (11-22), open_probe=1 */
 			goto err;
 		}
 	}

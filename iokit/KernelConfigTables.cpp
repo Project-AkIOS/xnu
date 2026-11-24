@@ -32,6 +32,10 @@
  * Version 2.0.
  */
 
+#if defined(__arm64__)
+#include <pexpert/arm64/board_config.h>
+#endif
+
 const char * gIOKernelConfigTables =
     "("
     "   {"
@@ -44,4 +48,49 @@ const char * gIOKernelConfigTables =
     "     'IOProviderClass' = IOService;"
     "     'IOExclaveProxy'  = 1:32;"
     "   }"
+#if defined(__arm64__) && !defined(APPLE_ARM64_ARCH_FAMILY)
+    "   ,{"
+    "     'IOClass'         = GenericARMPE;"
+    "     'IOProviderClass' = IOPlatformExpertDevice;"
+    "     'IOProbeScore'    = 1000:32;"
+    "   }"
+#endif
+/*
+ * AkIOS (11-22): IOBlockStorageDriver onto the devices of iokit/Kernel/AkitaUFSStorage.cpp (they say device-type
+ * Generic; MiniIOMedia's descriptive device does not, so it stays driverless): it publishes each one's whole-disk
+ * IOMedia, which Apple's APFS kext (prelinked) matches with its AppleAPFSContainerSchemeWholeDisk personality.
+ */
+    "   ,{"
+    "     'IOClass'         = IOBlockStorageDriver;"
+    "     'IOProviderClass' = IOBlockStorageDevice;"
+    "     'IOPropertyMatch' = { 'device-type' = Generic; };"
+    "   }"
+/*
+ * AkIOS (11-22): the rest of IOStorageFamily's personalities are NOT registered yet,
+ * so nothing matches IOMedia / IOBlockStorageDevice (MiniIOMedia's descriptive objects stay driverless). Draft from the
+ * family's Info.plist (337.100.1, iOS side: no IOAppleLabelScheme). Before enabling IOMediaBSDClient, keep it off
+ * MiniIOMedia's objects (they already have /dev nodes of their own), e.g. a property those objects carry that excludes them.
+ *
+ *  "   ,{"
+ *  "     'IOClass'         = IOMediaBSDClient;"
+ *  "     'IOProviderClass' = IOMedia;"
+ *  "     'IOMatchCategory' = IOMediaBSDClient;"
+ *  "     'IOResourceMatch' = IOBSD;"
+ *  "     'IOProbeScore'    = 30000:32;"
+ *  "   },{"
+ *  "     'IOClass'         = IOBlockStorageDriver;"
+ *  "     'IOProviderClass' = IOBlockStorageDevice;"
+ *  "     'IOPropertyMatch' = { 'device-type' = Generic; };"
+ *  "   },{"
+ *  "     'IOClass'         = IOGUIDPartitionScheme;"
+ *  "     'IOProviderClass' = IOMedia;"
+ *  "     'IOMatchCategory' = IOStorage;"
+ *  "     'IOProbeScore'    = 4000:32;"
+ *  "     'IOPropertyMatch' = { 'Whole' = .true.; };"
+ *  "     'Content Mask'    = GUID_partition_scheme;"
+ *  "   }"
+ *
+ * (Info.plist also has IOFDiskPartitionScheme (score 3000, Whole, Content Mask FDisk_partition_scheme, a Content Table of
+ *  MBR ids) and IOApplePartitionScheme (score 2000); their classes are not built in.)
+ */
     ")";

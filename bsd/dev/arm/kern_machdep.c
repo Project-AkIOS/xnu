@@ -16,6 +16,7 @@
 #include        <libkern/libkern.h>
 #include        <machine/exec.h>
 #include        <pexpert/arm64/board_config.h>
+#include        <pexpert/pexpert.h>     /* PE_parse_boot_argn: HakiOS hakios_arm64e= gate */
 
 int ml_grade_binary(cpu_type_t, cpu_subtype_t, cpu_subtype_t, bool);
 
@@ -91,6 +92,22 @@ ml_grade_binary(cpu_type_t exectype, cpu_subtype_t execsubtype, cpu_subtype_t ex
 				return 10;
 			case CPU_SUBTYPE_ARM64_ALL:
 				return 9;
+			case CPU_SUBTYPE_ARM64E: {
+				/*
+				 * HakiOS arm64e-on-arm64 bring-up (devices/akita/rebase-13mini.md, PATH 1):
+				 * this ARM64 kernel (A11-class host subtype, no Apple PAC) can run ARM64E
+				 * userland -- the iPhone 13 mini's 16.6.1 slices -- with pointer-auth left
+				 * disabled, since the PAC and AUT instructions execute as NOPs on ARMv8.3 when
+				 * the SCTLR enable bits are clear. Accept arm64e only when booted hakios_arm64e=1
+				 * so the plain-arm64 iPhone X build is unaffected (default: rejected as before).
+				 */
+				int hakios_arm64e = 0;
+				(void)PE_parse_boot_argn("hakios_arm64e", &hakios_arm64e, sizeof(hakios_arm64e));
+				if (hakios_arm64e) {
+					return grade_arm64e_binary(execfeatures);
+				}
+				break;
+			}
 			}
 			break;
 

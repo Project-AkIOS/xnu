@@ -2138,6 +2138,17 @@ IORegistryEntry::attachToParent( IORegistryEntry * parent,
 	PUNLOCK;
 
 	if (needParent) {
+		/*
+		 * AkIOS (11-22): a guard while Apple's APFS kext (prelinked) is new here: a parent whose attachToChild is not
+		 * kernel code (a broken vtable) is named and refused instead of jumped to.
+		 */
+		uintptr_t fn = (uintptr_t)(*(void ***)parent)[0x1c8 / 8];
+		extern vm_offset_t vm_kernel_stext, vm_kernel_etext, vm_kext_base, vm_kext_top;
+		if (!((fn >= vm_kernel_stext && fn < vm_kernel_etext) || (fn >= vm_kext_base && fn < vm_kext_top))) {
+			printf("AkIOS: attachToParent: %s (%p) under %s (%p): its attachToChild is %p, not code; refused\n",
+			    getMetaClass()->getClassName(), this, parent->getMetaClass()->getClassName(), parent, (void *)fn);
+			return false;
+		}
 		ret &= parent->attachToChild( this, plane );
 	}
 

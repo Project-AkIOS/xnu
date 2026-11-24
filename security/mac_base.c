@@ -1568,6 +1568,7 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
 	int error;
 	u_int i;
 	size_t ulen;
+	bool dispatched = false;        /* AkIOS (11-22): a policy of that name took the call */
 
 	error = copyinstr(uap->policy, target, sizeof(target), &ulen);
 	if (error) {
@@ -1591,6 +1592,7 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
 
 		if (strcmp(mpc->mpc_name, target) == 0 &&
 		    mpc->mpc_ops->mpo_policy_syscall != NULL) {
+			dispatched = true;
 			error = mpc->mpc_ops->mpo_policy_syscall(p,
 			    uap->call, uap->arg);
 			goto done;
@@ -1605,6 +1607,7 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
 
 			if (strcmp(mpc->mpc_name, target) == 0 &&
 			    mpc->mpc_ops->mpo_policy_syscall != NULL) {
+				dispatched = true;
 				error = mpc->mpc_ops->mpo_policy_syscall(p,
 				    uap->call, uap->arg);
 				break;
@@ -1614,6 +1617,37 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
 	}
 
 done:
+	if (error == ENOPOLICY) {
+		/*
+		 * AkIOS (11-22): which MAC policy iOS 27 asks for that this kernel does not have (Sandbox and AMFI are
+		 * kern_minimac's stand-ins). CarbonCore's sandbox_check got ENOPOLICY, so every process decided coreservicesd
+		 * was out of reach and gave no canonical paths. Each name said once, with the call and who asked.
+		 *
+		 * AkIOS (11-22): ENOPOLICY is also what a policy that IS registered answers to a call it does not know
+		 * (kern_minimac's AMFI: "no policy AMFI" was said of wifid's call 95 while the policy was there). The two
+		 * are told apart: "no policy" only when no policy of that name was found, "policy X refused call N" when
+		 * one was asked -- that one said once per name and call.
+		 */
+		static char said[8][32];
+		static int saidcall[8];         /* (-1: the name alone, no such policy) */
+		static int nsaid;
+		int want = dispatched ? (int)uap->call : -1;
+		int k;
+
+		for (k = 0; k < nsaid && (saidcall[k] != want || strcmp(said[k], target) != 0); k++) {
+		}
+		if (k == nsaid && nsaid < 8) {
+			strlcpy(said[nsaid], target, sizeof(said[0]));
+			saidcall[nsaid++] = want;
+			if (dispatched) {
+				printf("mac_syscall: policy \"%s\" refused call %d (from %s[%d])\n", target, uap->call, p->p_comm,
+				    proc_getpid(p));
+			} else {
+				printf("mac_syscall: no policy \"%s\" (call %d, from %s[%d])\n", target, uap->call, p->p_comm,
+				    proc_getpid(p));
+			}
+		}
+	}
 	return error;
 }
 

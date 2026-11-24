@@ -5449,7 +5449,10 @@ IOService::setRootMedia(IOService * root)
 	bool unhide;
 
 	ioblockstoragedriverClass = OSMetaClass::getMetaClassWithName(gIOBlockStorageDriverKey);
-	assert(ioblockstoragedriverClass);
+	if (!ioblockstoragedriverClass) {
+		// No IOStorageFamily in this kernel: the root cannot be a block storage device
+		root = NULL;
+	}
 
 	while (root) {
 		if (root->metaCast(ioblockstoragedriverClass)) {
@@ -5470,6 +5473,19 @@ IOService::setRootMedia(IOService * root)
 			root->addPMDriverClass(kIOPMDriverClassStorage);
 		}
 		publishHiddenMedia(root);
+		/*
+		 * AkIOS (11-22): and every other IOMedia too. The root here is a RAM disk, so the phone's own volumes' media are
+		 * not under it and stayed hidden from matching notifications until the registry went quiet (it hardly ever
+		 * does here; on an iPhone kernelmanagerd's start gets there): DiskArbitration never saw them, coreservicesd's
+		 * volume table stayed empty, LaunchServices registered no app (every volume -35), SpringBoard aborted.
+		 * iomedia_unhide=0: as before.
+		 */
+		uint32_t unhide_all = 1;
+		(void)PE_parse_boot_argn("iomedia_unhide", &unhide_all, sizeof(unhide_all));
+		if (unhide_all) {
+			IOLog("AkIOS: root media chosen; the IOMedia under other parents published as well\n");
+			publishHiddenMedia(NULL);
+		}
 	}
 }
 
