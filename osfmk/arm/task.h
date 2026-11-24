@@ -66,7 +66,7 @@
 #endif
 
 
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 #define TASK_ADDITIONS_PAC \
 	uint64_t rop_pid; \
 	uint64_t jop_pid; \

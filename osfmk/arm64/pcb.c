@@ -56,6 +56,9 @@
 #include <arm/machdep_call.h>
 #include <arm/misc_protos.h>
 #include <arm/cpuid.h>
+#if HAKIOS_USER_PAC
+#include <arm64/hakios_pac.h>
+#endif /* HAKIOS_USER_PAC */
 #include <arm/cpu_capabilities_public.h>
 
 #include <vm/vm_map_xnu.h>
@@ -159,7 +162,6 @@ machine_save_sme_context(thread_t old, arm_sme_saved_state_t *old_sme_ss, const 
 	 */
 
 	old->machine.tpidr2_el0 = __builtin_arm_rsr64("TPIDR2_EL0");
-
 
 	if (cpu_state->za_is_enabled) {
 		arm_save_sme_za_zt0(&old_sme_ss->context, old_sme_ss->svl_b);
@@ -487,6 +489,14 @@ machine_switch_pmap_and_extended_context(thread_t old, thread_t new)
 		arm_context_switch_requires_sync();
 	}
 
+#if HAKIOS_USER_PAC
+	/*
+	 * HakiOS PATH 2: load the incoming user thread's architected PAC keys and SCTLR_EL1.En*
+	 * (interrupts are off here; `old` still owns this CPU's cpu_data). One predicted branch
+	 * and nothing else when boot-arg hakios_pac is 0.
+	 */
+	hakios_pac_switch(old, new);
+#endif /* HAKIOS_USER_PAC */
 
 	machine_switch_cpu_data(old, new);
 }
@@ -589,7 +599,7 @@ machine_thread_create(thread_t thread, task_t task, bool first_thread)
 	thread->machine.cthread_self = 0;
 	thread->machine.kpcb = NULL;
 	thread->machine.exception_trace_code = 0;
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	thread->machine.rop_pid = task->rop_pid;
 	thread->machine.jop_pid = task->jop_pid;
 	if (task->disable_user_jop) {

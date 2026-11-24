@@ -32,6 +32,14 @@ SECURITY_READ_ONLY_LATE(bool) enable_dklog_serial_output = false;
 static SIMPLE_LOCK_DECLARE(kprintf_lock, 0);
 
 static void serial_putc_crlf(char c);
+extern void loader_log_putc(char c);
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+static void
+hakios_loader_kputc(char c)
+{
+	loader_log_putc(c);
+}
+#endif
 
 __startup_func
 static void
@@ -69,7 +77,15 @@ PE_init_kprintf(void)
 		 * and assume the console is using the video console (because clearly
 		 * serial doesn't work).
 		 */
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+		/*
+		 * HakiOS: a phone has no UART (12377 dropped the PI3 mini-UART driver 8796's serial_init() found), and
+		 * the video console is not ours to write: the console goes back to the loader (osfmk/arm64/loader_return.c).
+		 */
+		PE_kputc = hakios_loader_kputc;
+#else
 		PE_kputc = console_write_unbuffered;
+#endif
 	}
 }
 STARTUP(KPRINTF, STARTUP_RANK_FIRST, PE_init_kprintf);
@@ -163,6 +179,7 @@ serial_putc_crlf(char c)
 	if (c == '\n') {
 		uart_putc('\r');
 	}
+	loader_log_putc(c);
 	uart_putc(c);
 }
 

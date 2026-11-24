@@ -304,6 +304,23 @@
 
 
 
+#ifdef ARM64_BOARD_CONFIG_BCM2837
+/* HakiOS: the generic HakiOS board (see BCM2837.h); 12377 dropped Apple's Raspberry Pi 3 config. */
+#include <pexpert/arm64/BCM2837.h>
+
+#define MAX_L2_CLINE                   6
+#define MAX_CPUS                       16 /* the Raspberry Pi has four; the boards this runs on now have up to nine (the Pixel 8a) */
+#define MAX_CPU_CLUSTERS               1
+
+#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+
+/*
+ * No XNU_MONITOR (PPL) and no PMAP_CS: the plain pmap, as on 8796 (and as 12377's VMAPPLE without
+ * SPTM). No USE_APPLEARMSMP: ml_processor_register() boots each core (psci_smp.c starts them).
+ */
+#define NO_XNU_PLATFORM_ERROR_HANDLER  1 /* (12377 requires a board to choose; no Apple error handler) */
+#endif  /* ARM64_BOARD_CONFIG_BCM2837 */
+
 #ifdef ARM64_BOARD_CONFIG_VMAPPLE
 #include <pexpert/arm64/VMAPPLE.h>
 

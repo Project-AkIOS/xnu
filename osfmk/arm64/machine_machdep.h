@@ -71,10 +71,10 @@
  * Note that these are 32 bits wide.
  */
 
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 #define ARM_MACHINE_THREAD_DISABLE_USER_JOP_SHIFT       0
 #define ARM_MACHINE_THREAD_DISABLE_USER_JOP             (1U << ARM_MACHINE_THREAD_DISABLE_USER_JOP_SHIFT)
-#endif /* HAS_APPLE_PAC */
+#endif /* HAS_APPLE_PAC || HAKIOS_USER_PAC */
 
 /* Thread should use 1 GHz timebase */
 #define ARM_MACHINE_THREAD_USES_1GHZ_TIMBASE_SHIFT      1

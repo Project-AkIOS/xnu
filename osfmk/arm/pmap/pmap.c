@@ -93,11 +93,16 @@
 
 #include <pexpert/device_tree.h>
 
+MARK_AS_PMAP_TEXT static void pmap_phys_write_disable(vm_address_t va);
+
 #include <san/kasan.h>
 #include <sys/cdefs.h>
 
 #if defined(HAS_APPLE_PAC)
 #include <ptrauth.h>
+#endif
+#if HAKIOS_USER_PAC
+#include <arm64/hakios_pac.h>
 #endif
 
 #ifdef CONFIG_XNUPOST
@@ -1943,7 +1948,11 @@ pmap_map_bd_with_options(
 
 	switch (options & PMAP_MAP_BD_MASK) {
 	case PMAP_MAP_BD_WCOMB:
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+		if (true) {    /* HakiOS: Normal non-cacheable wherever it is (see pmap_get_pt_ops wimg_to_pte, VM_WIMG_WCOMB) */
+#else
 		if (is_dram_addr(start)) {
+#endif
 			mem_attr = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
 		} else {
 #if HAS_FEAT_XS
@@ -2268,9 +2277,9 @@ pmap_bootstrap(
 #if ARM_PARAMETERIZED_PMAP
 	kernel_pmap->pmap_pt_attr = native_pt_attr;
 #endif /* ARM_PARAMETERIZED_PMAP */
-#if HAS_APPLE_PAC
+#if HAS_APPLE_PAC || HAKIOS_USER_PAC
 	kernel_pmap->disable_jop = 0;
-#endif /* HAS_APPLE_PAC */
+#endif /* HAS_APPLE_PAC || HAKIOS_USER_PAC */
 	kernel_pmap->tte = cpu_tte;
 	kernel_pmap->ttep = cpu_ttep;
 	kernel_pmap->min = UINT64_MAX - (1ULL << (64 - T1SZ_BOOT)) + 1;
@@ -3000,9 +3009,9 @@ pmap_create_options_internal(
 	unsigned        tte_index_max;
 	pmap_t          p;
 	bool is_64bit = flags & PMAP_CREATE_64BIT;
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	bool disable_jop = flags & PMAP_CREATE_DISABLE_JOP;
-#endif /* defined(HAS_APPLE_PAC) */
+#endif /* defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC */
 	kern_return_t   local_kr = KERN_SUCCESS;
 
 	if (size != 0) {
@@ -3053,9 +3062,9 @@ pmap_create_options_internal(
 	}
 #endif /* CONFIG_ROSETTA */
 
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	p->disable_jop = disable_jop;
-#endif /* defined(HAS_APPLE_PAC) */
+#endif /* defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC */
 
 	p->nested_region_true_start = 0;
 	p->nested_region_true_end = ~0;
@@ -4952,8 +4961,8 @@ pmap_page_protect_options_with_flush_range(
 			}
 #endif
 			if (remove && (options & PMAP_OPTIONS_COMPRESSOR)) {
-				panic("pmap_page_protect: attempt to compress ppnum 0x%x owned by iommu %p, pve_p=%p",
-				    ppnum, ptep_get_iommu(pte_p), pve_p);
+				panic("pmap_page_protect: attempt to compress ppnum 0x%x owned by iommu, pte_p=%p, pve_p=%p",
+				    ppnum, pte_p, pve_p);
 			}
 			goto protect_skip_pve_pass1;
 		}
@@ -5988,7 +5997,16 @@ wimg_to_pte(unsigned int wimg, pmap_paddr_t pa)
 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
 		break;
 	case VM_WIMG_RT:
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+		/*
+		 * HakiOS: on a phone what lies outside the kernel's DRAM range (the loader's panic log, framebuffers, the
+		 * GPU's and DSPs' carve-outs) is RAM too: Normal non-cacheable as on 8796, not 12377's Device-GRE, on
+		 * which bzero's DC ZVA faults (the boot hung clearing the panic log, check_for_panic_log()).
+		 */
+		if (true) {
+#else
 		if (is_dram_addr(pa)) {
+#endif
 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_RT);
 		} else {
 #if HAS_FEAT_XS
@@ -6028,7 +6046,16 @@ wimg_to_pte(unsigned int wimg, pmap_paddr_t pa)
 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
 		break;
 	case VM_WIMG_WCOMB:
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+		/*
+		 * HakiOS: on a phone what lies outside the kernel's DRAM range (the loader's panic log, framebuffers, the
+		 * GPU's and DSPs' carve-outs) is RAM too: Normal non-cacheable as on 8796, not 12377's Device-GRE, on
+		 * which bzero's DC ZVA faults (the boot hung clearing the panic log, check_for_panic_log()).
+		 */
+		if (true) {
+#else
 		if (is_dram_addr(pa)) {
+#endif
 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
 		} else {
 #if HAS_FEAT_XS
@@ -7235,7 +7262,8 @@ void
 pmap_sync_page_attributes_phys(
 	ppnum_t pp)
 {
-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
+	/* (hakios: the page number is 32 bits wide and memory goes on above 4 GB: widen before shifting) */
+	flush_dcache((vm_offset_t) pp << PAGE_SHIFT, PAGE_SIZE, TRUE);
 }
 
 #if CONFIG_COREDUMP
@@ -9643,6 +9671,32 @@ void *
 pmap_auth_user_ptr(void *value, ptrauth_key key, uint64_t discriminator, uint64_t jop_key)
 {
 	return pmap_auth_user_ptr_internal(value, key, discriminator, jop_key);
+}
+#elif HAKIOS_USER_PAC
+/*
+ * HakiOS PATH 2 step 2: the same two interfaces on architected FEAT_PAuth (no PPL, so no
+ * _internal variants): osfmk/arm64/hakios_pac.c. As on Apple hardware only the process-independent
+ * (A) keys may be asked for; jop_key is the task's jop_pid. With boot-arg hakios_pac=0 the value
+ * comes back unchanged.
+ */
+void *
+pmap_sign_user_ptr(void *value, ptrauth_key key, uint64_t discriminator, uint64_t jop_key)
+{
+	if ((key != ptrauth_key_asia) && (key != ptrauth_key_asda)) {
+		panic("attempt to sign user pointer without process independent key");
+	}
+	return (void *)hakios_pac_sign_user_ptr((uint64_t)value,
+	           key == ptrauth_key_asia ? HAKIOS_PAC_KEY_IA : HAKIOS_PAC_KEY_DA, discriminator, jop_key);
+}
+
+void *
+pmap_auth_user_ptr(void *value, ptrauth_key key, uint64_t discriminator, uint64_t jop_key)
+{
+	if ((key != ptrauth_key_asia) && (key != ptrauth_key_asda)) {
+		panic("attempt to auth user pointer without process independent key");
+	}
+	return (void *)hakios_pac_auth_user_ptr((uint64_t)value,
+	           key == ptrauth_key_asia ? HAKIOS_PAC_KEY_IA : HAKIOS_PAC_KEY_DA, discriminator, jop_key);
 }
 #endif /* HAS_APPLE_PAC */
 
@@ -12243,7 +12297,8 @@ pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
 #if XNU_MONITOR
 	pmap_ppl_lockdown_pages(kva, size, PVH_FLAG_LOCKDOWN_CS, ppl_writable);
 #else
-	pmap_ppl_lockdown_pages(kva, size, 0, ppl_writable);
+	/* No PPL on this platform: nothing to lock down. */
+	(void)kva; (void)size; (void)ppl_writable;
 #endif
 }
 
@@ -12253,7 +12308,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
 #if XNU_MONITOR
 	pmap_ppl_unlockdown_pages(kva, size, PVH_FLAG_LOCKDOWN_CS, ppl_writable);
 #else
-	pmap_ppl_unlockdown_pages(kva, size, 0, ppl_writable);
+	/* No PPL on this platform: nothing to lock down. */
+	(void)kva; (void)size; (void)ppl_writable;
 #endif
 }
 

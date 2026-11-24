@@ -71,10 +71,16 @@
 #include <libkern/kernel_mach_header.h>
 #include <libkern/stack_protector.h>
 #include <libkern/section_keywords.h>
+#if HAKIOS_USER_PAC
+#include <arm64/hakios_pac.h>
+#endif /* HAKIOS_USER_PAC */
 #include <san/kasan.h>
 #include <sys/kdebug.h>
 
 #include <pexpert/pexpert.h>
+#if defined(__arm64__)
+#include <arm64/psci_smp.h>
+#endif
 
 #include <console/serial_protos.h>
 
@@ -345,7 +351,11 @@ arm_auxkc_init(void *mh, void *base)
  */
 
 __startup_func
+/* Bring-up checkpoints, see osfmk/arm64/loader_return.c */
+extern void loader_checkpoint(uint64_t n);
+
 void
+
 arm_init(
 	boot_args       *args)
 {
@@ -368,6 +378,7 @@ arm_init(
 	reset_vector_vaddr = (vm_offset_t) &LowResetVectorBase;
 #endif /* APPLEVIRTUALPLATFORM */
 
+	loader_checkpoint(10);
 	cpu_data_init(&BootCpuData);
 #if defined(HAS_APPLE_PAC)
 	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
@@ -376,14 +387,19 @@ arm_init(
 #endif /* defined(HAS_APPLE_PAC) */
 
 	PE_init_platform(FALSE, args); /* Get platform expert set up */
+	loader_checkpoint(11);
 
 #if __arm64__
 	configure_timer_apple_regs();
+	loader_checkpoint(30);
 	wfe_timeout_configure();
+	loader_checkpoint(31);
 	wfe_timeout_init();
+	loader_checkpoint(32);
 
 	configure_misc_apple_boot_args();
 	configure_misc_apple_regs(true);
+	loader_checkpoint(33);
 
 #if HAS_UPSI_FAILURE_INJECTION
 	/* UPSI (Universal Panic and Stall Injection) Logic
@@ -419,6 +435,7 @@ arm_init(
 	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
 	dt_entry_size = 0;
 #endif // HAS_UPSI_FAILURE_INJECTION
+	loader_checkpoint(34);
 
 
 	{
@@ -458,10 +475,13 @@ arm_init(
 	}
 #endif
 
+	loader_checkpoint(35);
 	ml_parse_cpu_topology();
+	loader_checkpoint(12);
 
 
 	boot_cpu_id = ml_get_boot_cpu_number();
+	loader_checkpoint(40);
 	assert(boot_cpu_id >= 0 && boot_cpu_id <= ml_get_max_cpu_number());
 
 	BootCpuData.cpu_number = (unsigned short)boot_cpu_id;
@@ -475,12 +495,15 @@ arm_init(
 	CpuDataEntries[boot_cpu_id].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
 	    + ((uintptr_t)&BootCpuData
 	    - (uintptr_t)(args->virtBase)));
+	loader_checkpoint(41);
 
 	thread = thread_bootstrap();
+	loader_checkpoint(42);
 	thread->machine.CpuDatap = &BootCpuData;
 	thread->machine.pcpu_data_base_and_cpu_number =
 	    ml_make_pcpu_base_and_cpu_number(0, BootCpuData.cpu_number);
 	machine_set_current_thread(thread);
+	loader_checkpoint(43);
 
 	/*
 	 * Preemption is enabled for this thread so that it can lock mutexes without
@@ -489,12 +512,16 @@ arm_init(
 	 * preemption level is not really meaningful for the bootstrap thread.
 	 */
 	thread->machine.preemption_count = 0;
+	loader_checkpoint(44);
 	cpu_bootstrap();
+	loader_checkpoint(13);
 
 	rtclock_early_init();
+	loader_checkpoint(14);
 
 	kernel_debug_string_early("kernel_startup_bootstrap");
 	kernel_startup_bootstrap();
+	loader_checkpoint(15);
 
 	/*
 	 * Initialize the timer callout world
@@ -502,6 +529,7 @@ arm_init(
 	timer_call_init();
 
 	cpu_init();
+	loader_checkpoint(16);
 
 	processor_bootstrap();
 
@@ -570,6 +598,7 @@ arm_init(
 	pmap_first_pnum = (ppnum_t)atop(gDramBase);
 
 	arm_vm_init(xmaxmem, args);
+	loader_checkpoint(17);
 
 	if (debug_boot_arg) {
 		patch_low_glo();
@@ -583,8 +612,11 @@ arm_init(
 
 	/* Setup debugging output. */
 	const unsigned int serial_exists = serial_init();
+	loader_checkpoint(18);
 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+	loader_checkpoint(19);
 	kprintf("kprintf initialized\n");
+	loader_checkpoint(60);
 
 	serialmode = 0;
 	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
@@ -624,7 +656,9 @@ arm_init(
 		(void)switch_to_serial_console(); /* Switch into serial mode from video console */
 		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
 	}
+	loader_checkpoint(61);
 	PE_create_console();
+	loader_checkpoint(20);
 
 	/* setup console output */
 	PE_init_printf(FALSE);
@@ -687,6 +721,7 @@ arm_init(
 	 * against string vulnerabilities
 	 */
 	__stack_chk_guard &= ~(0xFFULL << 8);
+	loader_checkpoint(21);
 	machine_startup(args);
 }
 
@@ -717,8 +752,19 @@ arm_init_cpu(
 
 	os_atomic_andnot(&cpu_data_ptr->cpu_flags, SleepState, relaxed);
 
+#if HAKIOS_USER_PAC
+	/*
+	 * HakiOS PATH 2: this core comes out of reset (SMP boot, or a PSCI power-down): its PAC key
+	 * registers are gone and start.s put SCTLR_EL1 back to its default. Forget the per-CPU cache;
+	 * the next switch to a user thread reloads (hakios_pac_switch).
+	 */
+	hakios_pac_cpu_invalidate(cpu_data_ptr);
+#endif /* HAKIOS_USER_PAC */
 
 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
+#if defined(GENERIC_PSCI_SMP)
+	psci_smp_cpu_reached(PSCI_SMP_CPU_IN_KERNEL);
+#endif
 
 #if APPLE_ARM64_ARCH_FAMILY
 	configure_late_apple_regs(false);
@@ -851,6 +897,11 @@ arm_init_idle_cpu(
 
 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
 
+#if HAKIOS_USER_PAC
+	/* HakiOS PATH 2: back from an idle state that lost the core's registers (see arm_init_cpu) */
+	hakios_pac_cpu_invalidate(cpu_data_ptr);
+#endif /* HAKIOS_USER_PAC */
+
 #if __arm64__
 	wfe_timeout_init();
 	pmap_clear_user_ttb();
@@ -874,5 +925,8 @@ arm_init_idle_cpu(
 
 	fiq_context_init(FALSE);
 
+#if defined(GENERIC_PSCI_SMP)
+	psci_idle_resumed();            /* (back from a power-down idle state: the GIC's CPU interface, the timer) */
+#endif
 	cpu_idle_exit(TRUE);
 }

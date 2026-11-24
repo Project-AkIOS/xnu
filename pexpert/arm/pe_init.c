@@ -171,6 +171,9 @@ check_for_panic_log(void)
 	}
 
 	gPanicBase = ml_io_map_wcomb(reg_prop[0], panic_region_length[0]);
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	{ extern void loader_checkpoint(uint64_t n); loader_checkpoint(63); }  /* HakiOS bring-up */
+#endif
 
 	/* Deduct the size of the panic header from the panic region size */
 	panic_text_len = panic_region_length[0] - sizeof(struct embedded_panic_header);
@@ -212,6 +215,9 @@ check_for_panic_log(void)
 
 	/* Clear panic region */
 	CleanPoC_DcacheRegion_Force(gPanicBase, gPanicSize);
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	{ extern void loader_checkpoint(uint64_t n); loader_checkpoint(64); }  /* HakiOS bring-up */
+#endif
 	bzero((void *)gPanicBase, gPanicSize);
 }
 
@@ -551,6 +557,12 @@ PE_create_console(void)
 	 * Do this before the VRAM is trashed.
 	 */
 	check_for_panic_log();
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	{
+		extern void loader_checkpoint(uint64_t n);
+		loader_checkpoint(62);  /* HakiOS bring-up */
+	}
+#endif
 
 	if (PE_state.video.v_display) {
 		PE_initialize_console(&PE_state.video, kPEGraphicsMode);

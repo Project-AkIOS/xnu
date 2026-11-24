@@ -875,6 +875,14 @@ get_serial_device_phandle(uint32_t * const phandle)
 int
 serial_init(void)
 {
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	/*
+	 * HakiOS: a phone has no UART for the kernel. 12377 found one in the loader's device tree at the first call
+	 * (arm_init) and hung re-initialising it at the second (PE_init_kprintf); the console goes back to the
+	 * loader instead (pexpert/arm/pe_kprintf.c, osfmk/console/serial_console.c).
+	 */
+	return 0;
+#endif
 	vm_offset_t     soc_base;
 
 	struct pe_serial_functions *fns = gPESF;

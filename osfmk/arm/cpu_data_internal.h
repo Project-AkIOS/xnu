@@ -247,10 +247,18 @@ typedef struct cpu_data {
 		CPU_HALTED,
 		CPU_HALTED_WITH_STATE
 	}                               halt_status;
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	uint64_t                        rop_key;
 	uint64_t                        jop_key;
-#endif /* defined(HAS_APPLE_PAC) */
+#endif /* defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC */
+#if HAKIOS_USER_PAC
+	/*
+	 * HakiOS PATH 2: what this CPU's architected PAC registers hold (HAKIOS_PAC_CPU_* in
+	 * arm64/hakios_pac.h). rop_key/jop_key above cache the rop_pid/jop_pid whose derived keys are
+	 * loaded in APIB/APDB and APIA/APDA. 0 = nothing known (after reset / power-down).
+	 */
+	uint8_t                         hakios_pac_state;
+#endif /* HAKIOS_USER_PAC */
 
 #if CONFIG_CPU_COUNTERS
 	struct cpc_cpu                  cpu_cpc;

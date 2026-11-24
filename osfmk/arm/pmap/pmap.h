@@ -116,7 +116,13 @@
  */
 #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
 #else /* defined(ARM_LARGE_MEMORY) */
-#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+/*
+ * With 4K pages every GB of DRAM costs one L2 page in each of the two
+ * bootstrap mappings (start.s maps all of memSize). Apple sized this for a
+ * 2 GB device (8 pages); 20 pages cover 8 GB, enough for a boot image of
+ * several GB next to the kernel.
+ */
+#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 20)
 #endif /* defined(ARM_LARGE_MEMORY) */
 
 typedef uint64_t tt_entry_t; /* translation table entry type */
@@ -470,11 +476,11 @@ struct pmap {
 	/* The nesting bounds have been set. */
 	bool nested_bounds_set;
 
-#if HAS_APPLE_PAC
+#if HAS_APPLE_PAC || HAKIOS_USER_PAC
 	bool disable_jop;
 #else
 	bool reserved11;
-#endif /* HAS_APPLE_PAC */
+#endif /* HAS_APPLE_PAC || HAKIOS_USER_PAC */
 
 	bool reserved13;
 
@@ -518,10 +524,13 @@ extern ppnum_t pmap_find_phys_nofault(pmap_t map, addr64_t va);
 extern void pmap_switch_user(thread_t th, vm_map_t map);
 extern void pmap_set_pmap(pmap_t pmap, thread_t thread);
 extern  void pmap_gc(void);
-#if HAS_APPLE_PAC
+#if HAS_APPLE_PAC || HAKIOS_USER_PAC
+#if HAKIOS_USER_PAC && !HAS_APPLE_PAC
+#include <ptrauth.h>            /* ptrauth_key (the type exists without the intrinsics) */
+#endif
 extern void * pmap_sign_user_ptr(void *value, ptrauth_key key, uint64_t data, uint64_t jop_key);
 extern void * pmap_auth_user_ptr(void *value, ptrauth_key key, uint64_t data, uint64_t jop_key);
-#endif /* HAS_APPLE_PAC */
+#endif /* HAS_APPLE_PAC || HAKIOS_USER_PAC */
 
 /**
  * Interfaces implemented as macros.

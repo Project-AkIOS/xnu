@@ -37,6 +37,9 @@
 #include <arm64/machine_machdep.h>
 #include <kern/cpc.h>
 #include <arm64/instructions.h>
+#if HAKIOS_USER_PAC
+#include <arm64/hakios_pac.h>
+#endif
 
 #include <kern/debug.h>
 #include <kern/exc_guard.h>
@@ -163,6 +166,8 @@ static void handle_msr_trap(arm_saved_state_t *state, uint64_t esr);
 #if __has_feature(ptrauth_calls)
 static void handle_pac_fail(arm_saved_state_t *state, uint64_t esr) __dead2;
 static inline uint64_t fault_addr_bitmask(unsigned int bit_from, unsigned int bit_to);
+#elif HAKIOS_USER_PAC
+static void hakios_handle_user_pac_fail(arm_saved_state_t *state, uint64_t esr) __dead2;
 #endif
 static void handle_bti_fail(arm_saved_state_t *state, uint64_t esr);
 extern kern_return_t arm_fast_fault(pmap_t, vm_map_address_t, vm_prot_t, bool, bool);
@@ -969,6 +974,23 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
 		handle_pac_fail(state, esr);
 		__builtin_unreachable();
 
+#elif HAKIOS_USER_PAC
+	/*
+	 * HakiOS PATH 2: these cores have FEAT_FPAC, so a failed aut* in a PAC-on process traps here
+	 * (EC 0x1c) instead of poisoning the pointer. Report it like Apple's handle_pac_fail()
+	 * (EXC_BAD_ACCESS / EXC_ARM_PAC_FAIL -> SIGBUS) and log it. Cannot happen with hakios_pac=0
+	 * (SCTLR_EL1.En* never set) or from the kernel (it has no aut*): then, as before, the
+	 * catch-all below.
+	 */
+	case ESR_EC_PAC_FAIL:
+		if (hakios_pac_mode != HAKIOS_PAC_MODE_OFF && is_user &&
+		    PSR64_IS_USER64(get_saved_state_cpsr(state))) {
+			hakios_handle_user_pac_fail(state, esr);
+			__builtin_unreachable();
+		}
+		handle_uncategorized(state);
+		break;
+
 #endif /* __has_feature(ptrauth_calls) */
 
 #if HAS_ARM_FEAT_SME
@@ -1176,6 +1198,41 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
 		thread->machine.el0_synchronous_trap = false;
 	}
 }
+
+#if HAKIOS_USER_PAC && !__has_feature(ptrauth_calls)
+/*
+ * HakiOS PATH 2: FPAC fault of a PAC-on user thread. The user half of Apple's handle_pac_fail():
+ * EXC_BAD_ACCESS with codes { EXC_ARM_PAC_FAIL, the instruction }. (Apple also sets
+ * EXC_PTRAUTH_BIT, which its exception_triage() strips again after telemetry and the
+ * pac-exception-fatal policy; neither exists here.) ESR bits 1:0 are the key, numbered like
+ * ptrauth_key: 0 IA, 1 IB, 2 DA, 3 DB.
+ */
+static void
+hakios_handle_user_pac_fail(arm_saved_state_t *state, uint64_t esr)
+{
+	static const char * const key_names[4] = { "IA", "IB", "DA", "DB" };
+	exception_type_t           exception = EXC_BAD_ACCESS;
+	mach_exception_data_type_t codes[2]  = {EXC_ARM_PAC_FAIL};
+	mach_msg_type_number_t     numcodes  = 2;
+	uint32_t                   instr     = 0;
+	char                       name[32];
+	int                        pid;
+
+	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+
+	hakios_pac_task_name(current_task(), name, sizeof(name), &pid);
+	hakios_pac_log("hakios_pac: PAC FAIL %s[%d] key %s esr 0x%llx pc 0x%llx instr 0x%08x lr 0x%llx "
+	    "sp 0x%llx x16 0x%llx x17 0x%llx\n",
+	    name, pid, key_names[esr & 0x3], esr, (uint64_t)get_saved_state_pc(state), instr,
+	    (uint64_t)get_saved_state_lr(state), (uint64_t)get_saved_state_sp(state),
+	    (uint64_t)get_saved_state_reg(state, 16), (uint64_t)get_saved_state_reg(state, 17));
+
+	codes[1] = instr;
+
+	exception_triage(exception, codes, numcodes);
+	__builtin_unreachable();
+}
+#endif /* HAKIOS_USER_PAC && !__has_feature(ptrauth_calls) */
 
 /*
  * Uncategorized exceptions are a catch-all for general execution errors.

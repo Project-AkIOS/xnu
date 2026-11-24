@@ -172,7 +172,7 @@ struct machine_thread {
 #else
 	bool                      reserved9;
 #endif
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	uint64_t                  rop_pid;
 	uint64_t                  jop_pid;
 #else

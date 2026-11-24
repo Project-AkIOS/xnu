@@ -243,6 +243,14 @@
 /* D-Cache, 128KB for Acc8 PCore, 8-way. 64KB for ECore, 8-way. */
 #define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
 
+#elif defined (BCM2837) /* Raspberry Pi 3; HakiOS: the generic HakiOS board (Cortex-A cores) */
+
+/* I-Cache. We don't have detailed spec so we just follow the ARM technical reference. */
+#define MMU_I_CLINE 6
+
+/* D-Cache. */
+#define MMU_CLINE   6
+
 #elif defined (VMAPPLE)
 
 /* I-Cache. */
@@ -2537,9 +2545,9 @@ typedef enum {
 	ESR_EC_SVC_64              = 0x15,
 	ESR_EC_HVC_64              = 0x16,
 	ESR_EC_MSR_TRAP            = 0x18,
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || HAKIOS_USER_PAC
 	ESR_EC_PAC_FAIL            = 0x1C,
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* __has_feature(ptrauth_calls) || HAKIOS_USER_PAC */
 #if HAS_ARM_FEAT_SME
 	ESR_EC_SME                 = 0x1D,
 #endif

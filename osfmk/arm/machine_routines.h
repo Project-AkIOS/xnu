@@ -1321,6 +1321,9 @@ uint32_t ml_update_cluster_wfe_recommendation(uint32_t wfe_cluster_id, uint64_t 
 #define UNSIGN_PTR(p) \
 	SIGN(p) ? ((p) | PAC_MASK) : ((p) & ~PAC_MASK)
 
+#endif /* defined(HAS_APPLE_PAC) */
+
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 uint64_t ml_default_rop_pid(void);
 uint64_t ml_default_jop_pid(void);
 uint64_t ml_non_arm64e_user_jop_pid(void);
@@ -1331,7 +1334,18 @@ uint8_t ml_task_get_disable_user_jop(task_t task);
 void ml_task_set_disable_user_jop(task_t task, uint8_t disable_user_jop);
 void ml_thread_set_disable_user_jop(thread_t thread, uint8_t disable_user_jop);
 void ml_thread_set_jop_pid(thread_t thread, task_t task);
+#endif /* defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC */
 
+#if HAKIOS_USER_PAC
+/*
+ * HakiOS PATH 2 (osfmk/arm64/hakios_pac.c): exec's decision whether an image runs with user
+ * pointer authentication. False unless boot-arg hakios_pac != 0, the image is arm64e, and
+ * (hakios_pac=2, or hakios_pac=1 and the name is in hakios_pac_proc=).
+ */
+bool hakios_pac_exec_wants_pac(const char *name, size_t namelen, bool is_arm64e);
+#endif /* HAKIOS_USER_PAC */
+
+#if defined(HAS_APPLE_PAC)
 
 #if !__has_ptrcheck
 

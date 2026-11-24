@@ -49,6 +49,12 @@
 #include <arm/machine_cpu.h>
 #include <arm/rtclock.h>
 #include <arm64/proc_reg.h>
+#if defined(GENERIC_PSCI_SMP)
+#include <arm64/psci_smp.h>
+#endif
+#if HAKIOS_USER_PAC
+#include <arm64/hakios_pac.h>
+#endif /* HAKIOS_USER_PAC */
 #include <mach/processor_info.h>
 #include <vm/pmap.h>
 #include <vm/vm_kern_xnu.h>
@@ -586,7 +592,12 @@ cpu_idle(void)
 #endif /* CONFIG_CPU_COUNTERS */
 
 	if (wfi) {
-#if !defined(APPLE_ARM64_ARCH_FAMILY)
+#if !defined(APPLE_ARM64_ARCH_FAMILY) && !defined(GENERIC_PSCI_SMP)
+		/*
+		 * (Not on the generic boards either. There a core keeps its cache while it waits,
+		 * and this would empty it by set and way every time: slow, wrong among several
+		 * processors, and under a hypervisor every one of those instructions is a trap.)
+		 */
 		platform_cache_idle_enter();
 #endif
 
@@ -610,6 +621,11 @@ cpu_idle(void)
 		__builtin_arm_dsb(DSB_SY);
 #if HAS_RETENTION_STATE
 		arm64_retention_wfi();
+#elif defined(GENERIC_PSCI_SMP)
+		/* (cpuidle=1: a power-down state instead, when nothing is due for a while -- psci_smp.c) */
+		if (!psci_idle_enter(cpu_data_ptr)) {
+			__builtin_arm_wfi();
+		}
 #else
 		__builtin_arm_wfi();
 #endif
@@ -693,6 +709,88 @@ cpu_idle_exit(boolean_t from_reset)
 	Idle_load_context();
 }
 
+/*
+ * HakiOS PATH 2, step 0 (devices/akita/rebase-13mini.md): probe the architected ARMv8.3 FEAT_PAuth
+ * support on each core and whether firmware (SCR_EL3.APK) lets this EL1 kernel write the key registers.
+ * cpu_init() runs with interrupts DISABLED, so this only READS/stores here (no console I/O -- a printf
+ * here panics "Console I/O from interrupt-disabled context"); the results are printed later by
+ * hakios_pac_probe_report(), called from ml_processor_register() with interrupts on.
+ * Default off; boot-arg hakios_pac_probe=1 reads ID_AA64ISAR1/2 per core, =2 also write-tests
+ * APIAKeyLo_EL1 (which RESETS the core if SCR_EL3.APK=0). Clobbering the key is harmless: the kernel
+ * never signs (SCTLR EnIA/IB/DA/DB stay clear).
+ */
+#define HAKIOS_PAC_MAXCPU 16
+int hakios_pac_probe_level;     /* read by hakios_pac_probe_report() in machine_routines.c */
+static uint64_t hakios_pac_isar1[HAKIOS_PAC_MAXCPU], hakios_pac_isar2[HAKIOS_PAC_MAXCPU];
+static uint64_t hakios_pac_keyw[HAKIOS_PAC_MAXCPU], hakios_pac_keyr[HAKIOS_PAC_MAXCPU];
+static int8_t hakios_pac_seen[HAKIOS_PAC_MAXCPU], hakios_pac_tested[HAKIOS_PAC_MAXCPU];
+
+static void
+hakios_pac_probe(void)
+{
+	int lvl = 0;
+
+	if (!PE_parse_boot_argn("hakios_pac_probe", &lvl, sizeof(lvl)) || lvl == 0) {
+		return;
+	}
+	hakios_pac_probe_level = lvl;
+	int cpu = cpu_number();
+	if (cpu < 0 || cpu >= HAKIOS_PAC_MAXCPU) {
+		return;
+	}
+	hakios_pac_isar1[cpu] = __builtin_arm_rsr64("S3_0_c0_c6_1");   /* ID_AA64ISAR1_EL1 */
+	hakios_pac_isar2[cpu] = __builtin_arm_rsr64("S3_0_c0_c6_2");   /* ID_AA64ISAR2_EL1 */
+	hakios_pac_seen[cpu] = 1;
+	if (lvl >= 2) {
+		uint64_t t = 0x0123456789abcdefULL ^ (uint64_t)cpu;
+		__builtin_arm_wsr64("S3_0_c2_c1_0", t);        /* APIAKeyLo_EL1 (traps->reset if SCR_EL3.APK=0) */
+		__asm__ volatile("isb" ::: "memory");
+		hakios_pac_keyr[cpu] = __builtin_arm_rsr64("S3_0_c2_c1_0");
+		hakios_pac_keyw[cpu] = t;
+		hakios_pac_tested[cpu] = 1;
+	}
+}
+
+/*
+ * Flush any seen-but-not-yet-printed cores, from an interrupts-enabled context. The cpu arg is
+ * ignored (cpu_init may store a core's data AFTER ml_processor_register runs for it, and the early
+ * prints also wrap out of the kernel log ring before a usbmux capture can reach them). Calling this
+ * on every CPU registration means the late registrations re-emit the earlier cores, so the data
+ * lands inside the capture window. loader_log_line() also persists each line past the ring.
+ */
+void hakios_pac_probe_report(int cpu);
+void
+hakios_pac_probe_report(int cpu)
+{
+	extern void loader_log_line(const char *line);
+	static int8_t printed[HAKIOS_PAC_MAXCPU];
+	(void)cpu;
+
+	if (hakios_pac_probe_level == 0) {
+		return;
+	}
+	for (int c = 0; c < HAKIOS_PAC_MAXCPU; c++) {
+		if (!hakios_pac_seen[c] || printed[c]) {
+			continue;
+		}
+		printed[c] = 1;
+		char line[160];
+		uint64_t i1 = hakios_pac_isar1[c], i2 = hakios_pac_isar2[c];
+		snprintf(line, sizeof(line), "hakios_pac: cpu %d ISAR1=0x%llx (APA=%u API=%u GPA=%u GPI=%u) ISAR2=0x%llx (APA3=%u GPA3=%u)\n",
+		    c, i1, (unsigned)((i1 >> 4) & 0xf), (unsigned)((i1 >> 8) & 0xf),
+		    (unsigned)((i1 >> 24) & 0xf), (unsigned)((i1 >> 28) & 0xf),
+		    i2, (unsigned)((i2 >> 12) & 0xf), (unsigned)((i2 >> 8) & 0xf));
+		printf("%s", line);
+		loader_log_line(line);
+		if (hakios_pac_tested[c]) {
+			snprintf(line, sizeof(line), "hakios_pac: cpu %d APIAKeyLo_EL1 w=0x%llx r=0x%llx %s\n", c,
+			    hakios_pac_keyw[c], hakios_pac_keyr[c], hakios_pac_keyw[c] == hakios_pac_keyr[c] ? "OK" : "MISMATCH");
+			printf("%s", line);
+			loader_log_line(line);
+		}
+	}
+}
+
 void
 cpu_init(void)
 {
@@ -700,6 +798,7 @@ cpu_init(void)
 	arm_cpu_info_t *cpu_info_p;
 
 	assert(exception_stack_pointer() != 0);
+	hakios_pac_probe();
 
 	if (cdp->cpu_type != CPU_TYPE_ARM64) {
 		cdp->cpu_type = CPU_TYPE_ARM64;
@@ -854,6 +953,9 @@ cpu_data_init(cpu_data_t *cpu_data_ptr)
 #if defined(HAS_APPLE_PAC)
 	cpu_data_ptr->rop_key = 0;
 	cpu_data_ptr->jop_key = ml_default_jop_pid();
+#elif HAKIOS_USER_PAC
+	/* HakiOS PATH 2: nothing is known about this CPU's PAC key registers or SCTLR_EL1.En* yet */
+	hakios_pac_cpu_invalidate(cpu_data_ptr);
 #endif
 #if NEEDS_MTE_IRG_RESEED
 	cpu_data_ptr->cpu_irg_reseed_counter = 0;

@@ -40,6 +40,9 @@
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
 #endif
+#if HAKIOS_USER_PAC
+#include <arm64/hakios_pac.h>
+#endif
 
 #include <libkern/coreanalytics/coreanalytics.h>
 
@@ -644,6 +647,552 @@ thread_generate_sigreturn_token(
 }
 #endif //__has_feature(ptrauth_calls)
 
+#if HAKIOS_USER_PAC && !__has_feature(ptrauth_calls)
+/*
+ * HakiOS PATH 2 step 4: the user thread-state ABI of an arm64e process on architected FEAT_PAuth.
+ *
+ * The four functions below (to_user, from_user, siguctx, function pointers) are Apple's
+ * __has_feature(ptrauth_calls) bodies of the machine_thread_*_convert_* routines, statement for
+ * statement: same key, same discriminator, same blend, same flag handling. Only the mechanism
+ * differs: hakios_pac_sign_user_ptr() / hakios_pac_auth_user_ptr() (what this tree's
+ * pmap_sign_user_ptr() / pmap_auth_user_ptr() call) with the thread's jop_pid, as Apple passes it
+ * (every pointer here is A-keyed: IA for pc/lr/function pointers, DA for sp/fp/uctx/nonce).
+ *
+ *   field            key   discriminator
+ *   __opaque_pc      IA    "pc" (0x7481); blend(user diversifier, "pc") when not kernel-signed
+ *   __opaque_lr      IA    "lr" (0x77d3); blend(user diversifier, "lr") when not kernel-signed;
+ *                          left alone (IB, signed by EL0 itself) under FLAGS_IB_SIGNED_LR
+ *   __opaque_sp      DA    "sp" (0xcbed)
+ *   __opaque_fp      DA    "fp" (0x4517)
+ *   sigreturn token  DA    "nonce" (0xb743), bits 51:48 / 55:52 of the result kept in ts64->flags
+ *   uctx             DA    "uctx" (0xd4a6)
+ *   sa_tramp, bsdthread_register's threadstart / wqthread: IA, 0 (authenticated only)
+ *
+ * What Apple's kernel signs besides these (ml_sign_thread_state: thread_state_initialize,
+ * thread_setentrypoint, machine_thread_dup, thread_set_wq_state64, ...) protects the saved state
+ * inside the kernel with the kernel's own keys; it never reaches EL0 and has no counterpart here.
+ *
+ * Kept out of the way of everything else: with boot-arg hakios_pac=0, and whenever neither the
+ * calling thread nor the target thread belongs to a PAC-on process, the state is not touched at
+ * all (not even FLAGS_NO_PTRAUTH is set), exactly as before this code existed.
+ */
+
+/* Apple's "JOP disabled" test of a thread */
+static inline bool
+hakios_ts_jop_disabled(thread_t t)
+{
+	return (t->machine.arm_machine_flags & ARM_MACHINE_THREAD_DISABLE_USER_JOP) ||
+	       !thread_is_64bit_addr(t);
+}
+
+/* a thread of a PAC-on user process (kernel threads never have DISABLE_USER_JOP set) */
+static inline bool
+hakios_ts_pac_user(thread_t t)
+{
+	return !hakios_ts_jop_disabled(t) && get_threadtask(t) != kernel_task;
+}
+
+/* does any of this apply to the pair (calling thread, target thread)? */
+static inline bool
+hakios_ts_applies(thread_t thread)
+{
+	if (__probable(hakios_pac_mode == HAKIOS_PAC_MODE_OFF)) {
+		return false;
+	}
+	return hakios_ts_pac_user(thread) || hakios_ts_pac_user(current_thread());
+}
+
+/*
+ * Debug log (hakios_pac_log(): silent with hakios_pac=0, and nothing here runs then anyway):
+ * the first HAKIOS_TS_LOG_PER_PROC signings / authentications of each process, and every
+ * authentication MISMATCH (up to a global cap). Unlocked counters: a lost update only changes
+ * how many lines appear.
+ */
+#define HAKIOS_TS_LOG_SLOTS             64
+#define HAKIOS_TS_LOG_PER_PROC          16
+#define HAKIOS_TS_LOG_TOTAL_MAX         4096
+#define HAKIOS_TS_LOG_MISMATCH_MAX      256
+
+static struct {
+	int             pid;
+	uint32_t        n;
+} hakios_ts_log_tab[HAKIOS_TS_LOG_SLOTS];
+static uint32_t hakios_ts_log_total;
+static uint32_t hakios_ts_log_mismatches;
+
+static const char *
+hakios_ts_key_name(int key)
+{
+	return key == HAKIOS_PAC_KEY_IA ? "IA" : key == HAKIOS_PAC_KEY_DA ? "DA" :
+	       key == HAKIOS_PAC_KEY_IB ? "IB" : "DB";
+}
+
+static bool
+hakios_ts_log_budget(thread_t thread, char *name, size_t namesize, int *pid)
+{
+	hakios_pac_task_name(get_threadtask(thread), name, namesize, pid);
+
+	if (hakios_ts_log_total >= HAKIOS_TS_LOG_TOTAL_MAX) {
+		return false;
+	}
+	__typeof__(&hakios_ts_log_tab[0]) slot = &hakios_ts_log_tab[(unsigned int)*pid % HAKIOS_TS_LOG_SLOTS];
+	if (slot->pid != *pid) {
+		slot->pid = *pid;
+		slot->n = 0;
+	}
+	if (slot->n >= HAKIOS_TS_LOG_PER_PROC) {
+		return false;
+	}
+	slot->n++;
+	hakios_ts_log_total++;
+	return true;
+}
+
+/* pmap_sign_user_ptr(in, key, disc, thread->machine.jop_pid) */
+static uint64_t
+hakios_ts_sign(thread_t thread, const char *what, int key, uint64_t disc, uint64_t in)
+{
+	const uint64_t out = hakios_pac_sign_user_ptr(in, key, disc, thread->machine.jop_pid);
+	char name[32];
+	int pid;
+
+	if (hakios_ts_log_budget(thread, name, sizeof(name), &pid)) {
+		hakios_pac_log("hakios_pac: ts sign %s[%d] %s key %s disc 0x%llx: 0x%llx -> 0x%llx\n",
+		    name, pid, what, hakios_ts_key_name(key), disc, in, out);
+	}
+	return out;
+}
+
+/* pmap_auth_user_ptr(in, key, disc, thread->machine.jop_pid): stripped, or poisoned on a mismatch */
+static uint64_t
+hakios_ts_auth(thread_t thread, const char *what, int key, uint64_t disc, uint64_t in)
+{
+	const uint64_t out = hakios_pac_auth_user_ptr(in, key, disc, thread->machine.jop_pid);
+	const uint64_t stripped = hakios_pac_strip_user_ptr(in, key);
+	char name[32];
+	int pid;
+
+	if (out != stripped) {
+		if (hakios_ts_log_mismatches < HAKIOS_TS_LOG_MISMATCH_MAX) {
+			hakios_ts_log_mismatches++;
+			hakios_pac_task_name(get_threadtask(thread), name, sizeof(name), &pid);
+			hakios_pac_log("hakios_pac: ts auth MISMATCH %s[%d] %s key %s disc 0x%llx: got 0x%llx, "
+			    "expected 0x%llx -> poisoned 0x%llx\n",
+			    name, pid, what, hakios_ts_key_name(key), disc, in,
+			    hakios_pac_sign_user_ptr(stripped, key, disc, thread->machine.jop_pid), out);
+		}
+	} else if (hakios_ts_log_budget(thread, name, sizeof(name), &pid)) {
+		hakios_pac_log("hakios_pac: ts auth %s[%d] %s key %s disc 0x%llx: 0x%llx -> 0x%llx\n",
+		    name, pid, what, hakios_ts_key_name(key), disc, in, out);
+	}
+	return out;
+}
+
+/* Apple's thread_generate_sigreturn_token() */
+static inline uint32_t
+hakios_ts_sigreturn_token(uint64_t ptr, thread_t thread)
+{
+	user64_addr_t token = (user64_addr_t)ptr;
+	token ^= (user64_addr_t)thread_get_sigreturn_token(thread);
+	token = (user64_addr_t)hakios_pac_sign_user_ptr(token,
+	    HAKIOS_PAC_KEY_DA, HAKIOS_PAC_DISC_NONCE,
+	    thread->machine.jop_pid);
+	token >>= 32;
+	return (uint32_t)token;
+}
+
+/* Apple's machine_thread_state_convert_to_user() */
+static kern_return_t
+hakios_thread_state_convert_to_user(
+	thread_t thread,
+	thread_flavor_t flavor,
+	thread_state_t tstate,
+	mach_msg_type_number_t *count,
+	thread_set_status_flags_t tssf_flags)
+{
+	arm_thread_state64_t *ts64;
+	bool preserve_flags = !!(tssf_flags & TSSF_PRESERVE_FLAGS);
+	bool stash_sigreturn_token = !!(tssf_flags & TSSF_STASH_SIGRETURN_TOKEN);
+	bool random_div = !!(tssf_flags & TSSF_RANDOM_USER_DIV);
+	bool thread_div = !!(tssf_flags & TSSF_THREAD_USER_DIV);
+	uint32_t old_flags;
+	bool kernel_signed_pc = true;
+	bool kernel_signed_lr = true;
+	uint32_t userland_diversifier = 0;
+
+	switch (flavor) {
+	case ARM_THREAD_STATE:
+	{
+		arm_unified_thread_state_t *unified_state = (arm_unified_thread_state_t *)tstate;
+
+		if (*count < ARM_UNIFIED_THREAD_STATE_COUNT || !is_thread_state64(unified_state)) {
+			return KERN_SUCCESS;
+		}
+		ts64 = thread_state64(unified_state);
+		break;
+	}
+	case ARM_THREAD_STATE64:
+	{
+		if (*count < ARM_THREAD_STATE64_COUNT) {
+			return KERN_SUCCESS;
+		}
+		ts64 = (arm_thread_state64_t *)tstate;
+		break;
+	}
+	default:
+		return KERN_SUCCESS;
+	}
+
+	/* HakiOS: no PAC-on process involved -> the state stays as it always was */
+	if (!hakios_ts_applies(thread)) {
+		return KERN_SUCCESS;
+	}
+
+	// Note that kernel threads never have disable_user_jop set
+	if (hakios_ts_jop_disabled(current_thread()) || hakios_ts_jop_disabled(thread)) {
+		ts64->flags = __DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH;
+		return KERN_SUCCESS;
+	}
+
+	old_flags = ts64->flags;
+	ts64->flags = 0;
+	if (ts64->lr) {
+		// lr might contain an IB-signed return address (strip is a no-op on unsigned addresses)
+		uint64_t stripped_lr = hakios_pac_strip_user_ptr(ts64->lr, HAKIOS_PAC_KEY_IB);
+		if (ts64->lr != stripped_lr) {
+			// Need to allow already-signed lr value to round-trip as is
+			ts64->flags |= __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR;
+		}
+		// Note that an IB-signed return address that happens to have a 0 signature value
+		// will round-trip correctly even if IA-signed again below (and IA-authd later)
+	}
+
+	if (preserve_flags) {
+		assert(random_div == false);
+		assert(thread_div == false);
+
+		/* Restore the diversifier and other opaque flags */
+		ts64->flags |= (old_flags & __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK);
+		userland_diversifier = old_flags & __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK;
+		if (!(old_flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC)) {
+			kernel_signed_pc = false;
+		}
+		if (!(old_flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR)) {
+			kernel_signed_lr = false;
+		}
+	} else {
+		/* Set a non zero userland diversifier */
+		if (random_div) {
+			do {
+				read_random(&userland_diversifier, sizeof(userland_diversifier));
+				userland_diversifier &=
+				    __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK;
+			} while (userland_diversifier == 0);
+		} else if (thread_div) {
+			userland_diversifier = thread_get_sigreturn_diversifier(thread) &
+			    __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK;
+		}
+		ts64->flags |= userland_diversifier;
+	}
+
+	if (kernel_signed_pc) {
+		ts64->flags |= __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC;
+	}
+
+	if (kernel_signed_lr) {
+		ts64->flags |= __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR;
+	}
+
+	if (ts64->pc) {
+		uint64_t discriminator = HAKIOS_PAC_DISC_PC;
+		if (!kernel_signed_pc && userland_diversifier != 0) {
+			discriminator = hakios_pac_blend((uint64_t)userland_diversifier, HAKIOS_PAC_DISC_PC);
+		}
+
+		ts64->pc = hakios_ts_sign(thread, "pc", HAKIOS_PAC_KEY_IA, discriminator, ts64->pc);
+	}
+	if (ts64->lr && !(ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR)) {
+		uint64_t discriminator = HAKIOS_PAC_DISC_LR;
+		if (!kernel_signed_lr && userland_diversifier != 0) {
+			discriminator = hakios_pac_blend((uint64_t)userland_diversifier, HAKIOS_PAC_DISC_LR);
+		}
+
+		ts64->lr = hakios_ts_sign(thread, "lr", HAKIOS_PAC_KEY_IA, discriminator, ts64->lr);
+	}
+	if (ts64->sp) {
+		ts64->sp = hakios_ts_sign(thread, "sp", HAKIOS_PAC_KEY_DA, HAKIOS_PAC_DISC_SP, ts64->sp);
+	}
+	if (ts64->fp) {
+		ts64->fp = hakios_ts_sign(thread, "fp", HAKIOS_PAC_KEY_DA, HAKIOS_PAC_DISC_FP, ts64->fp);
+	}
+
+	/* Stash the sigreturn token */
+	if (stash_sigreturn_token) {
+		if (kernel_signed_pc) {
+			uint32_t token = hakios_ts_sigreturn_token(ts64->pc, thread);
+			__DARWIN_ARM_THREAD_STATE64_SET_SIGRETURN_TOKEN(ts64, token,
+			    __DARWIN_ARM_THREAD_STATE64_SIGRETURN_PC_MASK);
+		}
+
+		if (kernel_signed_lr) {
+			uint32_t token = hakios_ts_sigreturn_token(ts64->lr, thread);
+			__DARWIN_ARM_THREAD_STATE64_SET_SIGRETURN_TOKEN(ts64, token,
+			    __DARWIN_ARM_THREAD_STATE64_SIGRETURN_LR_MASK);
+		}
+	}
+
+	return KERN_SUCCESS;
+}
+
+/*
+ * Apple's machine_thread_state_check_pac_state(): there it only sends a CoreAnalytics event
+ * (a kernel-signed pc/lr came back changed from an exception handler); here a log line.
+ */
+static void
+hakios_thread_state_check_pac_state(
+	thread_t thread,
+	arm_thread_state64_t *ts64,
+	arm_thread_state64_t *old_ts64)
+{
+	if (((ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC) &&
+	    ts64->pc != old_ts64->pc) || (!(ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR) &&
+	    (ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR) && (ts64->lr != old_ts64->lr ||
+	    (old_ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR)))) {
+		char name[32];
+		int pid;
+
+		if (hakios_ts_log_mismatches < HAKIOS_TS_LOG_MISMATCH_MAX) {
+			hakios_ts_log_mismatches++;
+			hakios_pac_task_name(get_threadtask(thread), name, sizeof(name), &pid);
+			hakios_pac_log("hakios_pac: ts %s[%d] exception reply changed a kernel-signed pc/lr: "
+			    "pc 0x%llx (was 0x%llx) lr 0x%llx (was 0x%llx) flags 0x%x (was 0x%x)\n",
+			    name, pid, ts64->pc, old_ts64->pc, ts64->lr, old_ts64->lr,
+			    ts64->flags, old_ts64->flags);
+		}
+	}
+}
+
+/* Apple's machine_thread_state_check_sigreturn_token() (its CoreAnalytics event is a log line here) */
+static bool
+hakios_thread_state_check_sigreturn_token(
+	arm_thread_state64_t *ts64,
+	thread_t thread)
+{
+	bool token_matched = true;
+	bool kernel_signed_pc = !!(ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC);
+	bool kernel_signed_lr = !!(ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR);
+	uint32_t pc_token = 0, lr_token = 0;
+
+	if (kernel_signed_pc) {
+		/* Compute the sigreturn token */
+		pc_token = hakios_ts_sigreturn_token(ts64->pc, thread);
+		if (!__DARWIN_ARM_THREAD_STATE64_CHECK_SIGRETURN_TOKEN(ts64, pc_token,
+		    __DARWIN_ARM_THREAD_STATE64_SIGRETURN_PC_MASK)) {
+			token_matched = false;
+		}
+	}
+
+	if (kernel_signed_lr) {
+		/* Compute the sigreturn token */
+		lr_token = hakios_ts_sigreturn_token(ts64->lr, thread);
+		if (!__DARWIN_ARM_THREAD_STATE64_CHECK_SIGRETURN_TOKEN(ts64, lr_token,
+		    __DARWIN_ARM_THREAD_STATE64_SIGRETURN_LR_MASK)) {
+			token_matched = false;
+		}
+	}
+
+	if (token_matched) {
+		return true;
+	}
+
+	if (hakios_ts_log_mismatches < HAKIOS_TS_LOG_MISMATCH_MAX) {
+		char name[32];
+		int pid;
+
+		hakios_ts_log_mismatches++;
+		hakios_pac_task_name(get_threadtask(thread), name, sizeof(name), &pid);
+		hakios_pac_log("hakios_pac: ts sigreturn token MISMATCH %s[%d] flags 0x%x pc 0x%llx lr 0x%llx: "
+		    "expected pc nibble 0x%x (%d) lr nibble 0x%x (%d)\n",
+		    name, pid, ts64->flags, ts64->pc, ts64->lr,
+		    (pc_token & __DARWIN_ARM_THREAD_STATE64_SIGRETURN_PC_MASK) >> 16, kernel_signed_pc,
+		    (lr_token & __DARWIN_ARM_THREAD_STATE64_SIGRETURN_LR_MASK) >> 20, kernel_signed_lr);
+	}
+	return false;
+}
+
+/* Apple's machine_thread_state_convert_from_user() */
+static kern_return_t
+hakios_thread_state_convert_from_user(
+	thread_t thread,
+	thread_flavor_t flavor,
+	thread_state_t tstate,
+	mach_msg_type_number_t count,
+	thread_state_t old_tstate,
+	mach_msg_type_number_t old_count,
+	thread_set_status_flags_t tssf_flags)
+{
+	arm_thread_state64_t *ts64;
+	arm_thread_state64_t *old_ts64 = NULL;
+	uint64_t userland_diversifier = 0;
+	bool kernel_signed_pc;
+	bool kernel_signed_lr;
+	bool random_div = !!(tssf_flags & TSSF_RANDOM_USER_DIV);
+	bool thread_div = !!(tssf_flags & TSSF_THREAD_USER_DIV);
+
+	switch (flavor) {
+	case ARM_THREAD_STATE:
+	{
+		arm_unified_thread_state_t *unified_state = (arm_unified_thread_state_t *)tstate;
+
+		if (count < ARM_UNIFIED_THREAD_STATE_COUNT || !is_thread_state64(unified_state)) {
+			return KERN_SUCCESS;
+		}
+		ts64 = thread_state64(unified_state);
+
+		arm_unified_thread_state_t *old_unified_state = (arm_unified_thread_state_t *)old_tstate;
+		if (old_unified_state && old_count >= ARM_UNIFIED_THREAD_STATE_COUNT) {
+			old_ts64 = thread_state64(old_unified_state);
+		}
+		break;
+	}
+	case ARM_THREAD_STATE64:
+	{
+		if (count != ARM_THREAD_STATE64_COUNT) {
+			return KERN_SUCCESS;
+		}
+		ts64 = (arm_thread_state64_t *)tstate;
+
+		if (old_count == ARM_THREAD_STATE64_COUNT) {
+			old_ts64 = (arm_thread_state64_t *)old_tstate;
+		}
+		break;
+	}
+	default:
+		return KERN_SUCCESS;
+	}
+
+	/* HakiOS: no PAC-on process involved -> the state stays as it always was */
+	if (!hakios_ts_applies(thread)) {
+		return KERN_SUCCESS;
+	}
+
+	// Note that kernel threads never have disable_user_jop set
+	if (hakios_ts_jop_disabled(current_thread())) {
+		if (hakios_ts_jop_disabled(thread)) {
+			ts64->flags = __DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH;
+			return KERN_SUCCESS;
+		}
+		// A JOP-disabled process must not set thread state on a JOP-enabled process
+		if (hakios_ts_log_mismatches < HAKIOS_TS_LOG_MISMATCH_MAX) {
+			char name[32];
+			int pid;
+
+			hakios_ts_log_mismatches++;
+			hakios_pac_task_name(get_threadtask(thread), name, sizeof(name), &pid);
+			hakios_pac_log("hakios_pac: ts set_state on PAC-on %s[%d] by a PAC-off process refused "
+			    "(KERN_PROTECTION_FAILURE, as Apple)\n", name, pid);
+		}
+		return KERN_PROTECTION_FAILURE;
+	}
+
+	if (ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH) {
+		if (hakios_ts_jop_disabled(thread)) {
+			return KERN_SUCCESS;
+		}
+		// Disallow setting unsigned thread state on JOP-enabled processes.
+		// Ignore flag and treat thread state arguments as signed, ptrauth
+		// poisoning will cause resulting thread state to be invalid
+		ts64->flags &= ~__DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH;
+	}
+
+	if (ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR) {
+		// lr might contain an IB-signed return address (strip is a no-op on unsigned addresses)
+		uint64_t stripped_lr = hakios_pac_strip_user_ptr(ts64->lr, HAKIOS_PAC_KEY_IB);
+		if (ts64->lr == stripped_lr) {
+			// Don't allow unsigned pointer to be passed through as is. Ignore flag and
+			// treat as IA-signed below (where auth failure may poison the value).
+			ts64->flags &= ~__DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR;
+		}
+		// Note that an IB-signed return address that happens to have a 0 signature value
+		// will also have been IA-signed (without this flag being set) and so will IA-auth
+		// correctly below.
+	}
+
+	kernel_signed_pc = !!(ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_PC);
+	kernel_signed_lr = !!(ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_KERNEL_SIGNED_LR);
+	/*
+	 * Replace pc/lr with old state if allow only
+	 * user ptr flag is passed and ptrs are marked
+	 * kernel signed.
+	 */
+	if ((tssf_flags & TSSF_CHECK_USER_FLAGS) &&
+	    (kernel_signed_pc || kernel_signed_lr)) {
+		if (old_ts64 && old_count == count) {
+			/* Send a CA event if the thread state does not match */
+			hakios_thread_state_check_pac_state(thread, ts64, old_ts64);
+
+			/* Check if user ptrs needs to be replaced */
+			if ((tssf_flags & TSSF_ALLOW_ONLY_USER_PTRS) &&
+			    kernel_signed_pc) {
+				ts64->pc = old_ts64->pc;
+			}
+
+			if ((tssf_flags & TSSF_ALLOW_ONLY_USER_PTRS) &&
+			    !(ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR) &&
+			    kernel_signed_lr) {
+				ts64->lr = old_ts64->lr;
+				if (old_ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR) {
+					ts64->flags |= __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR;
+				} else {
+					ts64->flags &= ~__DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR;
+				}
+			}
+		}
+	}
+
+	/* Validate sigreturn token */
+	if (tssf_flags & TSSF_CHECK_SIGRETURN_TOKEN) {
+		bool token_matched = hakios_thread_state_check_sigreturn_token(ts64, thread);
+		if ((tssf_flags & TSSF_ALLOW_ONLY_MATCHING_TOKEN) && !token_matched) {
+			return KERN_PROTECTION_FAILURE;
+		}
+	}
+
+	/* Get the userland diversifier */
+	if (random_div && old_ts64 && old_count == count) {
+		/* Get the random diversifier from the old thread state */
+		userland_diversifier = (uint64_t)(old_ts64->flags &
+		    __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK);
+	} else if (thread_div) {
+		userland_diversifier = (uint64_t)(thread_get_sigreturn_diversifier(thread) &
+		    __DARWIN_ARM_THREAD_STATE64_USER_DIVERSIFIER_MASK);
+	}
+
+	if (ts64->pc) {
+		uint64_t discriminator = HAKIOS_PAC_DISC_PC;
+		if (!kernel_signed_pc && userland_diversifier != 0) {
+			discriminator = hakios_pac_blend(userland_diversifier, HAKIOS_PAC_DISC_PC);
+		}
+		ts64->pc = hakios_ts_auth(thread, "pc", HAKIOS_PAC_KEY_IA, discriminator, ts64->pc);
+	}
+	if (ts64->lr && !(ts64->flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_IB_SIGNED_LR)) {
+		uint64_t discriminator = HAKIOS_PAC_DISC_LR;
+		if (!kernel_signed_lr && userland_diversifier != 0) {
+			discriminator = hakios_pac_blend(userland_diversifier, HAKIOS_PAC_DISC_LR);
+		}
+		ts64->lr = hakios_ts_auth(thread, "lr", HAKIOS_PAC_KEY_IA, discriminator, ts64->lr);
+	}
+	if (ts64->sp) {
+		ts64->sp = hakios_ts_auth(thread, "sp", HAKIOS_PAC_KEY_DA, HAKIOS_PAC_DISC_SP, ts64->sp);
+	}
+	if (ts64->fp) {
+		ts64->fp = hakios_ts_auth(thread, "fp", HAKIOS_PAC_KEY_DA, HAKIOS_PAC_DISC_FP, ts64->fp);
+	}
+
+	return KERN_SUCCESS;
+}
+#endif /* HAKIOS_USER_PAC && !__has_feature(ptrauth_calls) */
+
 /*
  * Translate thread state arguments to userspace representation
  */
@@ -810,6 +1359,12 @@ machine_thread_state_convert_to_user(
 	}
 
 	return KERN_SUCCESS;
+#elif HAKIOS_USER_PAC
+	/* HakiOS PATH 2 step 4; hakios_pac=0: one load, one branch, nothing touched */
+	if (__probable(hakios_pac_mode == HAKIOS_PAC_MODE_OFF)) {
+		return KERN_SUCCESS;
+	}
+	return hakios_thread_state_convert_to_user(thread, flavor, tstate, count, tssf_flags);
 #else
 	// No conversion to userspace representation on this platform
 	(void)thread; (void)flavor; (void)tstate; (void)count; (void)tssf_flags;
@@ -1094,6 +1649,13 @@ machine_thread_state_convert_from_user(
 	}
 
 	return KERN_SUCCESS;
+#elif HAKIOS_USER_PAC
+	/* HakiOS PATH 2 step 4; hakios_pac=0: one load, one branch, nothing touched */
+	if (__probable(hakios_pac_mode == HAKIOS_PAC_MODE_OFF)) {
+		return KERN_SUCCESS;
+	}
+	return hakios_thread_state_convert_from_user(thread, flavor, tstate, count,
+	           old_tstate, old_count, tssf_flags);
 #else
 	// No conversion from userspace representation on this platform
 	(void)thread; (void)flavor; (void)tstate; (void)count;
@@ -1142,6 +1704,23 @@ machine_thread_siguctx_pointer_convert_to_user(
 	}
 
 	return KERN_SUCCESS;
+#elif HAKIOS_USER_PAC
+	/*
+	 * HakiOS PATH 2 step 4: Apple's body above. The sigreturn validation token
+	 * (sendsig / sigreturn: uctx signed DA "uctx", XOR the thread's random token).
+	 */
+	if (__probable(hakios_pac_mode == HAKIOS_PAC_MODE_OFF)) {
+		return KERN_SUCCESS;
+	}
+	if (hakios_ts_jop_disabled(current_thread())) {
+		return KERN_SUCCESS;
+	}
+
+	if (*uctxp) {
+		*uctxp = hakios_ts_sign(thread, "uctx", HAKIOS_PAC_KEY_DA, HAKIOS_PAC_DISC_UCTX, *uctxp);
+	}
+
+	return KERN_SUCCESS;
 #else
 	// No conversion to userspace representation on this platform
 	(void)thread; (void)uctxp;
@@ -1175,6 +1754,27 @@ machine_thread_function_pointers_convert_from_user(
 		if (*fptrs) {
 			*fptrs = (uintptr_t)pmap_auth_user_ptr((void*)*fptrs,
 			    ptrauth_key_function_pointer, 0, thread->machine.jop_pid);
+		}
+		fptrs++;
+	}
+
+	return KERN_SUCCESS;
+#elif HAKIOS_USER_PAC
+	/*
+	 * HakiOS PATH 2 step 4: Apple's body above. sigaction's sa_tramp and bsdthread_register's
+	 * threadstart / wqthread arrive IA-signed with discriminator 0; the kernel keeps them stripped
+	 * and later puts them in a saved pc as they are.
+	 */
+	if (__probable(hakios_pac_mode == HAKIOS_PAC_MODE_OFF)) {
+		return KERN_SUCCESS;
+	}
+	if (hakios_ts_jop_disabled(current_thread())) {
+		return KERN_SUCCESS;
+	}
+
+	while (count--) {
+		if (*fptrs) {
+			*fptrs = hakios_ts_auth(thread, "fptr", HAKIOS_PAC_KEY_IA, 0, *fptrs);
 		}
 		fptrs++;
 	}

@@ -27,6 +27,9 @@
  */
 
 #include <arm64/machine_machdep.h>
+#if HAKIOS_USER_PAC
+#include <arm64/hakios_pac.h>
+#endif /* HAKIOS_USER_PAC */
 #include <arm64/proc_reg.h>
 #include <arm/machine_cpu.h>
 #include <arm/cpu_internal.h>
@@ -907,6 +910,15 @@ ml_get_machine_mem(void)
 	return machine_info.memory_size;
 }
 
+extern void loader_return(void);
+extern void hakios_adreno_stop(void);
+/*
+ * A device that can power itself off or restart (the Pixel 8a: PSCI SYSTEM_OFF, a reset into the active slot):
+ * devices/akita/drivers/power/hakios.akita_power.c. Returns when it does not (drivers/core/hakios.stubs.c), and the way
+ * back to the loader is taken as before.
+ */
+extern void hakios_platform_halt(int reboot);
+
 __attribute__((noreturn))
 void
 halt_all_cpus(boolean_t reboot)
@@ -918,6 +930,10 @@ halt_all_cpus(boolean_t reboot)
 		printf("CPU halted\n");
 		PEHaltRestart(kPEHaltCPU);
 	}
+	/* the device's own power off or restart, if it has one; else hand control (and the log) back to the loader */
+	hakios_platform_halt(reboot ? 1 : 0);
+	hakios_adreno_stop();
+	loader_return();
 	while (1) {
 		;
 	}
@@ -1140,6 +1156,109 @@ ml_read_chip_revision(unsigned int *rev __unused)
 #endif
 }
 
+/*
+ * The slower cores (an L2 access penalty, or the loader's "small-core"): each is made the SMT
+ * sibling ("secondary") of a faster core of its own, and the scheduler then treats it as XNU
+ * treats the second thread of a hyperthreaded core: a thread is put on it only when no faster
+ * core is idle or running something of lower priority; it looks for work only when none of
+ * them is idle; and what runs on it goes back to the run queue at every rescheduling, to be
+ * put on a faster core that has come free meanwhile. (XNU itself pairs such a core with the
+ * boot processor, which allows one of them; the phone has three: with cpus=8, cores 3, 2 and
+ * 1 go with 4, 5 and 6, so that 7, the boot core and the fastest, where real-time threads go
+ * first, stays alone: the scheduler idles a secondary while its primary runs a real-time
+ * thread.)
+ */
+static uint32_t small_cores_apart = 2;          /* boot-arg small_cores, read in ml_parse_cpu_topology() (before tunables are) */
+static int ml_slow_core_partner[MAX_CPUS];      /* by cpu_id: the faster core it is paired with, -1 if none */
+
+static void
+ml_choose_slow_core_partners(void)
+{
+	bool taken[MAX_CPUS] = { false };
+
+	for (int i = 0; i < MAX_CPUS; i++) {
+		ml_slow_core_partner[i] = -1;
+	}
+	for (int i = 0; i < (int)topology_info.num_cpus; i++) {
+		int partner = -1;
+
+		if (topology_info.cpus[i].l2_access_penalty == 0) {
+			continue;
+		}
+		/* the last fast core not yet taken; the boot core only if there is no other */
+		for (int j = (int)topology_info.num_cpus - 1; j >= 0; j--) {
+			if (topology_info.cpus[j].l2_access_penalty != 0 || taken[j]) {
+				continue;
+			}
+			if (&topology_info.cpus[j] == topology_info.boot_cpu) {
+				if (partner < 0) {
+					partner = j;
+				}
+				continue;
+			}
+			partner = j;
+			break;
+		}
+		if (partner >= 0) {
+			taken[partner] = true;
+			ml_slow_core_partner[i] = partner;
+		}
+	}
+}
+
+extern void loader_log_line(const char *line);
+
+/* At the registration of each processor: pairs it with its partner, if that one is registered too. */
+static void
+ml_pair_slow_processors(int cpu_id)
+{
+#if !CONFIG_SCHED_SMT
+	/*
+	 * HAKIOS-12377: processor_set_primary() and the secondary-processor logic only exist with
+	 * CONFIG_SCHED_SMT, which 12377 turns on for x86_64 only (not in MASTER.arm64.iPhoneOS nor our
+	 * MASTER.arm64.bcm2837). Without it the small cores are ordinary cores (as small_cores=0).
+	 */
+	(void)cpu_id;
+	(void)small_cores_apart;
+#else /* CONFIG_SCHED_SMT */
+	for (int i = 0; i < (int)topology_info.num_cpus; i++) {
+		int partner = ml_slow_core_partner[i];
+		processor_t slow, fast;
+		char line[128];
+
+		if (partner < 0 || (i != cpu_id && partner != cpu_id)) {
+			continue;
+		}
+		slow = processor_array[i];
+		fast = processor_array[partner];
+		if (slow == PROCESSOR_NULL || fast == PROCESSOR_NULL || slow->processor_primary == fast) {
+			continue;
+		}
+		sched_slow_secondaries = small_cores_apart >= 2;
+		processor_set_primary(slow, fast);
+		snprintf(line, sizeof(line), "cpu %d (phys id 0x%x) is a slower core: the scheduler uses it after cpu %d (phys id 0x%x)\n",
+		    i, topology_info.cpus[i].phys_id, partner, topology_info.cpus[partner].phys_id);
+		printf("%s", line);
+		loader_log_line(line);          /* (the kernel's own log of a run keeps only its end) */
+	}
+#endif /* CONFIG_SCHED_SMT */
+}
+
+/* How long processor cpu_id has been idle since it started, in mach_absolute_time() units (hakios.cpufreq.c's cpuload). */
+bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+
+bool
+ml_cpu_idle_time(int cpu_id, uint64_t *idle)
+{
+	struct recount_usage usage = { 0 };
+
+	if (cpu_id < 0 || cpu_id >= MAX_CPUS || processor_array[cpu_id] == PROCESSOR_NULL) {
+		return false;
+	}
+	recount_processor_usage(&processor_array[cpu_id]->pr_recount, &usage, idle);
+	return true;
+}
+
 void
 ml_parse_cpu_topology(void)
 {
@@ -1153,6 +1272,7 @@ ml_parse_cpu_topology(void)
 	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
 	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
+	PE_parse_boot_argn("small_cores", &small_cores_apart, sizeof(small_cores_apart));
 
 	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
 	// so that we trigger a panic later in the boot process, once serial is enabled.
@@ -1218,6 +1338,26 @@ ml_parse_cpu_topology(void)
 
 		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
 
+		/*
+		 * HAKIOS-12377: 12377 no longer reads "l2-access-penalty" (the field is marked unused and
+		 * nothing in the scheduler looks at it); HakiOS reads it again, as 8796 did, because it is
+		 * our "slower core" marker for ml_choose_slow_core_partners() below.
+		 */
+		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
+		/*
+		 * A core the boot loader calls small (on the phone the Cortex-A55s; the Cortex-A78 the
+		 * kernel boots on is about 2.5 times as fast) is to be used only when the faster ones are all
+		 * busy: what XNU does with a core that has an L2 access penalty (ml_pair_slow_processors()).
+		 * The loader gives it a name of its own because a kernel without that function would make
+		 * every such core the sibling of the boot processor, and stop at the assertion that a
+		 * processor has only one. Boot-arg small_cores=0: all cores alike, as before; 1: paired as
+		 * XNU pairs the two threads of a hyperthreaded core (a secondary kept idle while its primary
+		 * runs a real-time thread, and so on); 2 (the default): as cores of their own (see
+		 * sched_slow_secondaries in osfmk/kern/sched.h).
+		 */
+		if (cpu->l2_access_penalty == 0 && ml_readprop(child, "small-core", 0) != 0 && small_cores_apart) {
+			cpu->l2_access_penalty = 1;
+		}
 		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
 		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
 		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
@@ -1334,6 +1474,7 @@ ml_parse_cpu_topology(void)
 	cluster_offsets[0] = 0;
 #endif
 	assert(topology_info.boot_cpu != NULL);
+	ml_choose_slow_core_partners();
 	ml_read_chip_revision(&topology_info.chip_revision);
 	ml_cluster_power_override(&topology_info.cluster_power_down);
 
@@ -1708,6 +1849,20 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
 	if (!is_boot_cpu) {
 		smr_cpu_init(*processor_out);
 	}
+	/*
+	 * Cores that have a non-zero L2 access penalty compared
+	 * to the boot processor should be de-prioritized by the
+	 * scheduler, so that threads use the cores with better L2
+	 * preferentially. (Each with a faster core of its own, not all with the boot
+	 * processor: see ml_choose_slow_core_partners().)
+	 * (12377 no longer pairs such cores with the boot processor itself; this is HakiOS's.)
+	 */
+	ml_pair_slow_processors(this_cpu_datap->cpu_number);
+
+	/* HakiOS PATH 2 step 0: print this core's FEAT_PAuth probe (stored in cpu_init with interrupts off) */
+	extern void hakios_pac_probe_report(int cpu);
+	hakios_pac_probe_report(this_cpu_datap->cpu_number);
+
 	*ipi_handler_out = cpu_signal_handler;
 #if CONFIG_CPU_COUNTERS
 	cpc_cpu_transition(CPC_CPU_INIT, this_cpu_datap);
@@ -2708,8 +2863,16 @@ _enable_virtual_timer(void)
 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
 
 	__builtin_arm_wsr64(KERNEL_CNTV_CTL_EL0, cntvctl);
+#if defined(APPLE_ARM64_ARCH_FAMILY)
 	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */
 	__builtin_arm_wsr64("CNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
+#else
+	/*
+	 * When running at EL1 under a third-party hypervisor (e.g. Qualcomm's),
+	 * the EL1 physical timer registers are trapped and the access faults.
+	 * The guest only owns the virtual timer.
+	 */
+#endif
 #if HAS_APPLE_GENERIC_TIMER
 	__builtin_arm_wsr64("S3_1_C15_C13_4", CNTP_CTL_EL0_IMASKED);
 #endif
@@ -2859,7 +3022,7 @@ current_thread(void)
 	return current_thread_fast();
 }
 
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 uint8_t
 ml_task_get_disable_user_jop(task_t task)
 {
@@ -2883,6 +3046,10 @@ ml_thread_set_disable_user_jop(thread_t thread, uint8_t disable_user_jop)
 	} else {
 		thread->machine.arm_machine_flags &= ~ARM_MACHINE_THREAD_DISABLE_USER_JOP;
 	}
+#if HAKIOS_USER_PAC
+	/* exec only does this to a thread that has not run yet; if it ever is the running one, reload now */
+	hakios_pac_thread_changed(thread);
+#endif /* HAKIOS_USER_PAC */
 }
 
 void
@@ -2905,8 +3072,17 @@ ml_task_set_jop_pid(task_t task, task_t parent_task, boolean_t inherit, boolean_
 {
 	if (inherit) {
 		task->jop_pid = parent_task->jop_pid;
+#if HAKIOS_USER_PAC && !defined(HAS_APPLE_PAC)
+	/*
+	 * HAKIOS-12377: 12377 gives a non-arm64e task a key of its own (ml_non_arm64e_user_jop_pid(),
+	 * machine_routines_apple.c, built only with HAS_APPLE_PAC). Such a task never runs PAC-on here,
+	 * so it takes the per-boot JOP id like every other task (as on 8796).
+	 */
+	(void)disable_user_jop;
+#else
 	} else if (disable_user_jop) {
 		task->jop_pid = ml_non_arm64e_user_jop_pid();
+#endif
 	} else {
 		task->jop_pid = ml_default_jop_pid();
 	}
@@ -2915,6 +3091,18 @@ ml_task_set_jop_pid(task_t task, task_t parent_task, boolean_t inherit, boolean_
 void
 ml_task_set_jop_pid_from_shared_region(task_t task, boolean_t disable_user_jop)
 {
+#if HAKIOS_USER_PAC && !defined(HAS_APPLE_PAC)
+	/*
+	 * HakiOS PATH 2, Phase A: there are no per-shared-region keys in this (non-arm64e) kernel
+	 * (shared_region_find_key() and task->shared_region_id only exist with ptrauth_calls), so
+	 * every task takes the one per-boot JOP id. Shared-cache pages signed once by the pager are
+	 * then valid in every PAC-on process. Step 2 decides whether to key by shared region.
+	 * (HAKIOS-12377: 12377's disable_user_jop -> ml_non_arm64e_user_jop_pid() path is folded in
+	 * here too, see ml_task_set_jop_pid().)
+	 */
+	(void)disable_user_jop;
+	task->jop_pid = ml_default_jop_pid();
+#else /* !(HAKIOS_USER_PAC && !defined(HAS_APPLE_PAC)) */
 	if (disable_user_jop) {
 		task->jop_pid = ml_non_arm64e_user_jop_pid();
 		return;
@@ -2943,14 +3131,18 @@ ml_task_set_jop_pid_from_shared_region(task_t task, boolean_t disable_user_jop)
 		task->jop_pid = early_random();
 	}
 	task_unlock(task);
+#endif /* HAKIOS_USER_PAC && !defined(HAS_APPLE_PAC) */
 }
 
 void
 ml_thread_set_jop_pid(thread_t thread, task_t task)
 {
 	thread->machine.jop_pid = task->jop_pid;
+#if HAKIOS_USER_PAC
+	hakios_pac_thread_changed(thread);
+#endif /* HAKIOS_USER_PAC */
 }
-#endif /* defined(HAS_APPLE_PAC) */
+#endif /* defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC */
 
 #if DEVELOPMENT || DEBUG
 static uint64_t minor_badness_suffered = 0;
