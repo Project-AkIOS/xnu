@@ -1,0 +1,4 @@
+# AkIOS: build output and the files ak generates from the driver configuration
+/BUILD/
+/bsd/dev/hakios.drivers.h
+/config/MASTER.hakios
