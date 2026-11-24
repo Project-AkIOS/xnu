@@ -39,8 +39,6 @@ struct hakios_touch {
 /* For drivers; not from interrupt context. */
 void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void hakios_input_init(void);
-void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
-void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool hakios_ufs_dev(dev_t dev);           /* one of the storage's devices */
@@ -49,9 +47,6 @@ int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, u
 const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 void hakios_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
 int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
-/* one transfer at a time through the PMIC arbiter for this system (drivers/input/hakios.buttons.c) */
-void hakios_spmi_lock(void);
-void hakios_spmi_unlock(void);
 /*
  * How the battery is, as the battery's driver says (hakios.akita_battery.c on the Pixel 8a):
  * handed to drivers/power/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and
@@ -73,7 +68,6 @@ struct hakios_battery_state {
 };
 void hakios_battery_report(const struct hakios_battery_state *state);
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
-void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */

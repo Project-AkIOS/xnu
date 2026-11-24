@@ -3,15 +3,14 @@
  * docs/drivers-config.md), the way XNU keeps bsd/kern/bsd_stubs.c for its own parts that a configuration leaves out.
  *
  * The callers are the places that start the drivers (hakios.input.c, hakios.audio.c, bsd_init.c), that stop them on
- * the way back to the loader or out of a panic (loader_return.c, the thermal and battery guards, machine_routines.c)
+ * the way back to the loader or out of a panic (loader_return.c, machine_routines.c)
  * and the few that ask a driver something on the way (is this device one of the storage's, what the battery's
  * temperature is). Each of them calls the driver unconditionally, as it did when every driver was always built; here,
  * for a driver that is not, is what each call then does: nothing, and the answer "no", "not known" or "not there".
  * A driver that is built gets none of this: every block below is for one driver, and empty when that one is in.
  *
  * What is not here, on purpose: a call from one driver to another that it cannot work without. That is a `requires`
- * of its conf, and tools/hakios-config.py refuses
- * the configuration that would need a stand-in for it.
+ * of its conf, and tools/hakios-config.py refuses the configuration that would need a stand-in for it.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,19 +20,10 @@
 #include <sys/hakios.input.h>
 #include <sys/hakios.net.h>
 
-/* the ends of a run (loader_return.c, the guards), which have no header of their own */
-void hakios_ddr_quiesce(void);
+/* the ends of a run (loader_return.c), which have no header of their own */
 void hakios_ufs_quiesce(void);
 void hakios_var_save_on_return(void);
 void HakiosWLANStart(const char *interface, const uint8_t *address);
-
-#ifndef HAKIOS_GOODIX
-void hakios_goodix_init(void) {}
-#endif
-
-#ifndef HAKIOS_BUTTONS
-void hakios_buttons_init(void) {}
-#endif
 
 #ifndef HAKIOS_UFS
 void hakios_ufs_init(void) {}
@@ -82,11 +72,6 @@ void hakios_platform_halt(int reboot);
 void hakios_platform_halt(__unused int reboot) {}
 #endif
 
-#ifndef HAKIOS_CPUFREQ
-void hakios_cpufreq_init(void) {}
-void hakios_ddr_quiesce(void) {}
-#endif
-
 #ifndef HAKIOS_ADRENO
 void hakios_adreno_init(void) {}
 void hakios_adreno_quiesce(void) {}
@@ -119,18 +104,13 @@ hakios_wifi_tell(const char *format, ...)
 }
 #endif
 
-#if !defined(HAKIOS_HAPTIC) && !defined(HAKIOS_AKITA_HAPTIC)
+#ifndef HAKIOS_AKITA_HAPTIC
 void hakios_haptic_init(void) {}
 void hakios_haptic_quiesce(void) {}
 void hakios_haptic_pretend(__unused uint32_t peak) {}
 #endif
 
-#if !defined(HAKIOS_TORCH) && !defined(HAKIOS_AKITA_TORCH)
+#ifndef HAKIOS_AKITA_TORCH
 void hakios_torch_init(void) {}
 void hakios_torch_quiesce(void) {}
-#endif
-
-#ifndef HAKIOS_CAMERA
-void hakios_camera_init(void) {}
-void hakios_camera_quiesce(void) {}
 #endif

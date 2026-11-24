@@ -1244,21 +1244,6 @@ ml_pair_slow_processors(int cpu_id)
 #endif /* CONFIG_SCHED_SMT */
 }
 
-/* How long processor cpu_id has been idle since it started, in mach_absolute_time() units (hakios.cpufreq.c's cpuload). */
-bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
-
-bool
-ml_cpu_idle_time(int cpu_id, uint64_t *idle)
-{
-	struct recount_usage usage = { 0 };
-
-	if (cpu_id < 0 || cpu_id >= MAX_CPUS || processor_array[cpu_id] == PROCESSOR_NULL) {
-		return false;
-	}
-	recount_processor_usage(&processor_array[cpu_id]->pr_recount, &usage, idle);
-	return true;
-}
-
 void
 ml_parse_cpu_topology(void)
 {

@@ -354,9 +354,6 @@ hakios_input_init(void)
 		printf("hakios-touch: cannot create the device\n");
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
-	hakios_cpufreq_init();
-	hakios_goodix_init();
-	hakios_buttons_init();
 	hakios_battery_init();
 	hakios_ufs_init();
 	hakios_net_init();

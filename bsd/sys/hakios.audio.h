@@ -50,13 +50,11 @@ void hakios_audio_set_sink(const char *name, hakios_audio_sink_t sink);
 /* The volume Darwin has set last (HAKIOS_AUDIO_SET_VOLUME): false if it has set none; *generation counts the settings. */
 bool hakios_audio_volume(uint32_t *below, bool *muted, uint32_t *generation);
 void hakios_audio_init(void);
-void hakios_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (drivers/haptic/hakios.haptic.c) */
+void hakios_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (hakios.akita_haptic.c) */
 void hakios_haptic_quiesce(void);      /* its chip back into reset: at the run's end and on a panic's way out */
 void hakios_haptic_pretend(uint32_t peak); /* a test's stand-in for Darwin's waveform: as if a write of this loudness came */
-void hakios_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (drivers/camera/hakios.torch.c) */
+void hakios_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (hakios.akita_torch.c) */
 void hakios_torch_quiesce(void);       /* the light off: at the run's end and on a panic's way out */
-void hakios_camera_init(void);         /* boot-arg cam=N: the phone's cameras (drivers/camera/hakios.camera.c) */
-void hakios_camera_quiesce(void);      /* whatever of them was switched on, off: at the run's end and on a panic's way out */
 
 /*
  * The speakers' guard (hakios.guard.c): what the samples go through in the feeder on their

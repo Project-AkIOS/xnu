@@ -54,10 +54,8 @@ void loader_return(void);
 extern void hakios_adreno_quiesce(void);
 extern void hakios_adreno_stop(void);
 extern void hakios_adreno_minute(void);
-extern void hakios_ddr_quiesce(void);
 extern void hakios_haptic_quiesce(void);
 extern void hakios_torch_quiesce(void);
-extern void hakios_camera_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* drivers/storage/hakios.ufs.c: the data volume into the flash */
 void loader_checkpoint(uint64_t n);
@@ -417,10 +415,8 @@ loader_return(void)
 #endif
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
-	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
-	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that

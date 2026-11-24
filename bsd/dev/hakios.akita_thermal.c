@@ -1,6 +1,6 @@
 /*
  * The Pixel 8a's SoC temperatures (thermal=1): sysctl kern.hakios.thermal_*, a line in the log, and a stop for a phone
- * getting too hot -- what drivers/power/hakios.thermal.c is for the Qualcomm phones, here for zuma.
+ * getting too hot, for zuma.
  *
  * The sensors: zuma's TMU blocks (Android's tree: samsung,gs-tmu-v3; BIG id 0, MID 1, LITTLE 2, G3D 3, ISP 4, TPU 5,
  * AUR 6) are read by ACPM, the power firmware, and asked over its IPC (acpm_tmu, channel 9; hakios.akita_acpm.c): a

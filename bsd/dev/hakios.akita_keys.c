@@ -18,7 +18,7 @@
  * THIS DRIVER ONLY READS: nothing of the pin controller is written. Before it believes a pin it checks that the pin is
  * an input or an interrupt pin; where it finds something else it says so and leaves that key alone.
  *
- * What a press is: a pin read low, twice in a row, 60 times a second (as the reference phone's driver: hakios.buttons.c).
+ * What a press is: a pin read low, twice in a row, 60 times a second (as the reference phone's driver did).
  * A key that reads as held before it has ever been seen released is not believed. The mapping is the iPhone X's: power
  * is the side button (HAKIOS_BUTTON_LOCK).
  *

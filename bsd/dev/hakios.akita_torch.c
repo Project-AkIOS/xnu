@@ -17,7 +17,7 @@
  * What Darwin's flashlight is: the loader says the camera has a flash when torch=N is given (/product/camera "flash":
  * Control Center's flashlight button) and libhakios.media.dylib in mediaserverd hands FigFlashlight a device whose torch
  * level goes to /dev/hakios-torch (userland/src/inject_media.c) -- the same node and the same 0..1000 as the POCO X5
- * Pro's driver (drivers/camera/hakios.torch.c), which this replaces on this phone.
+ * Pro's driver had.
  *
  * Nothing is done unless asked:
  *   torch=1    a look: the clocks, the USI's mode and the pins as found; then the bus brought up and the chip's registers

@@ -32,8 +32,8 @@
  *              of 300 ms played at haptic_gain= percent (50)
  *   haptic=5   the motor for Darwin until the run ends: what Darwin plays on its "Actuator" audio device (the system's
  *              feedbacks, the ringer's vibration, CoreHaptics, UIKit's feedbacks) the audio plug-in writes to
- *              /dev/hakios-haptic (userland/src/audio_plugin.c), and it is played as the POCO's driver plays it
- *              (drivers/haptic/hakios.haptic.c): a waveform's start a tap -- the wavetable's click --, one that goes on
+ *              /dev/hakios-haptic (userland/src/audio_plugin.c), and it is played as the POCO's driver played it:
+ *              a waveform's start a tap -- the wavetable's click --, one that goes on
  *              a vibration -- its long waveform, as long as Darwin plays, 1 s at most and then as long a rest --, as
  *              strong as Darwin's is loud, up to haptic_gain= percent (80); the chip's error flags looked at while it
  *              plays, and any of them stops it for the run. (No test effects.)

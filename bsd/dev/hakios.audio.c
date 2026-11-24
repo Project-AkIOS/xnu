@@ -358,5 +358,4 @@ hakios_audio_init(void)
 	audio_recording_init();
 	hakios_haptic_init();
 	hakios_torch_init();
-	hakios_camera_init();
 }
