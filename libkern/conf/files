@@ -110,6 +110,8 @@ libkern/img4/interface.c 		standard
 libkern/image4/dlxk.c 		standard
 
 libkern/amfi/amfi.c 		standard
+libkern/amfi/miniamfi.c 		standard
+libkern/amfi/miniamfi_entitlements.cpp 	standard
 
 libkern/stack_protector.c       standard
 libkern/ptrauth_utils.c         standard

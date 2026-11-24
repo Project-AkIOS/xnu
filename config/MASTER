@@ -112,6 +112,9 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
 #	4.4 filesystems
 #
 options		MOCKFS		# Boot from an executable	# <mockfs>
+options		APFS		# Apple File System, read only	# <apfs>
+options		RAMFS		# Read-write filesystem in memory	# <ramfs>
+options		HFS		# HFS Plus, read-write: the data volume on the flash	# <hfs>
 options		FIFO		# fifo support			# <fifo>
 options		FDESC		# fdesc_fs support		# <fdesc>
 options		DEVFS		# devfs support			# <devfs>
@@ -330,6 +333,10 @@ options   CONFIG_PMAP_PPL			# <config_pmap_ppl>
 
 options   NOS_ARM_ASM			# <nos_arm_asm>
 options   NOS_ARM_PMAP			# <nos_arm_pmap>
+
+# HakiOS PATH 2: the (ARM64, non-arm64e) kernel manages architected FEAT_PAuth for EL0 only
+# (osfmk/arm64/hakios_pac.c). Compiled in by this option; inert unless boot-arg hakios_pac != 0.
+options   HAKIOS_USER_PAC			# <hakios_user_pac>
 
 # support dynamic signing of code
 #

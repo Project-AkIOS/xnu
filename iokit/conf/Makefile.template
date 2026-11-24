@@ -227,6 +227,14 @@ $(COMPONENT).filelist: $(OBJS)
 		 $(ECHO) $(TARGET)/$(CURRENT_KERNEL_CONFIG)/$${obj}; \
 	done > $(COMPONENT).filelist
 
+# AkIOS: Apple's IOStorageFamily (337.100.1) built in (iokit/Families/IOStorage, headers in iokit/IOKit/storage), as
+# its kext was: warnings off (Apple's -Wall code under XNU's -Weverything -Werror), and the family's own TargetConditionals.h
+# (iOS: TARGET_OS_OSX 0) on the include path and forced in, for the family and for its in-kernel users (MiniIOMedia).
+IOSTORAGE_OBJS = $(patsubst %.cpp,%.cpo,$(notdir $(wildcard $(SRCROOT)/iokit/Families/IOStorage/*.cpp))) MiniIOMedia.cpo AkitaUFSStorage.cpo
+$(foreach o,$(IOSTORAGE_OBJS),$(eval $(o)_CFLAGS_ADD += -I$(SRCROOT)/iokit/Families/IOStorage \
+	-include $(SRCROOT)/iokit/Families/IOStorage/TargetConditionals.h))
+$(foreach o,$(IOSTORAGE_OBJS),$(eval $(o)_CXXWARNFLAGS_ADD += -w))
+
 ifeq ($(XNU_LibAllFiles),1)
 LIBOBJS := $(OBJS)
 endif

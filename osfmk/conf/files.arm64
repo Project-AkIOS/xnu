@@ -35,10 +35,11 @@ osfmk/arm64/WKdmCompress_4k.s	standard
 osfmk/arm64/WKdmData.s		standard
 osfmk/arm64/lz4_decode_arm64.s  standard
 osfmk/arm64/lz4_encode_arm64.s  standard
-osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl
-osfmk/arm64/amcc_rorgn_ppl_amcc.c optional nos_arm_asm config_pmap_ppl
-osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm
-osfmk/arm64/amcc_rorgn_pv_ctrr.c optional nos_arm_asm
+# HakiOS: the amcc_rorgn_* sources (KTRR/CTRR read-only region) are not in the published source.
+#osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl
+#osfmk/arm64/amcc_rorgn_ppl_amcc.c optional nos_arm_asm config_pmap_ppl
+#osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm
+#osfmk/arm64/amcc_rorgn_pv_ctrr.c optional nos_arm_asm
 osfmk/arm64/bcopy.s standard
 osfmk/arm64/bzero.s standard
 osfmk/arm/caches.c		standard
@@ -129,3 +130,11 @@ osfmk/kern/ecc_init.c		standard
 osfmk/kern/ecc_logging.c	optional config_ecc_logging
 
 osfmk/kern/memory_error_logging.c	standard
+
+# HakiOS
+osfmk/arm64/generic_arm64_support.c	optional nos_arm_asm
+osfmk/arm64/loader_return.c	optional nos_arm_asm
+osfmk/arm64/user_exception_trace.c	standard
+osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
+osfmk/arm64/psci_smp.c	optional nos_arm_asm
+osfmk/arm64/hakios_pac.c	optional hakios_user_pac

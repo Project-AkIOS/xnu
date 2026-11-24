@@ -14,7 +14,8 @@ DRIVERKITLCLDIR = $(DRIVERKITFRAMEDIR)/$(DRIVERKIT_DKIT_PINCDIR)
 include $(MakeInc_cmd)
 include $(MakeInc_def)
 
-ALL_DEFS = $(notdir $(wildcard $(SOURCE)*.iig))
+# HakiOS: TestDextRematch.iig has no published iig output (iig is closed): left out
+ALL_DEFS = $(filter-out TestDextRematch.iig,$(notdir $(wildcard $(SOURCE)*.iig)))
 
 GENERATED_HEADERS = $(patsubst %.iig,%.h,$(ALL_DEFS))
 
