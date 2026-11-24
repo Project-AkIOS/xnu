@@ -88,7 +88,9 @@
 /* ARM64_TODO: move to higher memory */
 #endif
 #define SHARED_REGION_BASE_ARM64                0x180000000ULL
-#define SHARED_REGION_SIZE_ARM64                0x180000000ULL
+/* HakiOS: iOS 27's arm64e cache asks for 0x187ab0000 bytes plus a slide of up to 0x20000000 (its header: up to
+ * 0x327ab0000); 12377's 0x180000000 ends at 0x300000000 and its mappings failed. */
+#define SHARED_REGION_SIZE_ARM64                0x1C0000000ULL
 #define SHARED_REGION_NESTING_BASE_ARM64        SHARED_REGION_BASE_ARM64
 #define SHARED_REGION_NESTING_SIZE_ARM64        SHARED_REGION_SIZE_ARM64
 #define SHARED_REGION_NESTING_MIN_ARM64         ?

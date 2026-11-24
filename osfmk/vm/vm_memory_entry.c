@@ -57,6 +57,9 @@ IPC_KOBJECT_DEFINE(IKOT_NAMED_ENTRY,
  * somewhere else. Rather than doing it all at once (and
  * without needing access to the other whole map).
  */
+extern int hakios_shm_probe_enabled(void);
+extern void hakios_shm_probe(const char *, const char *, vm_map_t, uint64_t, uint64_t, uint64_t, int);
+
 kern_return_t
 mach_make_memory_entry_64(
 	vm_map_t                target_map,
@@ -66,13 +69,20 @@ mach_make_memory_entry_64(
 	ipc_port_t              *object_handle,
 	ipc_port_t              parent_handle)
 {
-	return mach_make_memory_entry_internal(target_map,
+	kern_return_t kr = mach_make_memory_entry_internal(target_map,
 	           size_u,
 	           offset_u,
 	           permission_u,
 	           VM_NAMED_ENTRY_KERNEL_FLAGS_NONE,
 	           object_handle,
 	           parent_handle);
+	/* (not for an entry being created: its "offset" is no address in the caller's map -- reading it crashed, 11-22) */
+	if (kr == KERN_SUCCESS && hakios_shm_probe_enabled() && !IP_VALID(parent_handle) &&
+	    !(VM_SANITIZE_UNSAFE_UNWRAP(permission_u) & MAP_MEM_NAMED_CREATE)) {
+		hakios_shm_probe("make_memory_entry", NULL, target_map, VM_SANITIZE_UNSAFE_UNWRAP(offset_u),
+		    VM_SANITIZE_UNSAFE_UNWRAP(*size_u), 0, VM_SANITIZE_UNSAFE_UNWRAP(permission_u));
+	}
+	return kr;
 }
 
 static inline void

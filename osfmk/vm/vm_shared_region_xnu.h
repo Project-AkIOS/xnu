@@ -161,14 +161,42 @@ union vm_shared_region_slide_info_entry {
  * - same si_slide_object, si_start, si_end, si_slide, si_ptrauth and si_jop_key
  * - The size and contents of si_slide_info_entry are the same.
  */
+/*
+ * HakiOS PATH 2 step 3 (HAKIOS_USER_PAC on a kernel that is not arm64e): the sections of an arm64e
+ * shared cache that hold authenticated pointers are slid UNSIGNED in the shared (nested) map, as
+ * before, for the PAC-off tasks; and a copy of their slide info is kept in sr_auth_section so that
+ * a PAC-ON task can map its own, SIGNED, pager over them (vm_shared_region_auth_remap()). This is
+ * Apple's arm64e machinery (VM_SR_AUTH_SECTIONS) without the per-shared_region_id keys / reslide.
+ */
+#if __has_feature(ptrauth_calls)
+#define VM_SR_AUTH_SECTIONS     1
+#define VM_SR_AUTH_HAKIOS       0
+#elif HAKIOS_USER_PAC
+#define VM_SR_AUTH_SECTIONS     1
+#define VM_SR_AUTH_HAKIOS       1
+#else
+#define VM_SR_AUTH_SECTIONS     0
+#define VM_SR_AUTH_HAKIOS       0
+#endif
+
 typedef struct vm_shared_region_slide_info {
 	uint32_t                si_slide;           /* the distance that the file data is relocated */
 	bool                    si_slid;
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 	bool                    si_ptrauth;
 	uint64_t                si_jop_key;
 	struct vm_shared_region *si_shared_region; /* so we can ref/dealloc for authenticated slide info */
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
+#if VM_SR_AUTH_HAKIOS
+	/* si_ptrauth only: what the unsigned pager of the same section reads from (a reference is held) */
+	vm_object_t             si_hk_backing_object;
+	vm_object_offset_t      si_hk_backing_offset;
+	/* si_ptrauth only: how the section is mapped in the nested map (taken when it was slid) */
+	vm_prot_t               si_hk_prot;
+	vm_prot_t               si_hk_max_prot;
+	vm_inherit_t            si_hk_inheritance;
+	bool                    si_hk_used_for_tpro;
+#endif /* VM_SR_AUTH_HAKIOS */
 	mach_vm_address_t       si_slid_address __kernel_data_semantics;
 	mach_vm_offset_t        si_start __kernel_data_semantics; /* start offset in si_slide_object */
 	mach_vm_offset_t        si_end __kernel_data_semantics;
@@ -210,10 +238,12 @@ struct vm_shared_region {
 
 #if __has_feature(ptrauth_calls)
 	bool                    sr_reslide;            /* Special shared region for suspected attacked processes */
+#endif /* __has_feature(ptrauth_calls) */
+#if VM_SR_AUTH_SECTIONS
 	uint_t                  sr_num_auth_section;  /* num entries in sr_auth_section */
 	uint_t                  sr_next_auth_section; /* used while filling in sr_auth_section */
 	vm_shared_region_slide_info_t *sr_auth_section;
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
 
 	uint32_t                sr_rsr_version;
 

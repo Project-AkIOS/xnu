@@ -236,13 +236,21 @@ extern vm_offset_t other_percpu_base(int cpu_number);
  * @param it            the name of the iterator
  * @param name          the per-CPU variable name
  */
+/*
+ * (redwood) The test is done on integers. As Apple wrote it in 8796, the end was a pointer
+ * computed from the start, and a compiler may then take "start <= start + n" for "n >= 0":
+ * with one processor start is VM_MAX_KERNEL_ADDRESS and end is 0, n looks positive, and the
+ * loop that must not run at all runs once on memory that does not exist (clang 18+ does this;
+ * the panic was in mbuf_mtypes_sync(), the first time a daemon asked for the mbuf statistics).
+ * 12377 no longer derives the end from the start; comparing integers keeps it that way.
+ */
 #define percpu_foreach_secondary(it, name) \
 	for (__PERCPU_TYPE(name) it, \
 	    __unsafe_indexable __base_ ## it = __PERCPU_CAST(name, percpu_base.start), \
 	    __unsafe_indexable __end_ ## it = __PERCPU_CAST(name, percpu_base.end); \
         \
 	    (it = __PERCPU_CAST(name, __PERCPU_ADDR(name) + (vm_address_t)__base_ ## it), \
-	    __base_ ## it <= __end_ ## it); \
+	    (vm_address_t)__base_ ## it <= (vm_address_t)__end_ ## it); \
         \
 	    __base_ ## it = __PERCPU_CAST(name, (vm_address_t)__base_ ## it + percpu_section_size()))
 

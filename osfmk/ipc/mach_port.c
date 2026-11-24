@@ -2971,7 +2971,18 @@ mach_port_is_connection_for_service(
 	}
 
 	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+		/*
+		 * HakiOS: no Sandbox kext, so nobody registered the message filter callbacks and there is no policy to
+		 * check -- the answer for a service port without a sandbox label ("Nothing to check" below). libxpc
+		 * refused every check-in on KERN_NOT_SUPPORTED (runningboardd: "Failed to verify check-in connection
+		 * port ... kr=46"), and backboardd's handshake with it never completed.
+		 */
+		*filter_policy_id = 0;
+		return KERN_SUCCESS;
+#else
 		return KERN_NOT_SUPPORTED;
+#endif
 	}
 
 	ret = ipc_port_translate_receive(space, service_port_name, &service_port);

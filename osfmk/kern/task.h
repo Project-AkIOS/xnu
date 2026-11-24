@@ -529,8 +529,10 @@ struct task {
 #define TES_CONCLAVE_UNTAINTABLE 0x02           /* Task can not be tainted by xnu when it talks to conclave */
 #endif /* CONFIG_EXCLAVES */
 
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || HAKIOS_USER_PAC
 	bool                            shared_region_auth_remapped;    /* authenticated sections ready for use */
+#endif /* __has_feature(ptrauth_calls) || HAKIOS_USER_PAC */
+#if __has_feature(ptrauth_calls)
 	char                            *shared_region_id;              /* determines which ptr auth key to use */
 #endif /* __has_feature(ptrauth_calls) */
 	struct vm_shared_region         *shared_region;

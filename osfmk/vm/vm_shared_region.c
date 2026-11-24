@@ -89,6 +89,17 @@
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
 #endif /* __has_feature(ptrauth_calls) */
+#if VM_SR_AUTH_HAKIOS
+#include <arm64/hakios_pac.h>
+/*
+ * Auth sections exist only while boot-arg hakios_pac is on. There is ONE shared region for PAC-on
+ * and PAC-off tasks, and exec gives it cpu subtype 0 (kern_exec.c), so a mapping with
+ * authenticated pointers is not told by the region's subtype as on Apple's kernels but by what it
+ * is: slid, not VM_PROT_NOAUTH, and with slide info v3 or v5 -- the formats that have auth pointers
+ * (vm_shared_region_slide_page_v3()/_v5(); v1, v2 and v4 are plain rebases; v5 came with 12377).
+ */
+#define VM_SR_AUTH_ENABLED()    (hakios_pac_mode != HAKIOS_PAC_MODE_OFF)
+#endif /* VM_SR_AUTH_HAKIOS */
 
 /* "dyld" uses this to figure out what the kernel supports */
 int shared_region_version = 3;
@@ -906,10 +917,12 @@ vm_shared_region_create(
 	shared_region->sr_images = NULL;
 #if __has_feature(ptrauth_calls)
 	shared_region->sr_reslide = reslide;
+#endif /* __has_feature(ptrauth_calls) */
+#if VM_SR_AUTH_SECTIONS
 	shared_region->sr_num_auth_section = 0;
 	shared_region->sr_next_auth_section = 0;
 	shared_region->sr_auth_section = NULL;
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
 	kern_return_t kr = vm_shared_region_insert_submap(config_map, shared_region, false);
 	if (kr != KERN_SUCCESS) {
 		SHARED_REGION_TRACE_ERROR(
@@ -1010,13 +1023,18 @@ vm_shared_region_destroy(
 		thread_call_free(shared_region->sr_timer_call);
 	}
 
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 	/*
 	 * Free the cached copies of slide_info for the AUTH regions.
 	 */
 	for (uint_t i = 0; i < shared_region->sr_num_auth_section; ++i) {
 		vm_shared_region_slide_info_t si = shared_region->sr_auth_section[i];
 		if (si != NULL) {
+#if VM_SR_AUTH_HAKIOS
+			if (si->si_hk_backing_object != VM_OBJECT_NULL) {
+				vm_object_deallocate(si->si_hk_backing_object);
+			}
+#endif /* VM_SR_AUTH_HAKIOS */
 			vm_object_deallocate(si->si_slide_object);
 			kfree_data(si->si_slide_info_entry,
 			    si->si_slide_info_size);
@@ -1030,7 +1048,7 @@ vm_shared_region_destroy(
 		shared_region->sr_auth_section = NULL;
 		shared_region->sr_num_auth_section = 0;
 	}
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
 
 	/* release the shared region structure... */
 	kfree_type(struct vm_shared_region, shared_region);
@@ -1226,7 +1244,7 @@ shared_region_tpro_protect(
 	return false;
 }
 
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 
 /*
  * Determine if this task is actually using pointer signing.
@@ -1234,12 +1252,16 @@ shared_region_tpro_protect(
 static boolean_t
 task_sign_pointers(task_t task)
 {
+#if VM_SR_AUTH_HAKIOS
+	return hakios_pac_task_signs(task);     /* never with hakios_pac=0 */
+#else /* VM_SR_AUTH_HAKIOS */
 	if (task->map &&
 	    task->map->pmap &&
 	    !task->map->pmap->disable_jop) {
 		return TRUE;
 	}
 	return FALSE;
+#endif /* VM_SR_AUTH_HAKIOS */
 }
 
 /*
@@ -1267,6 +1289,22 @@ vm_shared_region_auth_remap(vm_shared_region_t sr)
 	kern_return_t                 kr = KERN_SUCCESS;
 	boolean_t                     use_ptr_auth = task_sign_pointers(task);
 
+#if VM_SR_AUTH_HAKIOS
+	/*
+	 * HakiOS PATH 2 step 3: only a PAC-ON task gets private mappings. A PAC-off task (every task
+	 * with hakios_pac=0) keeps the shared, unsigned mappings of the nested map and nothing at all
+	 * is done for it here.
+	 */
+	if (!use_ptr_auth) {
+		return KERN_SUCCESS;
+	}
+	uint_t hk_sections = 0;
+	const char *hk_failed = "";             /* which step gave the error, for the log */
+	uint64_t hk_failed_addr = 0;
+#endif /* VM_SR_AUTH_HAKIOS */
+	vm_prot_t                     sec_prot, sec_max_prot;
+	vm_inherit_t                  sec_inheritance;
+
 	/*
 	 * Taking the full shared region lock here shouldn't be necessary for
 	 * functional correctness here, so we could potentially gain some scalability
@@ -1288,6 +1326,11 @@ vm_shared_region_auth_remap(vm_shared_region_t sr)
 	 */
 	for (i = 0; i < sr->sr_num_auth_section; ++i) {
 		si = sr->sr_auth_section[i];
+#if VM_SR_AUTH_HAKIOS
+		if (si == NULL) {
+			continue;       /* not recorded (logged in vm_shared_region_slide_mapping()) */
+		}
+#endif /* VM_SR_AUTH_HAKIOS */
 		assert(si != NULL);
 		assert(si->si_ptrauth);
 
@@ -1296,22 +1339,56 @@ vm_shared_region_auth_remap(vm_shared_region_t sr)
 		 * Look for an existing slid mapping's pager with matching
 		 * object, offset, slide info and shared_region_id to reuse.
 		 */
+#if VM_SR_AUTH_HAKIOS
+		/*
+		 * The signed pager of this section for this jop id (one for all PAC-on tasks: Phase A has
+		 * one jop id, and the section sits at the same address in every task of the region). It
+		 * reads from the same object and offset as the section's unsigned pager in the nested map.
+		 */
+		object = si->si_hk_backing_object;
+		sr_pager = shared_region_pager_match(object, si->si_hk_backing_offset, si, task->jop_pid);
+#else /* VM_SR_AUTH_HAKIOS */
 		object = si->si_slide_object;
 		sr_pager = shared_region_pager_match(object, si->si_start, si,
 		    use_ptr_auth ? task->jop_pid : 0);
+#endif /* VM_SR_AUTH_HAKIOS */
 		if (sr_pager == MEMORY_OBJECT_NULL) {
 			printf("%s(): shared_region_pager_match() failed\n", __func__);
+#if VM_SR_AUTH_HAKIOS
+			hk_failed = "shared_region_pager_match";
+			hk_failed_addr = si->si_slid_address;
+#endif /* VM_SR_AUTH_HAKIOS */
 			kr = KERN_FAILURE;
 			goto done;
 		}
 
+#if !VM_SR_AUTH_HAKIOS
 		/*
 		 * verify matching jop_pid for this task and this pager
 		 */
 		if (use_ptr_auth) {
 			shared_region_pager_match_task_key(sr_pager, task);
 		}
+#endif /* !VM_SR_AUTH_HAKIOS */
 
+#if VM_SR_AUTH_HAKIOS
+		/*
+		 * Apple looks the section up in the shared region's map here and insists that ONE map
+		 * entry covers it. That holds on Apple's kernels, where nobody ever uses the nested
+		 * map's copy of an auth section. Here the PAC-off tasks do: their first write to such
+		 * a section (__AUTH data is copy-on-write) makes vm_map_lookup_and_lock_object() CLIP
+		 * the nested map's entry around the faulting page, and from then on no single entry
+		 * covers the section -- "doesn't fully cover", KERN_FAILURE, for every PAC-on task
+		 * that came after (the first PAC-on task of the boot got in before any such write).
+		 * Nothing of that entry is needed but its protections and inheritance, and those were
+		 * taken when the section was slid: the nested map is not looked at.
+		 */
+		(void)sr_map;
+		(void)tmp_entry_store;
+		sec_prot = si->si_hk_prot;
+		sec_max_prot = si->si_hk_max_prot;
+		sec_inheritance = si->si_hk_inheritance;
+#else /* VM_SR_AUTH_HAKIOS */
 		sr_map = vm_shared_region_vm_map(sr);
 		tmp_entry = NULL;
 
@@ -1330,6 +1407,10 @@ vm_shared_region_auth_remap(vm_shared_region_t sr)
 			kr = KERN_FAILURE;
 			goto done;
 		}
+		sec_prot = tmp_entry->protection;
+		sec_max_prot = tmp_entry->max_protection;
+		sec_inheritance = tmp_entry->inheritance;
+#endif /* VM_SR_AUTH_HAKIOS */
 
 		/*
 		 * map the pager over the portion of the mapping that needs sliding
@@ -1337,12 +1418,19 @@ vm_shared_region_auth_remap(vm_shared_region_t sr)
 		vmk_flags = VM_MAP_KERNEL_FLAGS_FIXED(.vmf_overwrite = true);
 		vmk_flags.vmkf_overwrite_immutable = true;
 		vmk_flags.vmf_permanent = shared_region_make_permanent(sr,
-		    tmp_entry->max_protection);
+		    sec_max_prot);
 
 		/* Preserve the TPRO flag if task has TPRO enabled */
+#if VM_SR_AUTH_HAKIOS
+		/* (no tmp_entry here: what the nested map's entry said was taken when it was slid) */
+		vmk_flags.vmf_tpro = (vm_map_tpro(task->map) &&
+		    si->si_hk_used_for_tpro &&
+		    task_has_tpro(task));
+#else /* VM_SR_AUTH_HAKIOS */
 		vmk_flags.vmf_tpro = (vm_map_tpro(task->map) &&
 		    tmp_entry->used_for_tpro &&
 		    task_has_tpro(task));
+#endif /* VM_SR_AUTH_HAKIOS */
 
 		map_addr = si->si_slid_address;
 		kr = mach_vm_map_kernel(task->map,
@@ -1353,13 +1441,17 @@ vm_shared_region_auth_remap(vm_shared_region_t sr)
 		    (ipc_port_t)(uintptr_t) sr_pager,
 		    0,
 		    TRUE,
-		    tmp_entry->protection,
-		    tmp_entry->max_protection,
-		    tmp_entry->inheritance);
+		    sec_prot,
+		    sec_max_prot,
+		    sec_inheritance);
 		memory_object_deallocate(sr_pager);
 		sr_pager = MEMORY_OBJECT_NULL;
 		if (kr != KERN_SUCCESS) {
 			printf("%s(): mach_vm_map_kernel() failed\n", __func__);
+#if VM_SR_AUTH_HAKIOS
+			hk_failed = "mach_vm_map_kernel";
+			hk_failed_addr = si->si_slid_address;
+#endif /* VM_SR_AUTH_HAKIOS */
 			goto done;
 		}
 		assertf(map_addr == si->si_slid_address,
@@ -1368,12 +1460,33 @@ vm_shared_region_auth_remap(vm_shared_region_t sr)
 		    (uint64_t)si->si_slid_address,
 		    tmp_entry);
 
-		/* Drop the ref count grabbed by find_mapping_to_slide */
-		vm_object_deallocate(VME_OBJECT(tmp_entry));
-		tmp_entry = NULL;
+		if (tmp_entry) {
+			/* Drop the ref count grabbed by find_mapping_to_slide */
+			vm_object_deallocate(VME_OBJECT(tmp_entry));
+			tmp_entry = NULL;
+		}
+#if VM_SR_AUTH_HAKIOS
+		hk_sections++;
+#endif /* VM_SR_AUTH_HAKIOS */
 	}
 
 done:
+#if VM_SR_AUTH_HAKIOS
+	{
+		static uint32_t hk_remaps_logged;
+		if (kr != KERN_SUCCESS || os_atomic_inc_orig(&hk_remaps_logged, relaxed) < 200) {
+			char name[32];
+			int pid;
+			hakios_pac_task_name(task, name, sizeof(name), &pid);
+			hakios_pac_log("hakios_pac: shared region %p: %u of %u auth section(s) remapped SIGNED (private) for PAC-on pid %d (%s), kr 0x%x\n",
+			    sr, hk_sections, sr->sr_next_auth_section, pid, name, kr);
+			if (kr != KERN_SUCCESS) {
+				hakios_pac_log("hakios_pac: shared region %p: auth remap for pid %d FAILED in %s, kr 0x%x, section at 0x%llx\n",
+				    sr, pid, hk_failed, kr, hk_failed_addr);
+			}
+		}
+	}
+#endif /* VM_SR_AUTH_HAKIOS */
 	if (tmp_entry) {
 		/* Drop the ref count grabbed by find_mapping_to_slide */
 		vm_object_deallocate(VME_OBJECT(tmp_entry));
@@ -1394,7 +1507,7 @@ done:
 	vm_shared_region_release(sr);
 	return kr;
 }
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
 
 void
 vm_shared_region_undo_mappings(
@@ -2029,23 +2142,37 @@ vm_shared_region_map_file(
 	 * the previous code just established mappings for. This is why we
 	 * do it in a separate pass.
 	 */
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 	/*
 	 * need to allocate storage needed for any sr_auth_sections
 	 */
 	for (i = 0; i < mappings_to_slide_cnt; ++i) {
+#if VM_SR_AUTH_HAKIOS
+		/* an upper bound (the slide info's version is not read yet): unused slots stay NULL */
+		if (VM_SR_AUTH_ENABLED() &&
+		    shared_region->sr_cpu_type == CPU_TYPE_ARM64 &&
+		    !(mappings_to_slide[i]->sms_max_prot & VM_PROT_NOAUTH)) {
+			++shared_region->sr_num_auth_section;
+		}
+#else /* VM_SR_AUTH_HAKIOS */
 		if (shared_region->sr_cpu_type == CPU_TYPE_ARM64 &&
 		    shared_region->sr_cpu_subtype == CPU_SUBTYPE_ARM64E &&
 		    !(mappings_to_slide[i]->sms_max_prot & VM_PROT_NOAUTH)) {
 			++shared_region->sr_num_auth_section;
 		}
+#endif /* VM_SR_AUTH_HAKIOS */
 	}
 	if (shared_region->sr_num_auth_section > 0) {
 		shared_region->sr_auth_section =
 		    kalloc_type(vm_shared_region_slide_info_t, shared_region->sr_num_auth_section,
 		    Z_WAITOK | Z_ZERO);
 	}
-#endif /* __has_feature(ptrauth_calls) */
+#if VM_SR_AUTH_HAKIOS
+	hakios_pac_log("hakios_pac: shared region %p (cpu subtype 0x%x): room for %u auth section(s) among %u slid mapping(s)\n",
+	    shared_region, (unsigned)shared_region->sr_cpu_subtype,
+	    shared_region->sr_num_auth_section, mappings_to_slide_cnt);
+#endif /* VM_SR_AUTH_HAKIOS */
+#endif /* VM_SR_AUTH_SECTIONS */
 	for (i = 0; i < mappings_to_slide_cnt; ++i) {
 		kr = vm_shared_region_slide(shared_region->sr_slide,
 		    mappings_to_slide[i]->sms_file_offset,
@@ -2711,6 +2838,13 @@ vm_shared_region_slide_mapping(
 	}
 	si->si_shared_region = NULL;
 	si->si_ptrauth = FALSE;
+#elif VM_SR_AUTH_HAKIOS
+	/* the nested map's pager of this mapping: unsigned, as ever (and it owns this si) */
+	si->si_shared_region = NULL;
+	si->si_ptrauth = FALSE;
+	si->si_jop_key = 0;
+	si->si_hk_backing_object = VM_OBJECT_NULL;
+	si->si_hk_backing_offset = 0;
 #endif /* __has_feature(ptrauth_calls) */
 
 	/*
@@ -2778,6 +2912,56 @@ vm_shared_region_slide_mapping(
 	    (uint64_t)map_addr,
 	    (uint64_t) tmp_entry->vme_start,
 	    tmp_entry);
+
+#if VM_SR_AUTH_HAKIOS
+	/*
+	 * HakiOS PATH 2 step 3: this mapping of an arm64e cache holds authenticated pointers, and the
+	 * pager just mapped into the nested map leaves them UNSIGNED: right for PAC-off tasks, which
+	 * all share it. Keep a second slide info (own copy of dyld's data, own references) in the
+	 * shared region, from which vm_shared_region_auth_remap() gives each PAC-ON task a private
+	 * mapping of a SIGNING pager over the same addresses. Not done at all with hakios_pac=0.
+	 */
+	if (kr == KERN_SUCCESS &&
+	    VM_SR_AUTH_ENABLED() &&
+	    sr->sr_cpu_type == CPU_TYPE_ARM64 &&
+	    !(prot & VM_PROT_NOAUTH) &&
+	    (((vm_shared_region_slide_info_entry_t)slide_info_entry)->version == 3 ||
+	    ((vm_shared_region_slide_info_entry_t)slide_info_entry)->version == 5)) {
+		vm_shared_region_slide_info_t asi;
+		void *aentry;
+
+		if (sr->sr_next_auth_section == sr->sr_num_auth_section) {
+			printf("Too many auth/private sections for shared region!!\n");
+			hakios_pac_log("hakios_pac: shared region %p: more auth mappings than counted (%u): 0x%llx NOT signable\n",
+			    sr, sr->sr_num_auth_section, (uint64_t)si->si_slid_address);
+		} else {
+			aentry = kalloc_data((vm_size_t)slide_info_size, Z_WAITOK | Z_NOFAIL);
+			memcpy(aentry, slide_info_entry, (size_t)slide_info_size);
+			asi = kalloc_type(struct vm_shared_region_slide_info, Z_WAITOK | Z_NOFAIL);
+			*asi = *si;
+			asi->si_slide_info_entry = aentry;
+			vm_object_reference(object);                    /* for asi->si_slide_object */
+			asi->si_ptrauth = TRUE;
+			asi->si_jop_key = 0;                            /* (unused: the pager has the key) */
+			asi->si_shared_region = sr;                     /* its pagers hold the region */
+			asi->si_hk_backing_object = VME_OBJECT(tmp_entry);
+			vm_object_reference(asi->si_hk_backing_object);
+			asi->si_hk_backing_offset = VME_OFFSET(tmp_entry);
+			asi->si_hk_prot = tmp_entry->protection;
+			asi->si_hk_max_prot = tmp_entry->max_protection;
+			asi->si_hk_inheritance = tmp_entry->inheritance;
+			asi->si_hk_used_for_tpro = shared_region_tpro_protect(sr, prot);  /* as the entry just mapped */
+			sr->sr_auth_section[sr->sr_next_auth_section++] = asi;
+			hakios_pac_log("hakios_pac: shared region %p auth section %u: 0x%llx..0x%llx (file 0x%llx, slide 0x%x, info v%u) prot %x/%x\n",
+			    sr, sr->sr_next_auth_section - 1,
+			    (uint64_t)asi->si_slid_address,
+			    (uint64_t)(asi->si_slid_address + (asi->si_end - asi->si_start)),
+			    (uint64_t)asi->si_start, asi->si_slide,
+			    ((vm_shared_region_slide_info_entry_t)aentry)->version,
+			    tmp_entry->protection, tmp_entry->max_protection);
+		}
+	}
+#endif /* VM_SR_AUTH_HAKIOS */
 
 	/* success! */
 	kr = KERN_SUCCESS;
@@ -3246,17 +3430,53 @@ vm_shared_region_slide_page_v2(vm_shared_region_slide_info_t si, vm_offset_t vad
 }
 
 
+#if VM_SR_AUTH_HAKIOS
+/*
+ * HakiOS PATH 2 step 3: what the signing shared-cache pagers did, for the log. These pages are
+ * only ever made for PAC-on tasks (jop_key != 0 && si_ptrauth).
+ */
+static uint32_t hakios_sr_signed_pages;
+static uint32_t hakios_sr_signed[4];            /* per key IA/IB/DA/DB */
+static uint32_t hakios_sr_ptr_logged;
+#define HAKIOS_SR_PTR_LOG_MAX   12
+
+static void
+hakios_sr_signed_page(mach_vm_offset_t uservaddr, const uint32_t *by_key, uint32_t plain)
+{
+	uint32_t pages;
+
+	for (int k = 0; k < 4; k++) {
+		if (by_key[k] != 0) {
+			os_atomic_add(&hakios_sr_signed[k], by_key[k], relaxed);
+		}
+	}
+	pages = os_atomic_inc(&hakios_sr_signed_pages, relaxed);
+	/* the 1st, 2nd, 4th, 8th... page; and every page with a B-key pointer (see below) */
+	if ((pages & (pages - 1)) == 0 || by_key[1] != 0 || by_key[3] != 0) {
+		hakios_pac_log("hakios_pac: shared cache: %u page(s) signed so far (this one 0x%llx: IA %u IB %u DA %u DB %u plain %u); total IA %u IB %u DA %u DB %u%s\n",
+		    pages, (uint64_t)uservaddr, by_key[0], by_key[1], by_key[2], by_key[3], plain,
+		    hakios_sr_signed[0], hakios_sr_signed[1], hakios_sr_signed[2], hakios_sr_signed[3],
+		    (by_key[1] != 0 || by_key[3] != 0) ? " -- B-KEY POINTERS IN THE CACHE: NOT VALID for any task" : "");
+	}
+}
+#endif /* VM_SR_AUTH_HAKIOS */
+
 static kern_return_t
 vm_shared_region_slide_page_v3(
 	vm_shared_region_slide_info_t si,
 	vm_offset_t vaddr,
 	__unused mach_vm_offset_t uservaddr,
 	uint32_t pageIndex,
-#if !__has_feature(ptrauth_calls)
+#if !VM_SR_AUTH_SECTIONS
 	__unused
-#endif /* !__has_feature(ptrauth_calls) */
+#endif /* !VM_SR_AUTH_SECTIONS */
 	uint64_t jop_key)
 {
+#if VM_SR_AUTH_HAKIOS
+	const bool hk_sign = (jop_key != 0 && si->si_ptrauth && hakios_pac_mode != HAKIOS_PAC_MODE_OFF);
+	uint32_t hk_by_key[4] = { 0, 0, 0, 0 };
+	uint32_t hk_plain = 0;
+#endif /* VM_SR_AUTH_HAKIOS */
 	vm_shared_region_slide_info_entry_v3_t s_info = &si->si_slide_info_entry->v3;
 	const uint32_t slide_amount = si->si_slide;
 
@@ -3345,8 +3565,54 @@ vm_shared_region_slide_page_v3(
 			} else {
 				memcpy(rebaseLocation, &value, sizeof(value));
 			}
+#elif VM_SR_AUTH_HAKIOS
+			if (__improbable(hk_sign)) {
+				/*
+				 * { target:32 | diversity:16 | addrDiv:1 | key:2 (bit 49 B, bit 50 D) | next:11 | 0 | 1 }
+				 * value is now the slid target. Sign it as EL0 would: key with the modifier
+				 * `diversity`, blended with the address of this slot in the task (the page's
+				 * address in the shared region, the same in every task, + the offset in the
+				 * page) when addrDiv is set.
+				 *
+				 * The key comes from the pager's jop id. That is right for IA/DA. A B key is
+				 * per task (rop_pid) and a pager shared by tasks cannot sign with it: Apple's
+				 * caches have none; if one turns up it is signed with the jop id's B key,
+				 * which no task has, and reported (hakios_sr_signed_page()).
+				 */
+				uint64_t packed;
+				memcpy(&packed, rebaseLocation, sizeof(packed)); /* (not yet overwritten) */
+				const int      key = (int)((packed >> 49) & 0x3);
+				const uint64_t diversity = (packed >> 32) & 0xFFFF;
+				const bool     addrDiv = (packed & (1ULL << 48)) != 0;
+				const uint64_t slotVA = (uint64_t)uservaddr + (uint64_t)(rebaseLocation - page_content);
+				const uint64_t disc = addrDiv ? hakios_pac_blend(slotVA, diversity) : diversity;
+				const uint64_t target = value;
+
+				value = hakios_pac_sign_user_ptr(target, key, disc, jop_key);
+				hk_by_key[key]++;
+				if (__improbable(hakios_sr_ptr_logged < HAKIOS_SR_PTR_LOG_MAX) &&
+				    os_atomic_inc_orig(&hakios_sr_ptr_logged, relaxed) < HAKIOS_SR_PTR_LOG_MAX) {
+					static const char *const names[4] = { "IA", "IB", "DA", "DB" };
+					uint64_t back = hakios_pac_auth_user_ptr(value, key, disc, jop_key);
+					hakios_pac_log("hakios_pac: shared cache fixup slot 0x%llx %s%s div 0x%04llx disc 0x%llx: 0x%llx -> 0x%llx (%s)\n",
+					    slotVA, names[key], addrDiv ? "+addr" : "", diversity, disc,
+					    target, value, back == target ? "auth ok" : "AUTH MISMATCH");
+				}
+			}
 #endif /* __has_feature(ptrauth_calls) */
+#if !__has_feature(ptrauth_calls)
+			/*
+			 * HakiOS: 12377 stores an authenticated rebase only inside the ptrauth branch above,
+			 * so a kernel that is not arm64e would leave the raw chained value in place. Store
+			 * the slid target (signed above for a PAC-on pager, plain for everyone else), as
+			 * 8796 did after the if/else.
+			 */
+			memcpy(rebaseLocation, &value, sizeof(value));
+#endif /* !__has_feature(ptrauth_calls) */
 		} else {
+#if VM_SR_AUTH_HAKIOS
+			hk_plain++;
+#endif /* VM_SR_AUTH_HAKIOS */
 			// The new value for a rebase is the low 51-bits of the threaded value plus the slide.
 			// Regular pointer which needs to fit in 51-bits of value.
 			// C++ RTTI uses the top bit, so we'll allow the whole top-byte
@@ -3365,6 +3631,11 @@ vm_shared_region_slide_page_v3(
 	assert(preemption_enabled());
 #endif /* CONFIG_SPTM */
 
+#if VM_SR_AUTH_HAKIOS
+	if (__improbable(hk_sign)) {
+		hakios_sr_signed_page(uservaddr, hk_by_key, hk_plain);
+	}
+#endif /* VM_SR_AUTH_HAKIOS */
 	return KERN_SUCCESS;
 }
 
@@ -3481,11 +3752,17 @@ vm_shared_region_slide_page_v5(
 	vm_offset_t vaddr,
 	__unused mach_vm_offset_t uservaddr,
 	uint32_t pageIndex,
-#if !__has_feature(ptrauth_calls)
+#if !VM_SR_AUTH_SECTIONS
 	__unused
-#endif /* !__has_feature(ptrauth_calls) */
+#endif /* !VM_SR_AUTH_SECTIONS */
 	uint64_t jop_key)
 {
+#if VM_SR_AUTH_HAKIOS
+	/* HakiOS: as in vm_shared_region_slide_page_v3() (v5 is the format of iOS 18+ arm64e caches) */
+	const bool hk_sign = (jop_key != 0 && si->si_ptrauth && hakios_pac_mode != HAKIOS_PAC_MODE_OFF);
+	uint32_t hk_by_key[4] = { 0, 0, 0, 0 };
+	uint32_t hk_plain = 0;
+#endif /* VM_SR_AUTH_HAKIOS */
 	vm_shared_region_slide_info_entry_v5_t s_info = &si->si_slide_info_entry->v5;
 	const uint32_t slide_amount = si->si_slide;
 	const uint64_t value_add = s_info->value_add;
@@ -3564,8 +3841,45 @@ vm_shared_region_slide_page_v5(
 			} else {
 				memcpy(rebaseLocation, &value, sizeof(value));
 			}
+#else /* __has_feature(ptrauth_calls) */
+#if VM_SR_AUTH_HAKIOS
+			if (__improbable(hk_sign)) {
+				/*
+				 * { runtimeOffset:34 | diversity:16 | addrDiv:1 | keyIsData:1 | next:11 | 1 }
+				 * Only A keys in v5: IA, or DA when keyIsData. Signed as EL0 would, the
+				 * modifier blended with this slot's address in the task when addrDiv is set
+				 * (see vm_shared_region_slide_page_v3()).
+				 */
+				uint64_t packed;
+				memcpy(&packed, rebaseLocation, sizeof(packed)); /* (not yet overwritten) */
+				const int      key = ((packed >> 51) & 1) ? 2 /* DA */ : 0 /* IA */;
+				const uint64_t hk_div = (packed >> 34) & 0xFFFF;
+				const bool     hk_addr_div = (packed & (1ULL << 50)) != 0;
+				const uint64_t slotVA = (uint64_t)uservaddr + (uint64_t)(rebaseLocation - page_content);
+				const uint64_t disc = hk_addr_div ? hakios_pac_blend(slotVA, hk_div) : hk_div;
+				const uint64_t target = value;
+
+				value = hakios_pac_sign_user_ptr(target, key, disc, jop_key);
+				hk_by_key[key]++;
+				if (__improbable(hakios_sr_ptr_logged < HAKIOS_SR_PTR_LOG_MAX) &&
+				    os_atomic_inc_orig(&hakios_sr_ptr_logged, relaxed) < HAKIOS_SR_PTR_LOG_MAX) {
+					uint64_t back = hakios_pac_auth_user_ptr(value, key, disc, jop_key);
+					hakios_pac_log("hakios_pac: shared cache (v5) fixup slot 0x%llx %s%s div 0x%04llx disc 0x%llx: 0x%llx -> 0x%llx (%s)\n",
+					    slotVA, key == 2 ? "DA" : "IA", hk_addr_div ? "+addr" : "", hk_div, disc,
+					    target, value, back == target ? "auth ok" : "AUTH MISMATCH");
+				}
+			}
+#endif /* VM_SR_AUTH_HAKIOS */
+			/*
+			 * HakiOS: 12377 stores an authenticated rebase only in the ptrauth branch; store the
+			 * slid target here too (signed above for a PAC-on pager, plain for everyone else).
+			 */
+			memcpy(rebaseLocation, &value, sizeof(value));
 #endif /* __has_feature(ptrauth_calls) */
 		} else {
+#if VM_SR_AUTH_HAKIOS
+			hk_plain++;
+#endif /* VM_SR_AUTH_HAKIOS */
 			// the value already has the correct low bits, so just add in the high8 if it exists
 			value += high8;
 			memcpy(rebaseLocation, &value, sizeof(value));
@@ -3578,6 +3892,11 @@ vm_shared_region_slide_page_v5(
 	assert(preemption_enabled());
 #endif /* CONFIG_SPTM */
 
+#if VM_SR_AUTH_HAKIOS
+	if (__improbable(hk_sign)) {
+		hakios_sr_signed_page(uservaddr, hk_by_key, hk_plain);
+	}
+#endif /* VM_SR_AUTH_HAKIOS */
 	return KERN_SUCCESS;
 }
 

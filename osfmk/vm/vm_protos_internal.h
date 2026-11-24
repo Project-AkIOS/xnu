@@ -63,13 +63,15 @@ extern uint64_t apple_protect_pager_purge_all(void);
 extern uint64_t shared_region_pager_purge_all(void);
 extern uint64_t dyld_pager_purge_all(void);
 
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || HAKIOS_USER_PAC
 extern memory_object_t shared_region_pager_match(
 	vm_object_t             backing_object,
 	vm_object_offset_t      backing_offset,
 	struct vm_shared_region_slide_info *slide_info,
 	uint64_t                jop_key);
+#endif /* __has_feature(ptrauth_calls) || HAKIOS_USER_PAC */
 
+#if __has_feature(ptrauth_calls)
 extern void shared_region_pager_match_task_key(memory_object_t memobj, task_t task);
 #endif /* __has_feature(ptrauth_calls) */
 

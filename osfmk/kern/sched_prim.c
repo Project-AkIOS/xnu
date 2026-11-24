@@ -2109,6 +2109,14 @@ sched_vm_group_maintenance(void)
 #define SCHED_AVOID_CPU0 0
 #endif
 
+/*
+ * HakiOS: slower cores paired as "secondaries" of faster ones (see osfmk/kern/sched.h).
+ * HAKIOS-12377: the code that acts on it sits in CONFIG_SCHED_SMT blocks, and 12377 turns
+ * CONFIG_SCHED_SMT on for x86_64 only (config/MASTER*): on an arm64 build without it this flag is
+ * set (ml_pair_slow_processors()) but changes nothing. Enable CONFIG_SCHED_SMT for the board, or
+ * drop the pairing in favour of 12377's AMP (Edge/clutch) cluster scheduling.
+ */
+bool sched_slow_secondaries = false;
 int sched_avoid_cpu0 = SCHED_AVOID_CPU0;
 int sched_backup_cpu_timeout_count = 5; /* The maximum number of 10us delays to wait before using a backup cpu */
 int sched_rt_n_backup_processors = SCHED_DEFAULT_BACKUP_PROCESSORS;
@@ -2150,6 +2158,7 @@ bool
 sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
 {
 	processor_t ast_processor = NULL;
+	sched_ipi_type_t ipi_type = SCHED_IPI_NONE;
 
 #if (DEVELOPMENT || DEBUG)
 	if (__improbable(sched_smt_balance == 0)) {
@@ -2158,7 +2167,39 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
 #endif
 
 	assert(cprocessor == current_processor());
-	if (cprocessor->is_SMT == FALSE) {
+	if (cprocessor->is_SMT == FALSE && !sched_slow_secondaries) {
+		goto smt_balance_exit;
+	}
+
+	if (sched_slow_secondaries) {
+		/*
+		 * A faster core is going idle: the thread of highest priority that runs on a slower one
+		 * (not a real-time one: those stay where they are) is sent here. Its core is made to
+		 * reschedule; a thread on a secondary goes back to the run queue then, and an idle
+		 * primary is where it is put.
+		 */
+		integer_t highest = -1;
+
+		if (cprocessor->processor_primary != cprocessor) {
+			goto smt_balance_exit;
+		}
+		uint64_t running_secondaries = (cpset->cpu_state_map[PROCESSOR_RUNNING] & ~cpset->primary_map &
+		    ~cpset->pending_AST_URGENT_cpu_mask);
+		for (int cpuid = lsb_first(running_secondaries); cpuid >= 0; cpuid = lsb_next(running_secondaries, cpuid)) {
+			processor_t sprocessor = processor_array[cpuid];
+
+			if (sprocessor->current_pri < BASEPRI_RTQUEUES && sprocessor->current_pri > highest &&
+			    sprocessor->current_pri > MINPRI) {
+				highest = sprocessor->current_pri;
+				ast_processor = sprocessor;
+			}
+		}
+		if (ast_processor != PROCESSOR_NULL) {
+			ipi_type = sched_ipi_action(ast_processor, NULL, SCHED_IPI_EVENT_SMT_REBAL);
+			if (ipi_type == SCHED_IPI_NONE) {
+				ast_processor = PROCESSOR_NULL;
+			}
+		}
 		goto smt_balance_exit;
 	}
 
@@ -2173,7 +2214,6 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
 
 	processor_t sprocessor;
 
-	sched_ipi_type_t ipi_type = SCHED_IPI_NONE;
 	uint64_t running_secondary_map = (cpset->cpu_state_map[PROCESSOR_RUNNING] &
 	    ~cpset->primary_map);
 	for (int cpuid = lsb_first(running_secondary_map); cpuid >= 0; cpuid = lsb_next(running_secondary_map, cpuid)) {
@@ -2578,6 +2618,10 @@ thread_select(thread_t          thread,
 
 #if CONFIG_SCHED_SMT
 		bool needs_smt_rebalance = !is_yielding && thread->sched_pri < BASEPRI_RTQUEUES && processor->processor_primary != processor;
+		if (needs_smt_rebalance && sched_slow_secondaries) {
+			/* (a slower core of its own: worth leaving only for a faster one that is idle) */
+			needs_smt_rebalance = (pset->recommended_bitmask & pset->primary_map & pset->cpu_state_map[PROCESSOR_IDLE]) != 0;
+		}
 #endif /* CONFIG_SCHED_SMT */
 
 		bool affinity_mismatch   = thread->affinity_set != AFFINITY_SET_NULL && thread->affinity_set->aset_pset != pset;
@@ -2727,7 +2771,7 @@ pick_new_rt_thread:
 				clear_pending_AST_bits(pset, processor, select_outcome);
 
 #if CONFIG_SCHED_SMT
-				if (processor->processor_secondary != NULL) {
+				if (processor->processor_secondary != NULL && !sched_slow_secondaries) {
 					processor_t sprocessor = processor->processor_secondary;
 					if ((sprocessor->state == PROCESSOR_RUNNING) || (sprocessor->state == PROCESSOR_DISPATCHING)) {
 						ipi_type = sched_ipi_action(sprocessor, NULL, SCHED_IPI_EVENT_SMT_REBAL);
@@ -2800,7 +2844,8 @@ send_followup_ipi_before_idle:
 			}
 
 #if CONFIG_SCHED_SMT
-			if ((processor->processor_primary != processor) && (processor->processor_primary->current_pri >= BASEPRI_RTQUEUES)) {
+			if ((processor->processor_primary != processor) && (processor->processor_primary->current_pri >= BASEPRI_RTQUEUES) &&
+			    !sched_slow_secondaries) {
 				/* secondary can only run realtime thread */
 				if (select_outcome == IDLE_NONE) {
 					select_outcome = IDLE_SMT_PAIR_REALTIME;

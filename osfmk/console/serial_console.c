@@ -248,6 +248,9 @@ get_cons_ops_index(void)
  * @param poll Whether or not this call should poll instead of going to sleep
  *             waiting for an interrupt when the hardware device isn't ready
  */
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+extern void loader_log_putc(char c);
+#endif
 static inline void
 _cnputc(char c, bool poll)
 {
@@ -260,6 +263,13 @@ _cnputc(char c, bool poll)
 		_cnputc('\r', poll);
 	}
 
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	/* HakiOS: no UART on a phone -- every console character also goes to the log the loader gets back
+	 * (osfmk/arm64/loader_return.c); 12377's printf no longer passes through kprintf's PE_kputc. */
+	if (c != '\r') {
+		loader_log_putc(c);
+	}
+#endif
 	cons_ops[idx].putc(c, poll);
 }
 

@@ -12730,7 +12730,7 @@ vm_map_fork(
 
 	unsigned int pmap_flags = 0;
 	pmap_flags |= pmap_is64bit ? PMAP_CREATE_64BIT : 0;
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	pmap_flags |= old_map->pmap->disable_jop ? PMAP_CREATE_DISABLE_JOP : 0;
 #endif
 #if CONFIG_ROSETTA

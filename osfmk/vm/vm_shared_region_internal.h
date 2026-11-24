@@ -99,10 +99,10 @@ int vm_shared_region_slide(uint32_t,
     memory_object_control_t,
     vm_prot_t);
 extern void vm_shared_region_pivot(void);
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || HAKIOS_USER_PAC
 __attribute__((noinline))
 extern kern_return_t vm_shared_region_auth_remap(vm_shared_region_t sr);
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* __has_feature(ptrauth_calls) || HAKIOS_USER_PAC */
 extern void vm_shared_region_reference(vm_shared_region_t sr);
 
 #endif /* XNU_KERNEL_PRIVATE */

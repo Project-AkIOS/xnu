@@ -64,6 +64,12 @@
 #include <ptrauth.h>
 #include <arm/misc_protos.h>
 #endif /* defined(HAS_APPLE_PAC) */
+#if HAKIOS_USER_PAC && !defined(HAS_APPLE_PAC)
+#include <arm64/hakios_pac.h>
+#define HAKIOS_DYLD_PAGER_PAC 1         /* PATH 2 step 3: sign the fixups of PAC-on tasks */
+#else
+#define HAKIOS_DYLD_PAGER_PAC 0
+#endif
 
 
 /* For speculation macros */
@@ -246,6 +252,23 @@ struct dyld_pager {
 #if defined(HAS_APPLE_PAC)
 	uint64_t                dyld_a_key;
 #endif /* defined(HAS_APPLE_PAC) */
+#if HAKIOS_DYLD_PAGER_PAC
+	/*
+	 * HakiOS PATH 2 step 3. A dyld pager is made by ONE task (map_with_linking_np) for one image
+	 * and mapped only into that task's map: these are the owner's PAC mode and key ids, taken once
+	 * in dyld_pager_create(), like Apple's dyld_a_key. All false/0 for a PAC-off owner and with
+	 * hakios_pac=0, and then nothing below is looked at.
+	 */
+	bool                    dyld_hk_sign;        /* owner is PAC-on: sign the auth fixups */
+	uint64_t                dyld_hk_jop_id;      /* owner's jop_pid: IA/DA keys */
+	uint64_t                dyld_hk_rop_id;      /* owner's rop_pid: IB/DB keys */
+	int                     dyld_hk_pid;         /* owner, for the log only */
+	uint32_t                dyld_hk_pages;       /* pages fixed up (atomic) */
+	uint32_t                dyld_hk_signed[4];   /* pointers signed, per key IA/IB/DA/DB (atomic) */
+	uint32_t                dyld_hk_null;        /* auth fixups left 0 (a NULL target is not signed) */
+	uint32_t                dyld_hk_plain;       /* non-auth rebases/binds on those pages */
+	uint32_t                dyld_hk_foreign;     /* page-ins asked for by a task in the other mode */
+#endif /* HAKIOS_DYLD_PAGER_PAC */
 };
 
 queue_head_t dyld_pager_queue = QUEUE_HEAD_INITIALIZER(dyld_pager_queue);
@@ -815,6 +838,278 @@ fixupCachePageAuth64(
 }
 #endif /* defined(HAS_APPLE_PAC) */
 
+#if !defined(HAS_APPLE_PAC)
+/*
+ * HakiOS PATH 1 (devices/akita/rebase-13mini.md): this ARM64 kernel (no Apple PAC) runs ARM64E
+ * userland -- the iPhone 13 mini's 16.6.1 binaries -- with pointer-auth DISABLED (the loader sets
+ * HCR_EL2.API|APK so PACGA does not trap, and PACIA/AUTIA are NOPs with the SCTLR enable bits clear).
+ * So we must still APPLY the arm64e chained fixups (DYLD_CHAINED_PTR_ARM64E / _USERLAND / _USERLAND24),
+ * but write each target UNSIGNED -- there is no key to sign with and the CPU would not check it anyway.
+ * This mirrors fixupPageAuth64() exactly except the two auth cases drop signPointer() and store the raw
+ * target. Without it, format 12 (ARM64E_USERLAND24) hit the "unknown pointer_format" default and every
+ * arm64e binary's first fixed-up page took SIGBUS (initproc/launchd died -> "initproc failed to start").
+ */
+static kern_return_t
+fixupPageAuth64_nopac(
+	uint64_t                              userVA __unused,
+	vm_offset_t                           contents,
+	vm_offset_t                           end_contents,
+	dyld_pager_t                          pager,
+	struct dyld_chained_starts_in_segment *segInfo,
+	uint32_t                              pageIndex,
+	bool                                  offsetBased)
+{
+	void                 *link_info = pager->dyld_link_info;
+	uint32_t             link_info_size = pager->dyld_link_info_size;
+	struct mwl_info_hdr  *hdr = (struct mwl_info_hdr *)link_info;
+	uint64_t             *bindsArray = (uint64_t*)((uintptr_t)link_info + hdr->mwli_binds_offset);
+
+	if ((uintptr_t)&segInfo->page_start[pageIndex + 1] > (uintptr_t)link_info + link_info_size) {
+		printf("%s(): out of range segInfo->page_start[pageIndex]", __func__);
+		return KERN_FAILURE;
+	}
+	uint16_t firstStartOffset = segInfo->page_start[pageIndex];
+	if (firstStartOffset == DYLD_CHAINED_PTR_START_NONE) {
+		return KERN_SUCCESS;
+	}
+	uint64_t *chain = (uint64_t *)(contents + firstStartOffset);
+	uint64_t targetAdjust = (offsetBased ? hdr->mwli_image_address : hdr->mwli_slide);
+	uint64_t delta = 0;
+	do {
+		if ((uintptr_t)chain < contents || (uintptr_t)chain + sizeof(*chain) > end_contents) {
+			printf("%s(): chain 0x%llx out of range 0x%llx..0x%llx", __func__,
+			    (long long)chain, (long long)contents, (long long)end_contents);
+			return KERN_FAILURE;
+		}
+		uint64_t value = *chain;
+		delta = (value >> 51) & 0x7FF;
+		bool isAuth = (value & 0x8000000000000000ULL);
+		bool isBind = (value & 0x4000000000000000ULL);
+		if (isAuth) {
+			/* PAC off: store the target unsigned (ignore key/diversity/addrDiv) */
+			if (isBind) {
+				uint32_t bindOrdinal = value & 0x00FFFFFF;
+				if (bindOrdinal >= hdr->mwli_binds_count) {
+					printf("%s(): out of range bind ordinal %u (max %u)",
+					    __func__, bindOrdinal, hdr->mwli_binds_count);
+					return KERN_FAILURE;
+				}
+				*chain = bindsArray[bindOrdinal];
+			} else {
+				/* auth rebases carry only a 32-bit offset from the image base */
+				*chain = (value & 0xFFFFFFFF) + hdr->mwli_image_address;
+			}
+		} else {
+			if (isBind) {
+				uint32_t bindOrdinal = value & 0x00FFFFFF;
+				if (bindOrdinal >= hdr->mwli_binds_count) {
+					printf("%s(): out of range bind ordinal %u (max %u)",
+					    __func__, bindOrdinal, hdr->mwli_binds_count);
+					return KERN_FAILURE;
+				} else {
+					uint64_t addend19 = (value >> 32) & 0x0007FFFF;
+					if (addend19 & 0x40000) {
+						addend19 |=  0xFFFFFFFFFFFC0000ULL;
+					}
+					*chain = bindsArray[bindOrdinal] + addend19;
+				}
+			} else {
+				uint64_t target = (value & 0x7FFFFFFFFFFULL);
+				uint64_t high8  = (value << 13) & 0xFF00000000000000ULL;
+				*chain = target + targetAdjust + high8;
+			}
+		}
+		chain += delta;
+	} while (delta != 0);
+	return KERN_SUCCESS;
+}
+#endif /* !defined(HAS_APPLE_PAC) */
+
+#if HAKIOS_DYLD_PAGER_PAC
+/*
+ * HakiOS PATH 2 step 3: the same walk as fixupPageAuth64_nopac() above, for a pager whose owner
+ * runs PAC-ON (pager->dyld_hk_sign). It is Apple's fixupPageAuth64() + signPointer() on
+ * hakios_pac_sign_user_ptr():
+ *
+ *   auth pointer   { target:32 | diversity:16 | addrDiv:1 | key:2 | next:11 | bind:1 | auth:1 }
+ *                  (auth bind: ordinal:24 in the low bits instead of the target)
+ *       value = pac<key>(target, addrDiv ? blend(slot VA, diversity) : diversity)
+ *       under the owner's key: key 0 IA / 2 DA from its jop_pid, 1 IB / 3 DB from its rop_pid.
+ *       A NULL target (a missing weak import) stays 0: dyld and Apple's kernel do not sign NULL.
+ *   plain pointer  slid / bound, unsigned: exactly what _nopac writes.
+ *
+ * "slot VA" is the address of the pointer's own storage IN THE OWNER'S ADDRESS SPACE:
+ * userVA (the page's address there, worked out by dyld_pager_data_request() from the regions
+ * map_with_linking_np gave: dyld_address[r] + (object offset - dyld_file_offset[r]); the pager is
+ * mapped at exactly dyld_address[r], vm_map_with_linking()) + the slot's offset in the page.
+ * It is NOT the kernel address the page is being filled through.
+ *
+ * Counters for the log go to *st (the caller adds them to the pager's).
+ */
+struct hakios_dyld_fixup_stats {
+	uint32_t signed_by_key[4];
+	uint32_t null_auth;
+	uint32_t plain;
+};
+
+/* the first signed pointers of the boot are logged whole, and checked with the auth primitive */
+#define HAKIOS_DYLD_PTR_LOG_MAX         12
+static uint32_t hakios_dyld_ptr_logged;
+
+static inline uint64_t
+hakios_dyld_sign(
+	uint64_t                        target,
+	uint64_t                        slotVA,
+	uint64_t                        value,          /* the packed chain entry */
+	dyld_pager_t                    pager,
+	struct hakios_dyld_fixup_stats  *st)
+{
+	const int      key = (int)((value >> 49) & 0x3);        /* == hakios_pac_key_t == ptrauth_key */
+	const bool     addrDiv = ((value & (1ULL << 48)) != 0);
+	const uint64_t diversity = (value >> 32) & 0xFFFF;
+	const uint64_t disc = addrDiv ? hakios_pac_blend(slotVA, diversity) : diversity;
+	const uint64_t id = (key == HAKIOS_PAC_KEY_IA || key == HAKIOS_PAC_KEY_DA) ?
+	    pager->dyld_hk_jop_id : pager->dyld_hk_rop_id;
+	uint64_t       signedval;
+
+	/* don't sign NULL */
+	if (target == 0) {
+		st->null_auth++;
+		return 0;
+	}
+	signedval = hakios_pac_sign_user_ptr(target, key, disc, id);
+	st->signed_by_key[key]++;
+
+	if (__improbable(hakios_dyld_ptr_logged < HAKIOS_DYLD_PTR_LOG_MAX) &&
+	    os_atomic_inc_orig(&hakios_dyld_ptr_logged, relaxed) < HAKIOS_DYLD_PTR_LOG_MAX) {
+		static const char *const names[4] = { "IA", "IB", "DA", "DB" };
+		uint64_t back = hakios_pac_auth_user_ptr(signedval, key, disc, id);
+		hakios_pac_log("hakios_pac: dyld fixup pid %d slot 0x%llx %s%s div 0x%04llx disc 0x%llx: 0x%llx -> 0x%llx (%s)\n",
+		    pager->dyld_hk_pid, slotVA, names[key], addrDiv ? "+addr" : "", diversity, disc,
+		    target, signedval, back == target ? "auth ok" : "AUTH MISMATCH");
+	}
+	return signedval;
+}
+
+static kern_return_t
+fixupPageAuth64_hakios(
+	uint64_t                              userVA,
+	vm_offset_t                           contents,
+	vm_offset_t                           end_contents,
+	dyld_pager_t                          pager,
+	struct dyld_chained_starts_in_segment *segInfo,
+	uint32_t                              pageIndex,
+	bool                                  offsetBased,
+	struct hakios_dyld_fixup_stats        *st)
+{
+	void                 *link_info = pager->dyld_link_info;
+	uint32_t             link_info_size = pager->dyld_link_info_size;
+	struct mwl_info_hdr  *hdr = (struct mwl_info_hdr *)link_info;
+	uint64_t             *bindsArray = (uint64_t*)((uintptr_t)link_info + hdr->mwli_binds_offset);
+
+	if ((uintptr_t)&segInfo->page_start[pageIndex + 1] > (uintptr_t)link_info + link_info_size) {
+		printf("%s(): out of range segInfo->page_start[pageIndex]", __func__);
+		return KERN_FAILURE;
+	}
+	uint16_t firstStartOffset = segInfo->page_start[pageIndex];
+	if (firstStartOffset == DYLD_CHAINED_PTR_START_NONE) {
+		return KERN_SUCCESS;
+	}
+	uint64_t *chain = (uint64_t *)(contents + firstStartOffset);
+	uint64_t targetAdjust = (offsetBased ? hdr->mwli_image_address : hdr->mwli_slide);
+	uint64_t delta = 0;
+	do {
+		if ((uintptr_t)chain < contents || (uintptr_t)chain + sizeof(*chain) > end_contents) {
+			printf("%s(): chain 0x%llx out of range 0x%llx..0x%llx", __func__,
+			    (long long)chain, (long long)contents, (long long)end_contents);
+			return KERN_FAILURE;
+		}
+		uint64_t value = *chain;
+		delta = (value >> 51) & 0x7FF;
+		bool isAuth = (value & 0x8000000000000000ULL);
+		bool isBind = (value & 0x4000000000000000ULL);
+		if (isAuth) {
+			/* where this pointer is stored in the owner's address space */
+			uint64_t slotVA = userVA + ((uintptr_t)chain - contents);
+			if (isBind) {
+				uint32_t bindOrdinal = value & 0x00FFFFFF;
+				if (bindOrdinal >= hdr->mwli_binds_count) {
+					printf("%s(): out of range bind ordinal %u (max %u)",
+					    __func__, bindOrdinal, hdr->mwli_binds_count);
+					return KERN_FAILURE;
+				}
+				*chain = hakios_dyld_sign(bindsArray[bindOrdinal], slotVA, value, pager, st);
+			} else {
+				/* auth rebases carry only a 32-bit offset from the image base */
+				uint64_t target = (value & 0xFFFFFFFF) + hdr->mwli_image_address;
+				*chain = hakios_dyld_sign(target, slotVA, value, pager, st);
+			}
+		} else {
+			st->plain++;
+			if (isBind) {
+				uint32_t bindOrdinal = value & 0x00FFFFFF;
+				if (bindOrdinal >= hdr->mwli_binds_count) {
+					printf("%s(): out of range bind ordinal %u (max %u)",
+					    __func__, bindOrdinal, hdr->mwli_binds_count);
+					return KERN_FAILURE;
+				} else {
+					uint64_t addend19 = (value >> 32) & 0x0007FFFF;
+					if (addend19 & 0x40000) {
+						addend19 |=  0xFFFFFFFFFFFC0000ULL;
+					}
+					*chain = bindsArray[bindOrdinal] + addend19;
+				}
+			} else {
+				uint64_t target = (value & 0x7FFFFFFFFFFULL);
+				uint64_t high8  = (value << 13) & 0xFF00000000000000ULL;
+				*chain = target + targetAdjust + high8;
+			}
+		}
+		chain += delta;
+	} while (delta != 0);
+	return KERN_SUCCESS;
+}
+
+/*
+ * The ARM64E formats for a PAC-on owner: sign, count, and say so in the log on this pager's
+ * 1st, 2nd, 4th, 8th... page (a running total: a process that dies early still shows what it got).
+ */
+static void
+fixup_page_hakios(
+	uint64_t                              userVA,
+	vm_offset_t                           contents,
+	vm_offset_t                           end_contents,
+	dyld_pager_t                          pager,
+	struct dyld_chained_starts_in_segment *segInfo,
+	uint32_t                              pageIndex,
+	bool                                  offsetBased)
+{
+	struct hakios_dyld_fixup_stats st = {};
+	kern_return_t kr;
+	uint32_t pages;
+
+	kr = fixupPageAuth64_hakios(userVA, contents, end_contents, pager, segInfo, pageIndex, offsetBased, &st);
+
+	for (int k = 0; k < 4; k++) {
+		if (st.signed_by_key[k] != 0) {
+			os_atomic_add(&pager->dyld_hk_signed[k], st.signed_by_key[k], relaxed);
+		}
+	}
+	os_atomic_add(&pager->dyld_hk_null, st.null_auth, relaxed);
+	os_atomic_add(&pager->dyld_hk_plain, st.plain, relaxed);
+	pages = os_atomic_inc(&pager->dyld_hk_pages, relaxed);
+
+	if (kr != KERN_SUCCESS || (pages & (pages - 1)) == 0) {
+		hakios_pac_log("hakios_pac: dyld pager %p pid %d: %u page(s) signed so far (this one 0x%llx: IA %u IB %u DA %u DB %u null %u plain %u%s); total IA %u IB %u DA %u DB %u\n",
+		    pager, pager->dyld_hk_pid, pages, userVA,
+		    st.signed_by_key[0], st.signed_by_key[1], st.signed_by_key[2], st.signed_by_key[3],
+		    st.null_auth, st.plain, kr != KERN_SUCCESS ? ", CHAIN ERROR" : "",
+		    pager->dyld_hk_signed[0], pager->dyld_hk_signed[1],
+		    pager->dyld_hk_signed[2], pager->dyld_hk_signed[3]);
+	}
+}
+#endif /* HAKIOS_DYLD_PAGER_PAC */
+
 
 /*
  * Handle dyld fixups for a page.
@@ -832,6 +1127,9 @@ fixup_page(
 	uint32_t                              pageIndex = 0;
 	uint32_t                              segIndex;
 	struct dyld_chained_starts_in_image   *startsInfo;
+#if !defined(HAS_APPLE_PAC)
+	vm_offset_t                           end_contents = contents + PAGE_SIZE; /* HakiOS: 12377 dropped the parameter; the page's end, as 8796's caller passed */
+#endif
 	struct dyld_chained_starts_in_segment *seg;
 	uint64_t                              segStartAddress;
 	uint64_t                              segEndAddress;
@@ -933,6 +1231,31 @@ fixup_page(
 	case DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE:
 		fixupCachePageAuth64(userVA, contents, pager, segInfo, pageIndex);
 		break;
+#else /* !defined(HAS_APPLE_PAC) -- HakiOS PATH 1: apply arm64e chains with PAC disabled (unsigned targets) */
+	/*
+	 * HakiOS PATH 2 step 3: ... and SIGNED when the pager's owner runs PAC-on (dyld_hk_sign, fixed
+	 * when the pager was made; false for every PAC-off task and with hakios_pac=0, which then take
+	 * the _nopac path exactly as before).
+	 */
+	case DYLD_CHAINED_PTR_ARM64E:
+#if HAKIOS_DYLD_PAGER_PAC
+		if (__improbable(pager->dyld_hk_sign)) {
+			fixup_page_hakios(userVA, contents, end_contents, pager, segInfo, pageIndex, false);
+			break;
+		}
+#endif /* HAKIOS_DYLD_PAGER_PAC */
+		fixupPageAuth64_nopac(userVA, contents, end_contents, pager, segInfo, pageIndex, false);
+		break;
+	case DYLD_CHAINED_PTR_ARM64E_USERLAND:
+	case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+#if HAKIOS_DYLD_PAGER_PAC
+		if (__improbable(pager->dyld_hk_sign)) {
+			fixup_page_hakios(userVA, contents, end_contents, pager, segInfo, pageIndex, true);
+			break;
+		}
+#endif /* HAKIOS_DYLD_PAGER_PAC */
+		fixupPageAuth64_nopac(userVA, contents, end_contents, pager, segInfo, pageIndex, true);
+		break;
 #endif /* defined(HAS_APPLE_PAC) */
 	case DYLD_CHAINED_PTR_64:
 		fixupPage64(userVA, contents, link_info, segInfo, pageIndex, false);
@@ -1003,6 +1326,29 @@ dyld_pager_data_request(
 	assert(os_ref_get_count_raw(&pager->dyld_ref_count) > 1); /* pager is alive */
 	assert(pager->dyld_is_mapped); /* pager is mapped */
 	hdr = (struct mwl_info_hdr *)pager->dyld_link_info;
+
+#if HAKIOS_DYLD_PAGER_PAC
+	/*
+	 * HakiOS PATH 2 step 3: the page is filled for the pager's OWNER (signed or not, with the
+	 * owner's keys), whoever faults it in. The only other tasks that can reach this object are the
+	 * owner's fork children (same mode and key ids: task_create_internal) and tasks reading the
+	 * owner's memory (vm_read / vm_remap: they are meant to see the owner's bytes). Should a user
+	 * task of the OTHER mode ever fault here, say so: the bytes it gets are right for the owner,
+	 * not for it.
+	 */
+	if (__improbable(hakios_pac_mode != HAKIOS_PAC_MODE_OFF)) {
+		task_t ftask = current_task();
+		if (ftask != kernel_task && hakios_pac_task_signs(ftask) != pager->dyld_hk_sign &&
+		    os_atomic_inc(&pager->dyld_hk_foreign, relaxed) <= 4) {
+			char fname[32];
+			int fpid;
+			hakios_pac_task_name(ftask, fname, sizeof(fname), &fpid);
+			hakios_pac_log("hakios_pac: dyld pager %p (owner pid %d, %s) paged in by pid %d (%s), a %s task: offset 0x%llx\n",
+			    pager, pager->dyld_hk_pid, pager->dyld_hk_sign ? "PAC-on" : "PAC-off",
+			    fpid, fname, pager->dyld_hk_sign ? "PAC-off" : "PAC-on", (uint64_t)offset);
+		}
+	}
+#endif /* HAKIOS_DYLD_PAGER_PAC */
 
 	/*
 	 * Gather in a UPL all the VM pages requested by VM.
@@ -1297,6 +1643,19 @@ dyld_pager_terminate_internal(
 	assert(!pager->dyld_is_mapped);
 	assert(os_ref_get_count_raw(&pager->dyld_ref_count) == 1);
 
+#if HAKIOS_DYLD_PAGER_PAC
+	if (__improbable(pager->dyld_hk_sign)) {
+		static uint32_t hakios_dyld_pagers_done_logged;
+		if (os_atomic_inc_orig(&hakios_dyld_pagers_done_logged, relaxed) < 200) {
+			hakios_pac_log("hakios_pac: dyld pager %p pid %d done: %u page(s), signed IA %u IB %u DA %u DB %u, null auth %u, plain %u, foreign page-ins %u\n",
+			    pager, pager->dyld_hk_pid, pager->dyld_hk_pages,
+			    pager->dyld_hk_signed[0], pager->dyld_hk_signed[1],
+			    pager->dyld_hk_signed[2], pager->dyld_hk_signed[3],
+			    pager->dyld_hk_null, pager->dyld_hk_plain, pager->dyld_hk_foreign);
+		}
+	}
+#endif /* HAKIOS_DYLD_PAGER_PAC */
+
 	if (pager->dyld_backing_object != VM_OBJECT_NULL) {
 		vm_object_deallocate(pager->dyld_backing_object);
 		pager->dyld_backing_object = VM_OBJECT_NULL;
@@ -1487,7 +1846,7 @@ dyld_pager_lookup(
  */
 static dyld_pager_t
 dyld_pager_create(
-#if !defined(HAS_APPLE_PAC)
+#if !defined(HAS_APPLE_PAC) && !HAKIOS_DYLD_PAGER_PAC
 	__unused
 #endif /* defined(HAS_APPLE_PAC) */
 	task_t            task,
@@ -1552,6 +1911,40 @@ dyld_pager_create(
 #if defined(HAS_APPLE_PAC)
 	pager->dyld_a_key = (task->map && task->map->pmap && !task->map->pmap->disable_jop) ? task->jop_pid : 0;
 #endif /* defined(HAS_APPLE_PAC) */
+#if HAKIOS_DYLD_PAGER_PAC
+	/*
+	 * HakiOS PATH 2 step 3: the owner's mode, once and for all. exec fixed the map's disable_jop
+	 * (load_machfile: PMAP_CREATE_DISABLE_JOP) and the task's ids before any of its code ran, and
+	 * dyld only gets here from that code.
+	 */
+	pager->dyld_hk_sign = false;
+	pager->dyld_hk_jop_id = 0;
+	pager->dyld_hk_rop_id = 0;
+	pager->dyld_hk_pid = -1;
+	pager->dyld_hk_pages = 0;
+	pager->dyld_hk_signed[0] = pager->dyld_hk_signed[1] = 0;
+	pager->dyld_hk_signed[2] = pager->dyld_hk_signed[3] = 0;
+	pager->dyld_hk_null = 0;
+	pager->dyld_hk_plain = 0;
+	pager->dyld_hk_foreign = 0;
+	if (__improbable(hakios_pac_task_signs(task))) {
+		static uint32_t hakios_dyld_pagers_logged;
+		char name[32];
+
+		pager->dyld_hk_sign = true;
+		hakios_pac_task_ids(task, &pager->dyld_hk_jop_id, &pager->dyld_hk_rop_id);
+		hakios_pac_task_name(task, name, sizeof(name), &pager->dyld_hk_pid);
+		if (os_atomic_inc_orig(&hakios_dyld_pagers_logged, relaxed) < 200) {
+			struct mwl_info_hdr *lhdr = (struct mwl_info_hdr *)link_info;
+			hakios_pac_log("hakios_pac: dyld pager %p for PAC-on pid %d (%s): format %u, image 0x%llx, %u region(s), first 0x%llx+0x%llx, %u bind(s): fixups will be SIGNED\n",
+			    pager, pager->dyld_hk_pid, name, lhdr->mwli_pointer_format,
+			    (uint64_t)lhdr->mwli_image_address, region_cnt,
+			    region_cnt ? (uint64_t)regions[0].mwlr_address : 0ULL,
+			    region_cnt ? (uint64_t)regions[0].mwlr_size : 0ULL,
+			    lhdr->mwli_binds_count);
+		}
+	}
+#endif /* HAKIOS_DYLD_PAGER_PAC */
 
 	vm_object_reference(backing_object);
 	lck_mtx_lock(&dyld_pager_lock);

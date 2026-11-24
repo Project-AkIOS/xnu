@@ -38,6 +38,7 @@
 #include <mach/task_policy.h>
 #include <kern/sfi.h>
 #include <kern/policy_internal.h>
+#include <pexpert/pexpert.h>   /* AkIOS: rt_probe */
 #include <sys/errno.h>
 #include <sys/ulock.h>
 
@@ -261,8 +262,49 @@ thread_qos_scaled_relative_priority(int qos, int qos_relprio)
  */
 static TUNABLE(bool, allow_qos_policy_set, "-qos-policy-allow", false);
 
+static kern_return_t thread_policy_set_impl(thread_t thread, thread_policy_flavor_t flavor, thread_policy_t policy_info,
+    mach_msg_type_number_t count);
+
+/*
+ * AkIOS (11-23): rt_probe=NAME -- NAME's thread_policy_set calls that fail: flavor, the first four words, the result.
+ * audiomxd's HAL I/O thread "Failed to change thread to realtime priority" (configure_thread_for_realtime, flavor 2),
+ * so no I/O ever ran on the speaker.
+ */
 kern_return_t
 thread_policy_set(
+	thread_t                                thread,
+	thread_policy_flavor_t  flavor,
+	thread_policy_t                 policy_info,
+	mach_msg_type_number_t  count)
+{
+	extern void loader_log_line(const char *line);
+	static int on = -1;
+	static char who[MAXCOMLEN + 1];
+	static uint32_t said;
+	kern_return_t kr = thread_policy_set_impl(thread, flavor, policy_info, count);
+
+	if (on < 0) {
+		on = PE_parse_boot_arg_str("rt_probe", who, sizeof(who)) && who[0] != '\0';
+	}
+	if (on > 0 && kr != KERN_SUCCESS && said < 40) {
+		struct proc *p = current_proc();
+
+		if (p != NULL && strcmp(proc_name_address(p), who) == 0) {
+			char line[200];
+			integer_t *w = (integer_t *)policy_info;
+
+			said++;
+			snprintf(line, sizeof(line), "rt_probe: %s thread_policy_set flavor %d count %u words %d %d %d %d -> %d\n",
+			    who, flavor, count, count > 0 ? w[0] : 0, count > 1 ? w[1] : 0, count > 2 ? w[2] : 0, count > 3 ? w[3] : 0, kr);
+			printf("%s", line);
+			loader_log_line(line);
+		}
+	}
+	return kr;
+}
+
+static kern_return_t
+thread_policy_set_impl(
 	thread_t                                thread,
 	thread_policy_flavor_t  flavor,
 	thread_policy_t                 policy_info,

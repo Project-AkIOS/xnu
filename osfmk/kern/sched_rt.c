@@ -81,8 +81,13 @@ sched_realtime_timebase_init(void)
 {
 	uint64_t abstime;
 
-	/* smallest rt computation (50 us) */
-	clock_interval_to_absolutetime_interval(50, NSEC_PER_USEC, &abstime);
+	/*
+	 * smallest rt computation: 40 us here, not Apple's 50 (AkIOS, 11-23). iOS asks for realtime threads in ticks of an
+	 * iPhone's 24 MHz timebase -- CoreAudio's HAL I/O thread exactly 1200 (50 us there) -- and this phone's counter runs
+	 * at 24.576 MHz, where 50 us are 1228 ticks: the request was below the minimum (KERN_INVALID_ARGUMENT), audiomxd's
+	 * I/O thread never ran, no sound ever played, audiomxd deadlocked and everything waiting on it hung (Setup's freeze).
+	 */
+	clock_interval_to_absolutetime_interval(40, NSEC_PER_USEC, &abstime);
 	assert((abstime >> 32) == 0 && (uint32_t)abstime != 0);
 	min_rt_quantum = (uint32_t)abstime;
 

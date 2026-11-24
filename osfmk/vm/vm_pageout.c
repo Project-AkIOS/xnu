@@ -5276,7 +5276,7 @@ vm_pressure_response()
 
 	available_memory = (uint64_t) memorystatus_get_available_page_count();
 
-	total_pages = (unsigned int) atop_64(max_mem);
+	total_pages = (unsigned int) atop_64(sane_size); /* hakios: not max_mem, which counts the RAM-disk system image (see kern_memorystatus.c) */
 #if CONFIG_SECLUDED_MEMORY
 	total_pages -= vm_page_secluded_count;
 #endif /* CONFIG_SECLUDED_MEMORY */

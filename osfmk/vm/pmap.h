@@ -777,7 +777,7 @@ extern const pmap_t     kernel_pmap;            /* The kernel's map */
 #else
 
 #define PMAP_CREATE_STAGE2         0
-#if __arm64e__
+#if __arm64e__ || HAKIOS_USER_PAC
 #define PMAP_CREATE_DISABLE_JOP    0x4
 #else
 #define PMAP_CREATE_DISABLE_JOP    0

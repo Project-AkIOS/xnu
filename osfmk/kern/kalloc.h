@@ -920,9 +920,14 @@ __options_decl(kt_granule_t, uint32_t, {
  * @param ptr           the pointer whose type needs to be checked.
  * @param type          the type which the pointer will be checked against.
  */
+#if XNU_NO_TYPE_BUILTINS
+#define KALLOC_TYPE_IS_COMPATIBLE_PTR(ptr, type)  (1)
+#else
 #define KALLOC_TYPE_IS_COMPATIBLE_PTR(ptr, type)                         \
 	(__builtin_xnu_types_compatible(os_get_pointee_type(ptr), type) ||   \
 	    __builtin_xnu_types_compatible(os_get_pointee_type(ptr), void))  \
+
+#endif /* XNU_NO_TYPE_BUILTINS */
 
 #define KALLOC_TYPE_ASSERT_COMPATIBLE_POINTER(ptr, type) \
 	_Static_assert(KALLOC_TYPE_IS_COMPATIBLE_PTR(ptr, type), \

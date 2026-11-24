@@ -160,6 +160,7 @@ extern void mbuf_tag_init(void);
 #include <security/mac_mach_internal.h>
 #if CONFIG_VNGUARD
 extern void vnguard_policy_init(void);
+extern void minimac_policy_init(void);
 #endif
 #endif
 
@@ -219,9 +220,41 @@ TUNABLE(startup_debug_t, startup_debug, "startup_debug", 0);
 /* Indicates a server boot when set */
 TUNABLE(int, serverperfmode, "serverperfmode", 0);
 
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+/*
+ * HakiOS bring-up: every step of the kernel's start is said in the log the loader gets back, and step k is
+ * loader checkpoint 100+k (mkpayload.py --checkpoint N stops there and returns with the log).
+ */
+extern void loader_log_putc(char c);
+extern void loader_checkpoint(uint64_t n);
+static uint64_t hakios_boot_step = 100;
+void hakios_boot_step_log(const char *prefix, const char *message);
+void
+hakios_boot_step_log(const char *prefix, const char *message)
+{
+	uint64_t n = ++hakios_boot_step;
+	char num[4] = { (char)('0' + n / 100 % 10), (char)('0' + n / 10 % 10), (char)('0' + n % 10), ' ' };
+	for (int i = 0; i < 4; i++) {
+		loader_log_putc(num[i]);
+	}
+	for (const char *c = prefix; *c; c++) {
+		loader_log_putc(*c);
+	}
+	for (const char *c = message; *c; c++) {
+		loader_log_putc(*c);
+	}
+	loader_log_putc('\n');
+	loader_checkpoint(n);
+}
+#define HAKIOS_BOOT_STEP(p, m) hakios_boot_step_log(p, m)
+#else
+#define HAKIOS_BOOT_STEP(p, m) do { } while (0)
+#endif
+
 static inline void
 kernel_bootstrap_log(const char *message)
 {
+	HAKIOS_BOOT_STEP("kernel_bootstrap: ", message);
 	if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
 	    startup_phase >= STARTUP_SUB_KPRINTF) {
 		kprintf("kernel_bootstrap: %s\n", message);
@@ -232,6 +265,7 @@ kernel_bootstrap_log(const char *message)
 static inline void
 kernel_bootstrap_thread_log(const char *message)
 {
+	HAKIOS_BOOT_STEP("kernel_bootstrap_thread: ", message);
 	if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
 	    startup_phase >= STARTUP_SUB_KPRINTF) {
 		kprintf("kernel_bootstrap_thread: %s\n", message);
@@ -816,6 +850,12 @@ kernel_bootstrap_thread(void)
 #endif
 	(void) spllo();         /* Allow interruptions */
 
+#if HAKIOS_USER_PAC
+	/* HakiOS PATH 2 step 2: self-test of the user-PAC signing primitives (no-op unless hakios_pac != 0) */
+	extern void hakios_pac_selftest(void);
+	hakios_pac_selftest();
+#endif
+
 	/*
 	 * This will start displaying progress to the user, start as early as possible
 	 */
@@ -834,6 +874,9 @@ kernel_bootstrap_thread(void)
 	kernel_bootstrap_log("vnguard_policy_init");
 	vnguard_policy_init();
 #endif
+	/* stand-ins for the AMFI and Sandbox policies (bsd/kern/kern_minimac.c) */
+	kernel_bootstrap_log("minimac_policy_init");
+	minimac_policy_init();
 #endif
 
 #if CONFIG_DTRACE
@@ -861,6 +904,7 @@ kernel_bootstrap_thread(void)
 	csm_initialize_provisioning_profiles();
 #endif
 
+#if !defined(ARM64_BOARD_CONFIG_BCM2837) /* HakiOS: as 8796's own #ifndef BCM2837 -- no Image4 interface here (AMFI is ours) */
 	kernel_bootstrap_log("trust_cache_init");
 
 	/* Initialize the runtime for the trust cache interface */
@@ -868,6 +912,7 @@ kernel_bootstrap_thread(void)
 
 	/* Load the static and engineering trust caches */
 	load_static_trust_cache();
+#endif
 
 	kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN);
 
@@ -909,6 +954,9 @@ kernel_bootstrap_thread(void)
 	 * at the latest
 	 */
 	vm_set_restrictions(machine_info.max_cpus);
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	loader_checkpoint(70);  /* HakiOS bring-up */
+#endif
 
 
 #if KPERF
@@ -918,6 +966,9 @@ kernel_bootstrap_thread(void)
 	/*
 	 *	Start the user bootstrap.
 	 */
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	loader_checkpoint(71);  /* HakiOS bring-up */
+#endif
 #ifdef  MACH_BSD
 	bsd_init();
 #endif

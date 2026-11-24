@@ -699,6 +699,18 @@ static const struct {
 };
 
 /*
+ * (redwood) What kind of work the thread's work interval is for: one of WORK_INTERVAL_TYPE_*,
+ * or WORK_INTERVAL_TYPE_LAST for a thread that has joined none.
+ */
+uint32_t
+kern_work_interval_type_of_thread(thread_t thread)
+{
+	const struct work_interval *work_interval = thread->th_work_interval;
+
+	return work_interval ? work_interval->wi_create_flags & WORK_INTERVAL_TYPE_MASK : WORK_INTERVAL_TYPE_LAST;
+}
+
+/*
  * Called when a thread gets its scheduling priority from its associated work
  * interval.
  */

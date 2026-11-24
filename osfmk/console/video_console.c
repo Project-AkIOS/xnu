@@ -2860,8 +2860,12 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
 			gc_acquired = TRUE;
 		} else {
 			if (makeMapping) {
-#if HAS_UCNORMAL_MEM || APPLEVIRTUALPLATFORM
+#if HAS_UCNORMAL_MEM || APPLEVIRTUALPLATFORM || defined(BCM2837)
 				/*
+				 * (Generic ARM boards too: scrolling reads the framebuffer
+				 * back, and as device memory that is one bus access per
+				 * word - seconds per line on a phone-sized screen.)
+				 *
 				 * Framebuffers would normally use VM_WIMG_RT, which
 				 * io_map doesn't support.  However this buffer is set up
 				 * by the bootloader and doesn't require D$ cleaning, so

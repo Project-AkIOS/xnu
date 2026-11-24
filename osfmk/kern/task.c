@@ -1228,7 +1228,7 @@ task_init(void)
 
 	ipc_task_enable(kernel_task);
 
-#if defined(HAS_APPLE_PAC)
+#if defined(HAS_APPLE_PAC) || HAKIOS_USER_PAC
 	kernel_task->rop_pid = ml_default_rop_pid();
 	kernel_task->jop_pid = ml_default_jop_pid();
 	// kernel_task never runs at EL0, but machine_thread_state_convert_from/to_user() relies on
@@ -1405,6 +1405,17 @@ task_create_internal(
 
 #if defined(HAS_APPLE_PAC)
 	const uint8_t disable_user_jop = inherit_memory ? parent_task->disable_user_jop : FALSE;
+	ml_task_set_rop_pid(new_task, parent_task, inherit_memory);
+	ml_task_set_jop_pid(new_task, parent_task, inherit_memory, disable_user_jop);
+	ml_task_set_disable_user_jop(new_task, disable_user_jop);
+#elif HAKIOS_USER_PAC
+	/*
+	 * HakiOS PATH 2: as above, except that a task that does not inherit starts PAC-OFF
+	 * (disable_user_jop TRUE) and stays so until exec decides otherwise (exec_mach_imgact ->
+	 * IMGPF_NOJOP -> ml_task_set_disable_user_jop). A fork child (inherit_memory) keeps its
+	 * parent's ids and mode: its memory holds pointers signed with them.
+	 */
+	const uint8_t disable_user_jop = inherit_memory ? parent_task->disable_user_jop : TRUE;
 	ml_task_set_rop_pid(new_task, parent_task, inherit_memory);
 	ml_task_set_jop_pid(new_task, parent_task, inherit_memory, disable_user_jop);
 	ml_task_set_disable_user_jop(new_task, disable_user_jop);
@@ -4456,7 +4467,9 @@ task_pidsuspend(
 
 	if ((KERN_SUCCESS == kr) && task->message_app_suspended) {
 		iokit_task_app_suspended_changed(task);
+#if CONFIG_DEFERRED_RECLAIM /* HakiOS: declared only with deferred reclaim, which our config leaves out */
 		vm_deferred_reclamation_task_suspend(task);
+#endif
 	}
 
 	return kr;

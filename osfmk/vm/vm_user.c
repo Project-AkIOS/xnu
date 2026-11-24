@@ -815,6 +815,86 @@ vm_reallocate(
 }
 
 /*
+ * HakiOS (11-21): shm_probe=1 -- is the LaunchServices database the same on both sides? iOS 27's SpringBoard reads the
+ * database's header (schema) but finds no app records although lsd registered them. lsd hands the store over as
+ * shared memory (mach_make_memory_entry_64 -> xpc -> mach_vm_map) or the client maps the .csstore file (mmap): for
+ * lsd and SpringBoard each such region of 64 KB or more is read back through the caller's own map and logged with
+ * an FNV-1a hash, the first 16 KB's hash and the count of all-zero 16 KB pages. Equal hashes: the kernel hands
+ * the bytes over intact.
+ */
+#include <pexpert/pexpert.h>
+extern char *proc_name_address(void *p);
+extern void *get_bsdtask_info(task_t);
+
+int
+hakios_shm_probe_enabled(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		uint32_t v = 0;
+
+		on = PE_parse_boot_argn("shm_probe", &v, sizeof(v)) && v != 0;
+	}
+	return on;
+}
+
+void
+hakios_shm_probe(const char *what, const char *path, vm_map_t map, uint64_t addr, uint64_t size, uint64_t off, int prot)
+{
+	void *bsd;
+	const char *name;
+	uint8_t *buf;
+	uint64_t hash = 0xcbf29ce484222325ULL, first = 0, n, at;
+	uint32_t pages = 0, zero = 0, bad = 0;
+
+	if (!hakios_shm_probe_enabled() || size < 16384) {
+		return;
+	}
+	bsd = get_bsdtask_info(current_task());
+	name = bsd ? proc_name_address(bsd) : "?";
+	/*
+	 * (11-22) coreservicesd's file-ID "universe" is read by every client through a shared mapping too: those two from
+	 * 16 KB on. lsd and SpringBoard stay at 64 KB, as on 11-21 -- their smaller regions include device-backed ones
+	 * (surfaces), and reading one through copyin took the kernel down early in the boot (ios29, ios30).
+	 */
+	if (strcmp(name, "coreservicesd") != 0 && strcmp(name, "pathcheck") != 0 &&
+	    ((strcmp(name, "lsd") != 0 && strcmp(name, "SpringBoard") != 0) || size < 65536)) {
+		return;
+	}
+	if (map != current_map()) {
+		printf("shm_probe: %s %s addr %llx size %llx off %llx prot %x (another map: not read)%s%s\n", what, name,
+		    addr, size, off, prot, path ? " " : "", path ? path : "");
+		return;
+	}
+	buf = kalloc_data(16384, Z_WAITOK);
+	if (buf == NULL) {
+		return;
+	}
+	n = size > (64ULL << 20) ? (64ULL << 20) : size;
+	for (at = 0; at < n; at += 16384, pages++) {
+		uint64_t len = n - at < 16384 ? n - at : 16384, i;
+		bool all_zero = true;
+
+		if (copyin((user_addr_t)(addr + at), buf, (vm_size_t)len) != 0) {
+			bad++;
+			continue;
+		}
+		for (i = 0; i < len; i++) {
+			hash = (hash ^ buf[i]) * 0x100000001b3ULL;
+			all_zero &= buf[i] == 0;
+		}
+		zero += all_zero;
+		if (at == 0) {
+			first = hash;
+		}
+	}
+	kfree_data(buf, 16384);
+	printf("shm_probe: %s %s addr %llx size %llx off %llx prot %x: hash %016llx first16k %016llx, %u of %u pages zero, %u unreadable%s%s\n",
+	    what, name, addr, size, off, prot, hash, first, zero, pages, bad, path ? " " : "", path ? path : "");
+}
+
+/*
  * mach_vm_map -
  * Map some range of an object into an address space.
  *
@@ -848,10 +928,16 @@ mach_vm_map_external(
 
 	vm_map_kernel_flags_set_vmflags(&vmk_flags, flags);
 	/* range_id is set by mach_vm_map_kernel */
-	return mach_vm_map_kernel(target_map, address, initial_size, mask,
+	kern_return_t kr = mach_vm_map_kernel(target_map, address, initial_size, mask,
 	           vmk_flags, port, offset, copy,
 	           cur_protection, max_protection,
 	           inheritance);
+	if (kr == KERN_SUCCESS && hakios_shm_probe_enabled() && IP_VALID(port)) {
+		hakios_shm_probe(copy ? "vm_map(copy)" : "vm_map", NULL, target_map,
+		    VM_SANITIZE_UNSAFE_UNWRAP(*address), VM_SANITIZE_UNSAFE_UNWRAP(initial_size),
+		    VM_SANITIZE_UNSAFE_UNWRAP(offset), VM_SANITIZE_UNSAFE_UNWRAP(cur_protection));
+	}
+	return kr;
 }
 
 /* legacy interface */
@@ -1972,7 +2058,9 @@ mach_vm_deferred_reclamation_buffer_allocate(
 #else
 	(void) task;
 	(void) address;
-	(void) size;
+	(void) next_deadline;   /* HakiOS: was (void) size, which no longer exists (build without CONFIG_DEFERRED_RECLAIM) */
+	(void) initial_capacity;
+	(void) max_capacity;
 	return KERN_NOT_SUPPORTED;
 #endif /* CONFIG_DEFERRED_RECLAIM */
 }
@@ -2033,7 +2121,9 @@ mach_vm_deferred_reclamation_buffer_resize(task_t task,
 	return err;
 #else
 	(void) task;
-	(void) size;
+	(void) new_len;         /* HakiOS: was (void) size, which no longer exists (build without CONFIG_DEFERRED_RECLAIM) */
+	(void) bytes_reclaimed_out;
+	(void) next_deadline_out;
 	return KERN_NOT_SUPPORTED;
 #endif /* CONFIG_DEFERRED_RECLAIM */
 }

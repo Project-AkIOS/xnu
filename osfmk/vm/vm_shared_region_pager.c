@@ -317,9 +317,9 @@ typedef struct shared_region_pager {
 	vm_object_t             srp_backing_object; /* VM object for shared cache */
 	vm_object_offset_t      srp_backing_offset;
 	vm_shared_region_slide_info_t srp_slide_info;
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 	uint64_t                srp_jop_key;        /* zero if used for arm64 */
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
 } *shared_region_pager_t;
 #define SHARED_REGION_PAGER_NULL        ((shared_region_pager_t) NULL)
 
@@ -735,11 +735,11 @@ retry_src_fault:
 			    dst_vaddr + offset_in_page,
 			    (mach_vm_offset_t) (offset_in_sliding_range + slide_start_address),
 			    (uint32_t) (offset_in_sliding_range / slide_info_page_size),
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 			    pager->srp_slide_info->si_ptrauth ? pager->srp_jop_key : 0
-#else /* __has_feature(ptrauth_calls) */
+#else /* VM_SR_AUTH_SECTIONS */
 			    0
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
 			    );
 			if (shared_region_pager_data_request_debug) {
 				printf("shared_region_data_request"
@@ -966,7 +966,7 @@ shared_region_pager_deallocate_internal(
 		lck_mtx_unlock(&shared_region_pager_lock);
 
 		vm_shared_region_slide_info_t si = pager->srp_slide_info;
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 		/*
 		 * The slide_info for auth sections lives in the shared region.
 		 * Just deallocate() on the shared region and clear the field.
@@ -979,7 +979,7 @@ shared_region_pager_deallocate_internal(
 				si = NULL;
 			}
 		}
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
 		if (si != NULL) {
 			vm_object_deallocate(si->si_slide_object);
 			/* free the slide_info_entry */
@@ -1153,9 +1153,9 @@ shared_region_pager_create(
 	vm_object_t             backing_object,
 	vm_object_offset_t      backing_offset,
 	struct vm_shared_region_slide_info *slide_info,
-#if !__has_feature(ptrauth_calls)
+#if !VM_SR_AUTH_SECTIONS
 	__unused
-#endif /* !__has_feature(ptrauth_calls) */
+#endif /* !VM_SR_AUTH_SECTIONS */
 	uint64_t                jop_key)
 {
 	shared_region_pager_t   pager;
@@ -1187,7 +1187,7 @@ shared_region_pager_create(
 	pager->srp_backing_object = backing_object;
 	pager->srp_backing_offset = backing_offset;
 	pager->srp_slide_info = slide_info;
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 	pager->srp_jop_key = jop_key;
 	/*
 	 * If we're getting slide_info from the shared_region,
@@ -1197,7 +1197,7 @@ shared_region_pager_create(
 		assert(slide_info->si_ptrauth);
 		vm_shared_region_reference(slide_info->si_shared_region);
 	}
-#endif /* __has_feature(ptrauth_calls) */
+#endif /* VM_SR_AUTH_SECTIONS */
 
 	vm_object_reference(backing_object);
 
@@ -1274,12 +1274,16 @@ shared_region_pager_setup(
 	return (memory_object_t) pager;
 }
 
-#if __has_feature(ptrauth_calls)
+#if VM_SR_AUTH_SECTIONS
 /*
  * shared_region_pager_match()
  *
  * Provide the caller with a memory object backed by the provided
  * "backing_object" VM object.
+ *
+ * HakiOS (VM_SR_AUTH_HAKIOS): "backing_object" is the very object the section's unsigned pager
+ * reads from (si_hk_backing_object), not the file object whose ->copy Apple takes here: the copy
+ * object of a file can be replaced over time, and both pagers must read the same source.
  */
 memory_object_t
 shared_region_pager_match(
@@ -1291,9 +1295,15 @@ shared_region_pager_match(
 	shared_region_pager_t         pager;
 	vm_shared_region_slide_info_t si;
 
+#if VM_SR_AUTH_HAKIOS
+	vm_object_t match_object = backing_object;
+#else /* VM_SR_AUTH_HAKIOS */
+	vm_object_t match_object = backing_object->vo_copy;
+#endif /* VM_SR_AUTH_HAKIOS */
+
 	lck_mtx_lock(&shared_region_pager_lock);
 	queue_iterate(&shared_region_pager_queue, pager, shared_region_pager_t, srp_queue) {
-		if (pager->srp_backing_object != backing_object->vo_copy) {
+		if (pager->srp_backing_object != match_object) {
 			continue;
 		}
 		if (pager->srp_backing_offset != backing_offset) {
@@ -1340,9 +1350,11 @@ shared_region_pager_match(
 	 * waste a little memory.
 	 */
 	lck_mtx_unlock(&shared_region_pager_lock);
-	return shared_region_pager_setup(backing_object->vo_copy, backing_offset, slide_info, jop_key);
+	return shared_region_pager_setup(match_object, backing_offset, slide_info, jop_key);
 }
+#endif /* VM_SR_AUTH_SECTIONS */
 
+#if __has_feature(ptrauth_calls)
 void
 shared_region_pager_match_task_key(memory_object_t memobj, __unused task_t task)
 {
