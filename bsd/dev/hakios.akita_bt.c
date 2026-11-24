@@ -1,0 +1,668 @@
+/*
+ * The Pixel 8a's Bluetooth: the BCM4383 (the Wi-Fi chip's other half) speaks HCI in H4 on a UART of its own --
+ * Android's device tree: odm/btbcm "goog,nitrous" and serial@155D0000 (uart18: the APM block's USI1 as a UART, RTS/CTS;
+ * no pins to set: its pads are its own). So far, with boot-arg bt=1: the chip switched on and asked HCI_Reset,
+ * Broadcom's Read_Chip_Id (0xfc79) and Read_Local_Version_Information.
+ *
+ * How it was found (11-15), because none of it is in a public source for this phone: Android's kernel traced on the
+ * phone itself (events/rwmmio: every register it writes while Bluetooth is switched on) --
+ *   - BT_REG_ON (gpn8) goes through a LATCH: each change is followed by a pulse on gpp24-3 ("bt-ble-dbo-le");
+ *   - the UART's source clock is 200 MHz (UBRDIV 0x6b, UFRACVAL 8 for 115200);
+ *   - USI_OPTION is written 2, UCON 0xf3c5, UFCON 0x111, UMCON 0x30.
+ * The AoC has no part in it (Android's Bluetooth starts with the AoC never booted); gpa3, the tree's "uart18-bus", is
+ * not this UART's (gpa3-0/1 are a bit-banged SPMI bus: never to be touched).
+ *
+ * What Android's HAL does next (its firmware_config.json and its I/O traced): the baud rate up (0xfc18, 4 000 000), the
+ * fast download on (0xfe72), Download_Minidriver (0xfc2e, 50 ms), the .hcd's records sent as they are (each is an HCI
+ * command), Launch_RAM (0xfc4e, 250 ms), HCI_Reset, the low-power mode (0xfc27) and the address (0xfc01). Not here yet.
+ *
+ * Registers: Linux's drivers/tty/serial/exynos_tty.c; the clocks: Google's cal-if zuma cmucal-sfr.c (the gates of
+ * APM_USI1_UART_INT); the pins: pinctrl-gs.c's zuma tables (gpn6/8/9 in GPIO_CUSTOM_ALIVE 0x15060000 at 0xc0 / 0x100 /
+ * 0x120; gpp24 in GPIO_PERIC1 0x10C40000 at 0x60).
+ */
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <kern/thread_call.h>
+#include <libkern/libkern.h>
+#include <mach/mach_time.h>
+#include <mach/mach_types.h>
+#include <pexpert/device_tree.h>
+#include <pexpert/pexpert.h>
+#include <sys/errno.h>
+#include <sys/systm.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+
+#define CMU_APM_PHYS            0x15400000ULL
+#define CMU_MUX_APM_FUNC        0x1000
+#define CMU_MUX_APM_FUNCSRC     0x1004
+#define CMU_DIV_USI1_UART       0x1818          /* ratio in bits 0-6, busy bit 16 */
+#define CMU_GATE_IPCLK          0x20f4
+#define CMU_GATE_PCLK           0x20f8
+#define CMU_GATE_RSTNSYNC       0x2148
+#define CMU_QCH                 0x306c
+#define CMU_GATE_ON             0x00300000
+#define SYSREG_APM_PHYS         0x15420000ULL
+#define SYSREG_USI_MODE         0x4e4           /* syscon@154204E0, samsung,usi-offset 4 */
+#define USI_MODE_UART           0x1
+#define GPIO_ALIVE_PHYS         0x154d0000ULL
+#define GPA3                    0x060           /* read only: NOT the UART (pins 0/1 are a bit-banged SPMI bus) */
+#define GPIO_PERIC1_PHYS        0x10c40000ULL
+#define GPP24                   0x060           /* pin 3: the latch enable of BT_REG_ON ("bt-ble-dbo-le") */
+#define GPIO_CUSTOM_PHYS        0x15060000ULL
+#define GPN6                    0x0c0           /* pin 0: host wake (the chip's, an input) */
+#define GPN8                    0x100           /* pin 0: BT_REG_ON */
+#define GPN9                    0x120           /* pin 0: device wake */
+#define PIN_CON                 0x0
+#define PIN_DAT                 0x4
+#define PIN_PUD                 0x8
+#define UART_PHYS               0x155d0000ULL
+#define ULCON                   0x00
+#define UCON                    0x04
+#define UFCON                   0x08
+#define UMCON                   0x0c
+#define UTRSTAT                 0x10
+#define UERSTAT                 0x14
+#define UFSTAT                  0x18
+#define UMSTAT                  0x1c
+#define UTXH                    0x20
+#define URXH                    0x24
+#define UBRDIV                  0x28
+#define UFRACVAL                0x2c
+#define UINTP                   0x30
+#define UINTM                   0x38
+#define USI_CON                 0xc4
+#define USI_OPTION              0xc8
+#define UTRSTAT_TX_EMPTY        (1u << 2)       /* the shifter too */
+#define UFSTAT_RX_COUNT(v)      ((v) & 0x1ffu)
+#define UFSTAT_TX_FULL          (1u << 24)
+
+static vm_offset_t cmu, sysreg, gpio_alive, gpio_custom, gpio_peric1, uart;
+static uint32_t src_hz;
+
+static uint32_t rd(vm_offset_t a) { return *(volatile uint32_t *)a; }
+static void wr(vm_offset_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+
+static void
+pin_set(vm_offset_t bank, unsigned pin, uint32_t function, int pud, int level)
+{
+	if (level >= 0) {
+		wr(bank + PIN_DAT, (rd(bank + PIN_DAT) & ~(1u << pin)) | ((uint32_t)level << pin));
+	}
+	if (pud >= 0) {
+		wr(bank + PIN_PUD, (rd(bank + PIN_PUD) & ~(0xfu << (4 * pin))) | ((uint32_t)pud << (4 * pin)));
+	}
+	wr(bank + PIN_CON, (rd(bank + PIN_CON) & ~(0xfu << (4 * pin))) | (function << (4 * pin)));
+}
+
+static void
+say_state(const char *when)
+{
+	printf("akita bt: %s: CMU_APM mux %#x/%#x div %#x gates %#x/%#x/%#x qch %#x; USI mode %#x; gpa3 con %#x dat %#x pud %#x; "
+	    "gpn6 %#x/%#x gpn8 %#x/%#x gpn9 %#x/%#x\n", when, rd(cmu + CMU_MUX_APM_FUNC), rd(cmu + CMU_MUX_APM_FUNCSRC),
+	    rd(cmu + CMU_DIV_USI1_UART), rd(cmu + CMU_GATE_IPCLK), rd(cmu + CMU_GATE_PCLK), rd(cmu + CMU_GATE_RSTNSYNC),
+	    rd(cmu + CMU_QCH), rd(sysreg + SYSREG_USI_MODE), rd(gpio_alive + GPA3 + PIN_CON), rd(gpio_alive + GPA3 + PIN_DAT),
+	    rd(gpio_alive + GPA3 + PIN_PUD), rd(gpio_custom + GPN6 + PIN_CON), rd(gpio_custom + GPN6 + PIN_DAT),
+	    rd(gpio_custom + GPN8 + PIN_CON), rd(gpio_custom + GPN8 + PIN_DAT), rd(gpio_custom + GPN9 + PIN_CON),
+	    rd(gpio_custom + GPN9 + PIN_DAT));
+}
+
+static void
+say_uart(const char *when)
+{
+	printf("akita bt: %s: ULCON %#x UCON %#x UFCON %#x UMCON %#x UTRSTAT %#x UERSTAT %#x UFSTAT %#x UMSTAT %#x UBRDIV %#x "
+	    "UFRACVAL %#x UINTM %#x USI_CON %#x USI_OPTION %#x\n", when, rd(uart + ULCON), rd(uart + UCON), rd(uart + UFCON),
+	    rd(uart + UMCON), rd(uart + UTRSTAT), rd(uart + UERSTAT), rd(uart + UFSTAT), rd(uart + UMSTAT), rd(uart + UBRDIV),
+	    rd(uart + UFRACVAL), rd(uart + UINTM), rd(uart + USI_CON), rd(uart + USI_OPTION));
+}
+
+static uint64_t
+now_ns(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+static void
+uart_send(const uint8_t *bytes, unsigned length)
+{
+	uint64_t t0 = now_ns();
+
+	for (unsigned i = 0; i < length; i++) {
+		while (rd(uart + UFSTAT) & UFSTAT_TX_FULL) {
+			if (now_ns() - t0 > NSEC_PER_SEC) {
+				printf("akita bt: send: the FIFO stays full (UFSTAT %#x UMSTAT %#x): CTS not given?\n", rd(uart + UFSTAT),
+				    rd(uart + UMSTAT));
+				return;
+			}
+		}
+		wr(uart + UTXH, bytes[i]);
+	}
+}
+
+/* what comes within MS milliseconds, at most MAX bytes; stops 20 ms after the last byte once something came */
+static unsigned
+uart_receive(uint8_t *out, unsigned max, unsigned ms)
+{
+	uint64_t t0 = now_ns(), last = 0;
+	unsigned n = 0;
+
+	while (n < max && now_ns() - t0 < (uint64_t)ms * NSEC_PER_MSEC) {
+		if (UFSTAT_RX_COUNT(rd(uart + UFSTAT)) != 0) {
+			out[n++] = (uint8_t)rd(uart + URXH);
+			last = now_ns();
+		} else if (n != 0 && now_ns() - last > 20 * NSEC_PER_MSEC) {
+			break;
+		} else {
+			delay_for_interval(1, NSEC_PER_MSEC);
+		}
+	}
+	return n;
+}
+
+static bool
+hci_command(const char *name, const uint8_t *command, unsigned length, unsigned ms)
+{
+	uint8_t answer[64];
+	char text[3 * sizeof(answer) + 1];
+	unsigned n, at = 0;
+
+	uart_send(command, length);
+	n = uart_receive(answer, sizeof(answer), ms);
+	text[0] = 0;
+	for (unsigned i = 0; i < n; i++) {
+		at += (unsigned)snprintf(text + at, sizeof(text) - at, "%02x ", answer[i]);
+	}
+	printf("akita bt: %s: %u bytes back: %s(UERSTAT %#x UFSTAT %#x UMSTAT %#x)\n", name, n, text, rd(uart + UERSTAT),
+	    rd(uart + UFSTAT), rd(uart + UMSTAT));
+	/* an event (04), Command Complete (0e), for this opcode, status 0 */
+	return n >= 7 && answer[0] == 0x04 && answer[1] == 0x0e && answer[4] == command[1] && answer[5] == command[2] &&
+	       answer[6] == 0;
+}
+
+/* Linux's exynos_serial_pm / _resetport / _startup / _set_termios for this port, as its register writes were traced on
+ * this phone (rwmmio events, Android's kernel): the USI into its reset and out, USI_OPTION 2, UMCON 0x20, UFCON 0x111,
+ * UCON 0x3c5 | 0xf000, the divisor for a 200 MHz clock (115200: UBRDIV 0x6b, UFRACVAL 8), UMCON 0x30 (RTS/CTS) */
+static void
+uart_open(uint32_t baud)
+{
+	uint32_t quot;
+
+	wr(cmu + CMU_GATE_PCLK, CMU_GATE_ON);
+	wr(cmu + CMU_GATE_RSTNSYNC, CMU_GATE_ON);
+	wr(cmu + CMU_GATE_IPCLK, CMU_GATE_ON);
+	delay_for_interval(1, NSEC_PER_MSEC);
+	wr(sysreg + SYSREG_USI_MODE, USI_MODE_UART);
+	wr(uart + USI_CON, 1);
+	delay(10);
+	wr(uart + USI_CON, 0);
+	wr(uart + USI_OPTION, 2);
+	wr(uart + UMCON, 0x20);
+	wr(uart + UINTM, 0xf);                          /* polled here: every interrupt masked */
+	wr(uart + UFCON, 0x117);                        /* FIFOs on, both reset */
+	delay_for_interval(1, NSEC_PER_MSEC);
+	wr(uart + UFCON, 0x111);
+	wr(uart + UCON, 0xf3c5);
+	wr(uart + ULCON, 0x3);
+	quot = (src_hz + baud / 2) / baud;
+	wr(uart + UBRDIV, quot / 16 - 1);
+	wr(uart + UFRACVAL, quot % 16);
+	wr(uart + UMCON, 0x30);
+	wr(uart + UINTP, 0xf);
+}
+
+/*
+ * BT_REG_ON reaches the chip through a latch: after each change of gpn8 Android's kernel pulses gpp24-3 (the tree's
+ * "bt-ble-dbo-le": a latch enable -- the chip keeps its power state while the phone is off, for Find My) high and low.
+ * Traced: DAT of GPIO_PERIC1 +0x60 written 0x1, 0x9, 0x1 right after each write of gpn8. Without the pulse the chip
+ * never sees the pin: that was the silence of every run before.
+ */
+static void
+power_pin(int on)
+{
+	pin_set(gpio_custom + GPN8, 0, 1, 0, on);
+	delay(20);
+	pin_set(gpio_peric1 + GPP24, 3, 1, 0, 0);
+	delay(10);
+	pin_set(gpio_peric1 + GPP24, 3, 1, 0, 1);
+	delay(10);
+	pin_set(gpio_peric1 + GPP24, 3, 1, 0, 0);
+}
+
+static void
+uart_baud(uint32_t baud)
+{
+	uint32_t quot = (src_hz + baud / 2) / baud;
+
+	/* (nothing left in the shifter first) */
+	for (int i = 0; i < 100 && !(rd(uart + UTRSTAT) & UTRSTAT_TX_EMPTY); i++) {
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	wr(uart + UBRDIV, quot / 16 - 1);
+	wr(uart + UFRACVAL, quot % 16);
+}
+
+/*
+ * The firmware, as Android's HAL loads it (its firmware_config.json; its writes traced): the rate up to 4 000 000
+ * (0xfc18), the fast download on (0xfe72: the records are not answered one by one, RTS/CTS paces them),
+ * Download_Minidriver (0xfc2e) and 50 ms, then BCM.hcd's records as they are -- each is an HCI command, opcode, length,
+ * data; 3631 Write_RAM (0xfc4c) and at the end Launch_RAM (0xfc4e) --, 250 ms, the UART back at 115200, HCI_Reset.
+ */
+static bool
+firmware_download(void)
+{
+	static const uint8_t rate[] = { 0x01, 0x18, 0xfc, 0x06, 0x00, 0x00, 0x00, 0x09, 0x3d, 0x00 };  /* 0x003d0900 */
+	static const uint8_t fast[] = { 0x01, 0x72, 0xfe, 0x02, 0x00, 0x01 };
+	static const uint8_t minidriver[] = { 0x01, 0x2e, 0xfc, 0x00 };
+	static const uint8_t reset[] = { 0x01, 0x03, 0x0c, 0x00 };
+	static const uint8_t name[] = { 0x01, 0x14, 0x0c, 0x00 };
+	static const uint8_t h4_command = 0x01;
+	uint64_t size = 0, at = 0, t0;
+	const uint8_t *file = hakios_image_file("fw", "BCM.hcd", &size, NULL);
+	uint8_t answer[300];
+	unsigned records = 0, came = 0, n;
+
+	if (file == NULL || size < 16) {
+		printf("akita bt: no fw/BCM.hcd in the image (from /vendor/firmware/brcm of the phone's Android into fw-wifi/)\n");
+		return false;
+	}
+	if (!hci_command("Update_Baudrate (0xfc18) 4000000", rate, sizeof(rate), 500)) {
+		return false;
+	}
+	uart_baud(4000000);
+	delay_for_interval(5, NSEC_PER_MSEC);
+	if (!hci_command("fast download (0xfe72)", fast, sizeof(fast), 500) ||
+	    !hci_command("Download_Minidriver (0xfc2e)", minidriver, sizeof(minidriver), 500)) {
+		return false;
+	}
+	delay_for_interval(50, NSEC_PER_MSEC);
+	t0 = now_ns();
+	while (at + 3 <= size) {
+		uint32_t length = 3u + file[at + 2];
+
+		if (at + length > size) {
+			printf("akita bt: BCM.hcd: record %u at %llu runs past the file's end\n", records, at);
+			return false;
+		}
+		if ((file[at] | file[at + 1] << 8) == 0xfc4e) {
+			printf("akita bt: firmware: %u records, %llu bytes in %llu ms, %u bytes came back meanwhile; Launch_RAM\n", records, at,
+			    (now_ns() - t0) / NSEC_PER_MSEC, came);
+		}
+		uart_send(&h4_command, 1);
+		uart_send(file + at, length);
+		at += length;
+		records++;
+		while (UFSTAT_RX_COUNT(rd(uart + UFSTAT)) != 0) {       /* (whatever it says meanwhile: read and counted) */
+			(void)rd(uart + URXH);
+			came++;
+		}
+	}
+	delay_for_interval(250, NSEC_PER_MSEC);
+	n = uart_receive(answer, sizeof(answer), 20);
+	uart_baud(115200);
+	wr(uart + UFCON, 0x117);
+	delay_for_interval(1, NSEC_PER_MSEC);
+	wr(uart + UFCON, 0x111);
+	printf("akita bt: firmware: launched (%u more bytes came); UERSTAT %#x\n", n, rd(uart + UERSTAT));
+	if (!hci_command("HCI_Reset, the firmware's", reset, sizeof(reset), 1000)) {
+		return false;
+	}
+	/* Read_Local_Name: the firmware says its build ("BCM4383A3 ... FW:... CFG:..."; the ROM alone has another) */
+	uart_send(name, sizeof(name));
+	n = uart_receive(answer, sizeof(answer), 500);
+	if (n > 7) {
+		answer[n < sizeof(answer) ? n : sizeof(answer) - 1] = 0;
+		printf("akita bt: firmware: the controller's name (%u bytes): %s\n", n, (const char *)answer + 7);
+	}
+	return n > 7;
+}
+
+/* ---- the controller's operations for the chip-independent half (drivers/bluetooth/hakios.bthost.c) ---- */
+
+struct hakios_bt_platform {                     /* (hakios.bthost.c's, field for field) */
+	const char      *name;
+	int     (*power_on)(void);
+	int     (*function_on)(void);
+	void    (*function_off)(void);
+	int     (*send)(const uint8_t *h4, unsigned length);
+	int     (*receive)(uint8_t *h4, unsigned room, unsigned wait_ms);
+	void    (*wake)(void);
+	int     (*wifi_address)(uint8_t out[6]);
+	bool    wakes;
+};
+extern void hakios_bthost_start(const struct hakios_bt_platform *platform);
+extern void hakios_bthost_publish(const struct hakios_bt_platform *platform);
+extern void hakios_bthost_wake(void);
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+
+/*
+ * The UART's interrupt (SPI 0x47 of the tree: INTID 103, level): bytes are in the receive FIFO, at its trigger level or
+ * after the receive time-out (UCON bit 7). Taken once the firmware runs; until then, and with bt_irq=0, the FIFO is
+ * read where it is asked for. The handler empties the FIFO into a ring and wakes the bridge; RTS holds the chip back
+ * meanwhile as before.
+ */
+#define UART_INTID              (32 + 0x47)
+#define RX_RING                 65536u
+static uint8_t rx_ring[RX_RING];
+static volatile uint32_t rx_head, rx_tail;      /* written by the handler, by the reader */
+static volatile uint32_t rx_interrupts, rx_lost;
+static bool rx_by_interrupt;
+
+static void
+akita_bt_interrupt(__unused void *context, __unused uint32_t intid)
+{
+	uint32_t pending = rd(uart + UINTP);
+
+	while (UFSTAT_RX_COUNT(rd(uart + UFSTAT)) != 0) {
+		uint8_t byte = (uint8_t)rd(uart + URXH);
+
+		if (rx_head - rx_tail < RX_RING) {
+			rx_ring[rx_head % RX_RING] = byte;
+			rx_head++;
+		} else {
+			rx_lost++;
+		}
+	}
+	wr(uart + UINTP, pending);
+	rx_interrupts++;
+	hakios_bthost_wake();
+}
+
+/* the next byte the controller sent: from the ring, or (polled) from the FIFO; false if none */
+static bool
+rx_byte(uint8_t *byte)
+{
+	if (rx_by_interrupt) {
+		if (rx_tail == rx_head) {
+			return false;
+		}
+		*byte = rx_ring[rx_tail % RX_RING];
+		rx_tail++;
+		return true;
+	}
+	if (UFSTAT_RX_COUNT(rd(uart + UFSTAT)) == 0) {
+		return false;
+	}
+	*byte = (uint8_t)rd(uart + URXH);
+	return true;
+}
+
+static bool want_interrupt = true;               /* bt_irq=0: the UART polled */
+static uint64_t last_traffic_ns;                /* the last byte either way: the polling slows when nothing moves */
+
+/* the chip switched on and answering at 115200 (nitrous_rfkill_set_power and the tty's open, as traced) */
+static int
+akita_bt_power_on(void)
+{
+	static const uint8_t reset[] = { 0x01, 0x03, 0x0c, 0x00 };
+	static const uint8_t chip_id[] = { 0x01, 0x79, 0xfc, 0x00 };
+	uint32_t v;
+	uint8_t junk[32];
+	unsigned n;
+
+	src_hz = 200000000;                             /* (Linux's divisor for 115200 says so; the loop-back measured 196.5) */
+	if (PE_parse_boot_argn("bt_hz", &v, sizeof(v)) && v != 0) {
+		src_hz = v;
+	}
+	say_state("as found");
+	pin_set(gpio_custom + GPN6, 0, 0, 1, -1);               /* host wake: an input, pulled down as Android has it */
+	pin_set(gpio_custom + GPN9, 0, 1, 0, 0);
+	power_pin(0);
+	delay_for_interval(43, NSEC_PER_MSEC);
+	power_pin(1);
+	pin_set(gpio_custom + GPN9, 0, 1, 0, 1);
+	delay_for_interval(26, NSEC_PER_MSEC);
+	uart_open(115200);
+	delay_for_interval(150, NSEC_PER_MSEC);
+	say_uart("before HCI_Reset");
+	printf("akita bt: gpp24 con %#x dat %#x; CTS %s; host-wake %u\n", rd(gpio_peric1 + GPP24 + PIN_CON),
+	    rd(gpio_peric1 + GPP24 + PIN_DAT), (rd(uart + UMSTAT) & 1u) ? "given" : "NOT given", rd(gpio_custom + GPN6 + PIN_DAT) & 1u);
+	n = uart_receive(junk, sizeof(junk), 20);
+	if (n != 0) {
+		printf("akita bt: %u bytes came by themselves after power-on (first %02x)\n", n, junk[0]);
+	}
+	if (!hci_command("HCI_Reset", reset, sizeof(reset), 1000)) {
+		printf("akita bt: no answer to HCI_Reset at 115200 with the clock taken as %u Hz (bt_hz=)\n", src_hz);
+		return EIO;
+	}
+	(void)hci_command("Read_Chip_Id (0xfc79)", chip_id, sizeof(chip_id), 500);
+	return 0;
+}
+
+/* the firmware, then the rate the host talks at (4 000 000, as Android's HAL after its download) */
+static int
+akita_bt_function_on(void)
+{
+	static const uint8_t rate[] = { 0x01, 0x18, 0xfc, 0x06, 0x00, 0x00, 0x00, 0x09, 0x3d, 0x00 };
+
+	if (!firmware_download()) {
+		printf("akita bt: the firmware did NOT load\n");
+		return EIO;
+	}
+	if (!hci_command("Update_Baudrate (0xfc18) 4000000, for the host", rate, sizeof(rate), 500)) {
+		return EIO;
+	}
+	uart_baud(4000000);
+	delay_for_interval(5, NSEC_PER_MSEC);
+	last_traffic_ns = now_ns();
+	if (want_interrupt) {
+		static bool attached;
+
+		if (!attached && gic_v3_spi_attach(UART_INTID, false, akita_bt_interrupt, NULL) != KERN_SUCCESS) {
+			printf("akita bt: the UART's interrupt (intid %u) could not be taken\n", UART_INTID);
+			return EIO;                     /* (the bridge was told it would be woken) */
+		}
+		attached = true;
+		rx_head = rx_tail = 0;
+		rx_by_interrupt = true;
+		wr(uart + UINTP, 0xf);
+		wr(uart + UINTM, 0xe);                  /* the receive interrupt alone */
+	}
+	printf("akita bt: the firmware runs; 4000000 baud; %s\n", rx_by_interrupt ? "the UART's interrupt taken" : "the UART polled");
+	return 0;
+}
+
+static void
+akita_bt_function_off(void)
+{
+	wr(uart + UINTM, 0xf);
+	rx_by_interrupt = false;
+	pin_set(gpio_custom + GPN9, 0, 1, 0, 0);
+	power_pin(0);
+	printf("akita bt: the chip's power off\n");
+}
+
+static int
+akita_bt_send(const uint8_t *h4, unsigned length)
+{
+	uart_send(h4, length);
+	last_traffic_ns = now_ns();
+	return 0;
+}
+
+/* the length of the H4 packet that begins the bytes, 0 while its header is not whole, ~0 for a first byte that is none */
+static unsigned
+h4_length(const uint8_t *b, unsigned have)
+{
+	switch (b[0]) {
+	case 2: case 5:                         /* ACL, ISO: handle (2), length (2; ISO's 14 bits) */
+		return have >= 5 ? 5u + ((b[3] | ((unsigned)b[4] << 8)) & (b[0] == 5 ? 0x3fffu : 0xffffu)) : 0;
+	case 3:                                 /* SCO: handle (2), length (1) */
+		return have >= 4 ? 4u + b[3] : 0;
+	case 4:                                 /* event: code (1), length (1) */
+		return have >= 3 ? 3u + b[2] : 0;
+	default:
+		return ~0u;
+	}
+}
+
+/*
+ * One whole H4 packet from the controller, or 0 after wait_ms. The bytes of a packet not yet whole are kept for the next
+ * call. With the interrupt the bridge asks with wait_ms 0 and sleeps itself; polled (bt_irq=0), with nothing moving
+ * for a second the polling slows to once in 10 ms. Once a minute of traffic the counts are said.
+ */
+static int
+akita_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms)
+{
+	static uint8_t partial[4096];
+	static unsigned have;
+	static uint32_t said;
+	static uint64_t counted_ns;
+	uint64_t t0 = now_ns();
+	uint8_t byte;
+
+	if (rx_by_interrupt && t0 - counted_ns > 60 * NSEC_PER_SEC) {
+		counted_ns = t0;
+		printf("akita bt: %u interrupts so far, %u bytes from the controller, %u lost to a full ring\n", rx_interrupts, rx_head, rx_lost);
+	}
+	for (;;) {
+		while (rx_byte(&byte)) {
+			unsigned want;
+
+			last_traffic_ns = now_ns();
+			if (have == sizeof(partial)) {
+				have = 0;                       /* (a packet longer than any the controller sends: the framing is lost) */
+			}
+			partial[have++] = byte;
+			want = h4_length(partial, have);
+			if (want == ~0u) {
+				if (said++ < 8) {
+					printf("akita bt: receive: %02x is not an H4 packet type: dropped (UERSTAT %#x)\n", byte, rd(uart + UERSTAT));
+				}
+				have = 0;
+			} else if (want != 0 && have == want) {
+				unsigned n = have;
+
+				have = 0;
+				if (n > room) {
+					return -EMSGSIZE;
+				}
+				memcpy(h4, partial, n);
+				return (int)n;
+			}
+		}
+		if (now_ns() - t0 >= (uint64_t)wait_ms * NSEC_PER_MSEC) {
+			if (!rx_by_interrupt && have == 0 && now_ns() - last_traffic_ns > NSEC_PER_SEC) {
+				delay_for_interval(10, NSEC_PER_MSEC);
+			}
+			return 0;
+		}
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+}
+
+/* the loader's /chosen mac-address-wifi0: this phone's own (the Bluetooth address is made of it, one up) */
+static int
+akita_bt_wifi_address(uint8_t out[6])
+{
+	DTEntry chosen;
+	const void *mac = NULL;
+	unsigned int size = 0;
+
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+	    SecureDTGetProperty(chosen, "mac-address-wifi0", &mac, &size) != kSuccess || size != 6) {
+		return ENOENT;
+	}
+	memcpy(out, mac, 6);
+	return 0;
+}
+
+static struct hakios_bt_platform akita_bt_platform = {
+	.name = "zuma / akita / BCM4383",
+	.power_on = akita_bt_power_on,
+	.function_on = akita_bt_function_on,
+	.function_off = akita_bt_function_off,
+	.send = akita_bt_send,
+	.receive = akita_bt_receive,
+	.wifi_address = akita_bt_wifi_address,
+};
+
+/* bt=1: a look -- the chip on, its firmware loaded, its name said. bt=2: the controller given to iOS (hakios.bthost.c) */
+static void
+akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
+{
+	uint32_t mode = 1;
+
+	PE_parse_boot_argn("bt", &mode, sizeof(mode));
+	if (mode >= 2) {
+		uint32_t irq = 1;
+
+		PE_parse_boot_argn("bt_irq", &irq, sizeof(irq));
+		want_interrupt = irq != 0;
+		akita_bt_platform.wakes = want_interrupt;
+		hakios_bthost_start(&akita_bt_platform);
+		return;
+	}
+	if (akita_bt_power_on() == 0) {
+		printf("akita bt: the controller answers\n");
+		printf("akita bt: the firmware %s\n", firmware_download() ? "runs" : "did NOT load");
+	}
+}
+
+/* the registry's "bluetooth" service and its address at once, long before the controller is switched on (30 s): bluetoothd,
+   started for SpringBoard within seconds of it, needs them or exits (hakios_bthost_publish) */
+static void
+akita_bt_publish_thread(__unused void *arg, __unused wait_result_t wr_)
+{
+	hakios_bthost_publish(&akita_bt_platform);
+}
+
+static void
+akita_bt_publish(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(akita_bt_publish_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+static void
+akita_bt_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(akita_bt_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+__startup_func
+static void
+akita_bt_init(void)
+{
+	static thread_call_t start;
+	uint32_t mode = 0;
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("bt", &mode, sizeof(mode)) || mode == 0) {
+		return;
+	}
+	cmu = ml_io_map(CMU_APM_PHYS, 0x4000);
+	sysreg = ml_io_map(SYSREG_APM_PHYS, 0x1000);
+	gpio_alive = ml_io_map(GPIO_ALIVE_PHYS, 0x1000);
+	gpio_custom = ml_io_map(GPIO_CUSTOM_PHYS, 0x1000);
+	gpio_peric1 = ml_io_map(GPIO_PERIC1_PHYS, 0x1000);
+	uart = ml_io_map(UART_PHYS, 0x1000);
+	if (!cmu || !sysreg || !gpio_alive || !gpio_custom || !gpio_peric1 || !uart) {
+		printf("akita bt: could not map its registers\n");
+		return;
+	}
+	start = thread_call_allocate(akita_bt_start, NULL);
+	clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(start, deadline);
+	uint32_t early = 1;
+
+	PE_parse_boot_argn("bt_early", &early, sizeof(early));      /* (bt_early=0: the node only when the bridge starts, as before 11-16) */
+	if (mode >= 2 && early != 0) {
+		static thread_call_t publish;
+
+		publish = thread_call_allocate(akita_bt_publish, NULL);
+		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(publish, deadline);
+	}
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, akita_bt_init);
