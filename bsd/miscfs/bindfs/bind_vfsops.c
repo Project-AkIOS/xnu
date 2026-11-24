@@ -75,10 +75,30 @@
 #include <sys/param.h>
 
 #include <IOKit/IOBSD.h>
+#include <pexpert/pexpert.h>
 
 #include "bindfs.h"
 
 #define BINDFS_ENTITLEMENT "com.apple.private.bindfs-allow"
+
+/*
+ * AkIOS (11-22): reporting the lower volume's UUID (an 11-21 change) makes several "volumes" of one UUID, for every
+ * bind mount keeps an f_fsid of its own and has no persistent object ids. So it is only done with the boot-arg
+ * bindfs_uuid=1; without it bindfs reports no f_uuid, as stock bindfs does. Read once, at the first question.
+ */
+static bool
+bindfs_uuid_passthrough(void)
+{
+	static int state = -1;          /* (a race reads the boot-arg twice and stores the same value) */
+
+	if (state < 0) {
+		uint32_t on = 0;
+
+		(void)PE_parse_boot_argn("bindfs_uuid", &on, sizeof(on));
+		state = (on != 0);
+	}
+	return state != 0;
+}
 
 static int
 bindfs_vfs_getlowerattr(mount_t mp, struct vfs_attr * vfap, vfs_context_t ctx)
@@ -94,6 +114,9 @@ bindfs_vfs_getlowerattr(mount_t mp, struct vfs_attr * vfap, vfs_context_t ctx)
 	VFSATTR_WANTED(vfap, f_files);
 	VFSATTR_WANTED(vfap, f_ffree);
 	VFSATTR_WANTED(vfap, f_capabilities);
+	if (bindfs_uuid_passthrough()) {
+		VFSATTR_WANTED(vfap, f_uuid);   /* (AkIOS 11-21: a bound directory is on its volume: the same UUID) */
+	}
 
 	return vfs_getattr(mp, vfap, ctx);
 }
@@ -136,8 +159,12 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
 		return ENOTSUP;
 	}
 
-	/* check entitlement */
-	if (!IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT)) {
+	/*
+	 * check entitlement -- hakios: or process 1, the port's own init, unsigned, which binds
+	 * its choice of launchd jobs and the like onto the read-only Darwin root volume before it
+	 * hands over to launchd (userland/src/init.c, root_apfs=)
+	 */
+	if (!IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT) && proc_getpid(current_proc()) != 1) {
 		return EPERM;
 	}
 
@@ -482,6 +509,15 @@ bindfs_vfs_getattr(struct mount * mp, struct vfs_attr * vfap, vfs_context_t ctx)
 		memcpy(&vfap->f_capabilities, &capabilities, sizeof(vol_capabilities_attr_t));
 
 		VFSATTR_SET_SUPPORTED(vfap, f_capabilities);
+	}
+
+	/*
+	 * AkIOS (11-21): iOS 27's LaunchServices asks every volume for its UUID (gal_probe: lsd volume on bindfs).
+	 * AkIOS (11-22): only with bindfs_uuid=1 (see bindfs_uuid_passthrough).
+	 */
+	if (bindfs_uuid_passthrough() && VFSATTR_IS_ACTIVE(vfap, f_uuid) && VFSATTR_IS_SUPPORTED(&vfa, f_uuid)) {
+		memcpy(vfap->f_uuid, vfa.f_uuid, sizeof(vfap->f_uuid));
+		VFSATTR_SET_SUPPORTED(vfap, f_uuid);
 	}
 
 	if (VFSATTR_IS_ACTIVE(vfap, f_attributes)) {

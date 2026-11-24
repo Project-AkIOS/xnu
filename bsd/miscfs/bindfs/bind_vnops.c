@@ -408,11 +408,23 @@ bindfs_readlink(struct vnop_readlink_args * ap)
 	return error;
 }
 
+/*
+ * AkIOS (11-22): the bound directory's own answer (it was EINVAL for every name): coreservicesd asks every mount's
+ * root for _PC_NAME_MAX and _PC_FILESIZEBITS while it builds its volume table.
+ */
 static int
-bindfs_pathconf(__unused struct vnop_pathconf_args * args)
+bindfs_pathconf(struct vnop_pathconf_args * args)
 {
+	struct vnode * lvp = BINDVPTOLOWERVP(args->a_vp);
+	int error;
+
 	BINDFSDEBUG("%s %p\n", __FUNCTION__, args->a_vp);
-	return EINVAL;
+	if (lvp == NULLVP || vnode_getwithref(lvp) != 0) {
+		return EINVAL;
+	}
+	error = VNOP_PATHCONF(lvp, args->a_name, args->a_retval, args->a_context);
+	vnode_put(lvp);
+	return error;
 }
 
 static int

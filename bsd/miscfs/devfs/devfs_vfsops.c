@@ -113,7 +113,13 @@ devfs_init(__unused struct vfsconf *vfsp)
 		return ENOTSUP;
 	}
 	devfs_make_node(makedev(0, 0), DEVFS_CHAR,
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	    /* HakiOS: 0666 from the start -- 12377 no longer lets init chmod it (devfs_is_vnode_protected), and the
+	     * daemons that do not run as root open it as their standard error (launchd: "Unable to open stderr path") */
+	    UID_ROOT, GID_WHEEL, 0666, "console");
+#else
 	    UID_ROOT, GID_WHEEL, 0622, "console");
+#endif
 	devfs_make_node(makedev(2, 0), DEVFS_CHAR,
 	    UID_ROOT, GID_WHEEL, 0666, "tty");
 #if CONFIG_DEV_KMEM
