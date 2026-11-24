@@ -647,6 +647,51 @@ start_cpu:
 1:
 .endmacro
 
+/*
+ * AKIOS_PSTORE_MARK "text"
+ *   Bring-up aid (osfmk/arm64/akios_pstore.c): the text into the phone's pstore zone, the Linux persistent RAM
+ *   zone at 0xFD5FF000 (header: "DBGC", start, size; then a ring of 0x200000 - 12 bytes), if one is there. MMU off
+ *   only (a data access is then a device access to the physical address). Clobbers x9-x14.
+ */
+.macro AKIOS_PSTORE_MARK
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+	movz	x9, #0xFD5F, lsl #16
+	movk	x9, #0xF000
+	ldr		w10, [x9]
+	movz	w11, #0x4244
+	movk	w11, #0x4347, lsl #16
+	cmp		w10, w11
+	b.ne	3f
+	ldr		w10, [x9, #4]						// start
+	ldr		w11, [x9, #8]						// size
+	movz	w12, #0x1F, lsl #16
+	movk	w12, #0xFFF4						// the ring's bytes
+	cmp		w10, w12
+	b.hs	3f
+	adr		x14, 2f
+1:
+	ldrb	w13, [x14], #1
+	cbz		w13, 4f
+	add		x9, x9, #12
+	strb	w13, [x9, w10, uxtw]
+	sub		x9, x9, #12
+	add		w10, w10, #1
+	cmp		w10, w12
+	csel	w10, wzr, w10, hs
+	cmp		w11, w12
+	cinc	w11, w11, lo
+	b		1b
+2:
+	.asciz	$0
+	.align	2
+4:
+	str		w10, [x9, #4]
+	str		w11, [x9, #8]
+	dsb		sy
+3:
+#endif
+.endmacro
+
 	.align 2
 	.globl EXT(start_first_cpu)
 LEXT(start_first_cpu)
@@ -655,6 +700,7 @@ LEXT(start_first_cpu)
 
 	mov		x20, x0
 	mov		x21, #0
+	AKIOS_PSTORE_MARK "\n[xnu] start_first_cpu\n"
 	LOADER_CHECKPOINT 1
 
 	// Set low reset vector before attempting anything that might trap
@@ -939,6 +985,9 @@ common_start:
 	cbnz	x21, 1f								// boot CPU cold start only
 	LOADER_CHECKPOINT 4
 1:
+	cbnz	x21, 5f								// boot CPU cold start only
+	AKIOS_PSTORE_MARK "[xnu] page tables built, MMU on next\n"
+5:
 	// Enable caches, MMU, ROP and JOP
 	MOV64   x0, SCTLR_EL1_DEFAULT
 	MSR_SCTLR_EL1_X0
