@@ -20,7 +20,6 @@
 #include <sys/vnode_internal.h>
 #include <sys/fcntl.h>
 #include <sys/hakios.input.h>
-#include <sys/hakios.virtio_blk.h>
 #include <sys/proc.h>
 #include <kern/thread.h>
 #include <libkern/OSAtomic.h>
@@ -1202,7 +1201,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	(void)PE_parse_boot_argn("apfs_meta_cluster", &am->am_nx.meta_cluster,
 	    sizeof(am->am_nx.meta_cluster));
 	/*
-	 * The phone's flash and QEMU's virtio disk cost tens of microseconds a request; this
+	 * The phone's flash costs tens of microseconds a request; this
 	 * port's other disks (md, the resident image; rsp, part of an image) answer with a
 	 * memory copy.  Boot-arg apfs_cheap=0/1 says otherwise.
 	 */
@@ -1210,7 +1209,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 		dev_t rdev = vnode_specrdev(devvp);
 		uint32_t cheap;
 
-		am->am_nx.cheap_requests = !hakios_ufs_dev(rdev) && !hakios_virtio_blk_dev(rdev);
+		am->am_nx.cheap_requests = !hakios_ufs_dev(rdev);
 		if (PE_parse_boot_argn("apfs_cheap", &cheap, sizeof(cheap))) {
 			am->am_nx.cheap_requests = (cheap != 0);
 		}

@@ -3,9 +3,8 @@
  *
  * What is written goes two ways:
  *
- *   to a sink   a driver that plays it: the virtio sound device under QEMU
- *               (hakios.virtio_sound.c). On the phone there is none yet (hakios.speaker.c
- *               is where it begins).
+ *   to a sink   a driver that plays it: on the Pixel 8a, the always-on processor's audio
+ *               path (hakios.akita_aoc.c).
  *
  *   into a recording, with boot-arg rec_sound=N: the first N seconds of sound are also kept
  *               in one piece of memory that is left in place when the kernel returns to the
@@ -357,7 +356,6 @@ hakios_audio_init(void)
 	}
 	report_call = thread_call_allocate(audio_report, NULL);
 	audio_recording_init();
-	hakios_virtio_sound_init();
 	hakios_speaker_init();
 	hakios_haptic_init();
 	hakios_torch_init();

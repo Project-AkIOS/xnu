@@ -20,7 +20,6 @@
 #include <sys/hakios.audio.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.net.h>
-#include <sys/hakios.virtio_blk.h>
 
 /* the ends of a run (loader_return.c, the guards), which have no header of their own */
 void hakios_adsp_stop(void);
@@ -32,10 +31,6 @@ void hakios_ufs_quiesce(void);
 void hakios_var_save_on_return(void);
 void hakios_mic_quiesce(void);
 void HakiosWLANStart(const char *interface, const uint8_t *address);
-
-#ifndef HAKIOS_VIRTIO_INPUT
-void hakios_virtio_input_init(void) {}
-#endif
 
 #ifndef HAKIOS_GOODIX
 void hakios_goodix_init(void) {}
@@ -51,11 +46,6 @@ void hakios_ufs_report(__unused const char *when) {}
 bool hakios_ufs_dev(__unused dev_t dev) { return false; }
 void hakios_ufs_quiesce(void) {}
 void hakios_var_save_on_return(void) {}         /* no flash, so no data volume to save into it */
-#endif
-
-#ifndef HAKIOS_VIRTIO_BLK
-void hakios_virtio_blk_init(void) {}
-bool hakios_virtio_blk_dev(__unused dev_t dev) { return false; }
 #endif
 
 #ifndef HAKIOS_BATTERY
@@ -149,14 +139,6 @@ void hakios_adsp_quiesce(void) {}
 void hakios_mpss_init(void) {}
 void hakios_mpss_stop(void) {}
 void hakios_mpss_quiesce(void) {}
-#endif
-
-#ifndef HAKIOS_VIRTIO_NET
-void hakios_virtio_net_init(void) {}
-#endif
-
-#ifndef HAKIOS_VIRTIO_SOUND
-void hakios_virtio_sound_init(void) {}
 #endif
 
 #ifndef HAKIOS_SPEAKER

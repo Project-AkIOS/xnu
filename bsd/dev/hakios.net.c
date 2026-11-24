@@ -9,8 +9,8 @@
  * IOKit object behind it is another matter: see userland/src/net_test.m.
  *
  * What carries the frames is a link driver's business; sys/hakios.net.h is all that the two
- * know of each other. The first link is QEMU's virtio network device (hakios.virtio_net.c).
- * There can be two interfaces: en0 for the Wi-Fi (or virtio), en1 for the modem's packets
+ * know of each other.
+ * There can be two interfaces: en0 for the Wi-Fi, en1 for the modem's packets
  * through the IPA (hakios.cell.c); each has its link, its state and its thread.
  */
 #include <kern/clock.h>
@@ -425,6 +425,5 @@ hakios_net_init(void)
 {
 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
-	hakios_virtio_net_init();
 	hakios_akita_wifi_early();             /* the Pixel 8a's radio: en0 from the start (devices/akita) */
 }

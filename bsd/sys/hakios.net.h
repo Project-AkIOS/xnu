@@ -3,9 +3,8 @@
  *
  * The network interface Darwin uses here is made in drivers/net/hakios.net.c with the kernel's own
  * interface KPI: Ethernet as far as the rest of the kernel and user space can tell. What carries
- * the frames is a "link", a driver of its own that knows nothing about interfaces: QEMU's virtio
- * network device today (drivers/net/hakios.virtio_net.c), the phone's radio or frames carried over
- * the boot loader's USB channel tomorrow. This is all the two know of each other.
+ * the frames is a "link", a driver of its own that knows nothing about interfaces: the phone's
+ * radio (hakios.akita_bcm.c) or the modem's packets. This is all the two know of each other.
  *
  * A link driver
  *   - fills in a struct hakios_net_link and calls hakios_net_attach() once, when it is ready
@@ -25,7 +24,7 @@
 #include <sys/kpi_mbuf.h>
 
 #define HAKIOS_NET_FRAME_MAX   1514
-#define HAKIOS_NET_UNITS       2       /* en0: the radio (or virtio); en1: the modem's packets (hakios.cell.c) */
+#define HAKIOS_NET_UNITS       2       /* en0: the radio; en1: the modem's packets (hakios.cell.c) */
 
 struct hakios_net_link {
 	const char *    name;           /* for the log */
@@ -61,7 +60,6 @@ void hakios_net_link_state_unit(unsigned unit, bool up);
 void hakios_net_init(void);            /* the links there are: each looks for its hardware (or its boot-arg) */
 /* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: hakios.apple80211.c */
 errno_t hakios_apple80211_ioctl(u_long command, void *data);
-void hakios_virtio_net_init(void);     /* boot-arg virtio_net=1: QEMU's virtio network device */
 #endif /* KERNEL */
 
 #endif /* _SYS_HAKIOS_NET_H_ */

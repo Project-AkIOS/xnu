@@ -148,7 +148,6 @@
 #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
 #include <sys/hakios.input.h>
 #include <sys/hakios.audio.h>
-#include <sys/hakios.virtio_blk.h>
 #include <sys/hakios.sparse.h>
 #include <sys/hakios.version.h>
 #if APFS
@@ -1042,7 +1041,6 @@ extern void hakios_boot_step_log(const char *prefix, const char *message);
 			hakios_haptics_ready_init(); /* AHSFirmwareReadyNotifier: audiomxd's haptic server waits for it (11-23) */
 		}
 		hakios_audio_init();           /* /dev/hakios-audio */
-		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
 		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
 #if APFS
 		/* mounts and walks /dev/rvblk0 once userland has /private/var up */

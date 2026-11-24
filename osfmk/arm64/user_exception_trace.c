@@ -465,7 +465,7 @@ ustacks_current(void)
 	}
 }
 
-/* The same at once, for whoever asks (a debugging key sequence, see drivers/input/hakios.virtio_input.c). */
+/* The same at once, for whoever asks (usbmux's stacks port, hakios.akita_usbmux.c). */
 void ustacks_now(const char *name);
 
 void
