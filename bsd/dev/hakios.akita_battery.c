@@ -1,0 +1,525 @@
+/*
+ * The Pixel 8a's battery, for Darwin: the fuel gauge and the charger of its MAX77759, read over I2C every five seconds
+ * (fuelgauge=1), and handed to drivers/power/hakios.battery.c (hakios_battery_report), which keeps them for the
+ * kern.hakios.battery_* sysctls and passes them on to HakiosBattery, the IOPMPowerSource the status bar's battery,
+ * the lock screen's "Charging" and Settings > Battery read.
+ *
+ * Read only: nothing here tells the charger anything. What it does is what Google's bootloader and the chip's own
+ * defaults left (seen in iOS: CHG_CNFG_00 mode 5, charger and buck on).
+ *
+ * The bus: zuma's hsi2c@10cb0000 (Linux: i2c-11 under 10cb0000.hsi2c), an Exynos 7 HSI2C in a USI block, also the eUSB
+ * repeater's. U-Boot's driver has set it up before the kernel (cmd/hakios_eusb.c, `eusb repeater`: auto mode, FIFOs on,
+ * the bootloader's timings kept); here only transfers, polled, as U-Boot's drivers/i2c/exynos_hs_i2c.c does them (the
+ * Exynos 7 variant: completion and errors in INT_STATUS). Nothing else in the kernel uses the bus.
+ *
+ * The chips (Android: /sys/class/power_supply/maxfg is 11-0036, main-charger 11-0069), registers little-endian words
+ * for the gauge, bytes for the charger. The scales were read against Android's own values on this phone (2026-11-02):
+ *   gauge 0x36: 0x00 Status (bit 3: no battery), 0x05 RepCap and 0x10 FullCapRep and 0x18 DesignCap in 2 mAh,
+ *               0x06 RepSOC in 1/256 %, 0x08 Temp in 1/256 C, 0x09 VCell in 78.125 uV, 0x0a Current in 312.5 uA
+ *               (signed, more than 0 while charging), 0x17 Cycles in 1/100 of a cycle
+ *   TCPC 0x25 (the USB-C port controller, TCPCI): 0x1d CC_STATUS (bit 4 the phone the sink; bits 1:0 / 3:2 CC1 / CC2:
+ *               what the source advertises, 1 default, 2 1.5 A, 3 3.0 A), 0x1e POWER_STATUS: the charger's type and current
+ *   charger 0x69: 0xb4 CHG_INT_OK (bit 6 CHGIN_OK: a source on the USB port), 0xb6 CHG_DETAILS_01 (bits 3:0 CHG_DTLS:
+ *               0 precharge, 1 constant current, 2 constant voltage, 3 top-off, 4 done, others not charging)
+ */
+#include <kern/clock.h>
+#include <kern/startup.h>
+#include <kern/thread.h>
+#include <kern/thread_call.h>
+#include <libkern/libkern.h>
+#include <mach/mach_types.h>
+#include <pexpert/pexpert.h>
+#include <sys/hakios.input.h>
+#include <sys/sysctl.h>
+#include <sys/systm.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+#define HSI2C_PHYS              0x10cb0000UL
+
+/* the HSI2C's registers (U-Boot's struct exynos5_hsi2c) */
+#define CTL                     0x00
+#define FIFO_CTL                0x04
+#define INT_STAT                0x24
+#define FIFO_STAT               0x30
+#define TX_DATA                 0x34
+#define RX_DATA                 0x38
+#define CONF                    0x40
+#define AUTO_CONF               0x44
+#define TIMEOUT                 0x48
+#define TRANS_STATUS            0x50
+#define ADDR                    0x70
+
+#define CTL_FUNC_MODE_I2C       (1u << 0)
+#define CTL_MASTER              (1u << 3)
+#define CTL_RXCHON              (1u << 6)
+#define CTL_TXCHON              (1u << 7)
+#define FIFO_RX_EN              (1u << 0)
+#define FIFO_TX_EN              (1u << 1)
+#define CONF_AUTO_MODE          (1u << 31)
+#define AUTO_READ               (1u << 16)
+#define AUTO_STOP               (1u << 17)
+#define AUTO_RUN                (1u << 31)
+#define TIMEOUT_EN              (1u << 31)
+#define INT_DONE                (1u << 7)
+#define INT_ABORT               (1u << 8)
+#define INT_NO_ACK              (1u << 9)
+#define INT_NO_DEV              (1u << 10)
+#define INT_TIMEOUT             (1u << 11)
+#define INT_ALL                 (INT_DONE | INT_ABORT | INT_NO_ACK | INT_NO_DEV | INT_TIMEOUT)
+#define FIFO_TX_FULL            (1u << 7)
+#define FIFO_RX_EMPTY           (1u << 24)
+#define MASTER_BUSY             (1u << 17)
+#define WAIT_US                 10000
+
+#define GAUGE                   0x36
+#define CHARGER                 0x69
+#define TCPC                    0x25            /* the MAX77759's USB-C port controller (TCPCI) */
+#define TCPC_CC_STATUS          0x1d
+#define TCPC_POWER_STATUS       0x1e
+
+#if defined(HAKIOS_AKITA_USB)
+extern bool akita_usb_host_configured(void);    /* drivers/usb/hakios.akita_usb.c */
+#else
+static bool akita_usb_host_configured(void) { return false; }
+#endif
+
+static vm_offset_t i2c;
+static uint32_t errors;
+
+static inline uint32_t
+rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(i2c + off);
+}
+
+static inline void
+wr(uint32_t off, uint32_t v)
+{
+	*(volatile uint32_t *)(i2c + off) = v;
+}
+
+/* until (register & mask) == want; false after WAIT_US */
+static bool
+wait_for(uint32_t off, uint32_t mask, uint32_t want)
+{
+	for (unsigned i = 0; i < WAIT_US; i++) {
+		if ((rd(off) & mask) == want) {
+			return true;
+		}
+		delay(1);
+	}
+	return false;
+}
+
+/* the end of a transfer: done, or what went wrong (0 for done) */
+static uint32_t
+transfer_end(void)
+{
+	for (unsigned i = 0; i < WAIT_US; i++) {
+		uint32_t s = rd(INT_STAT);
+
+		if (s & INT_ALL) {
+			wr(INT_STAT, s);
+			return s & (INT_ABORT | INT_NO_ACK | INT_NO_DEV | INT_TIMEOUT) ? s : 0;
+		}
+		delay(1);
+	}
+	return ~0u;
+}
+
+/* one transfer to or from the chip at addr: len bytes, a stop after it or not (a repeated start follows) */
+static bool
+transfer(uint8_t addr, bool read, uint8_t *buf, unsigned len, bool stop)
+{
+	uint32_t end;
+	bool ok = true;
+
+	wr(TIMEOUT, rd(TIMEOUT) & ~TIMEOUT_EN);
+	wr(ADDR, (uint32_t)(addr & 0x3ff) << 10);
+	wr(CTL, (read ? CTL_RXCHON : CTL_TXCHON) | CTL_FUNC_MODE_I2C | CTL_MASTER);
+	wr(INT_STAT, INT_ALL);
+	wr(AUTO_CONF, len | AUTO_RUN | (stop ? AUTO_STOP : 0) | (read ? AUTO_READ : 0));
+	for (unsigned i = 0; i < len && ok; i++) {
+		if (read) {
+			ok = wait_for(FIFO_STAT, FIFO_RX_EMPTY, 0);
+			if (ok) {
+				buf[i] = (uint8_t)rd(RX_DATA);
+			}
+		} else {
+			ok = wait_for(FIFO_STAT, FIFO_TX_FULL, 0);
+			if (ok) {
+				wr(TX_DATA, buf[i]);
+			}
+		}
+	}
+	end = transfer_end();
+	if (stop) {
+		wait_for(TRANS_STATUS, MASTER_BUSY, 0);
+	}
+	wr(CTL, CTL_FUNC_MODE_I2C);
+	if (!ok || end) {
+		if (errors++ < 8) {
+			printf("akita battery: I2C %s of %u bytes at %#x failed (%s, INT_STAT %#x)\n", read ? "read" : "write",
+			    len, addr, ok ? "the end" : "the FIFO", end);
+		}
+		return false;
+	}
+	return true;
+}
+
+/* len bytes from register reg of the chip at addr: the register's number written, then a repeated start and the read */
+static bool
+read_regs(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
+{
+	return transfer(addr, false, &reg, 1, false) && transfer(addr, true, buf, len, true);
+}
+
+static bool
+write_reg(uint8_t addr, uint8_t reg, uint8_t value)
+{
+	uint8_t b[2] = { reg, value };
+
+	return transfer(addr, false, b, 2, true);
+}
+
+/*
+ * The charge current's thermal limit (Android's fcc cooling device, from hakios.akita_dvfs.c's controllers): asked for
+ * from any thread, written by this driver's own thread on its next look (the I2C is its). The charger's CHG_CNFG_02
+ * CHGCC (bits 5:0; 0x03 200 mA .. 0x3c 4 A, 66.67 mA a step, Google's max77759_charger.c), its write protection
+ * (CHG_CNFG_06 CHGPROT, bits 3:2) lifted for the write and put back; 0 asks for the charger's own value again (what it
+ * was before the first limit). kern.hakios.charge_limit_ma (0: none).
+ */
+#define CHG_CNFG_02             0xbb
+#define CHG_CNFG_06             0xbf
+static volatile int32_t cc_wanted_ua;           /* 0 none */
+static int32_t cc_applied_ua;                   /* what is in the charger (0: its own) */
+static int cc_own = -1;                         /* CHGCC before the first limit; -1 not read */
+static int charge_limit_ma;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_INT(_kern_hakios, OID_AUTO, charge_limit_ma, CTLFLAG_RD | CTLFLAG_LOCKED, &charge_limit_ma, 0,
+    "the charge current's thermal limit, in mA (0: none)");
+
+void akita_charger_limit_ua(int32_t ua);
+void
+akita_charger_limit_ua(int32_t ua)
+{
+	cc_wanted_ua = ua > 0 ? ua : 0;
+}
+
+static void
+charge_limit_apply(void)
+{
+	int32_t want = cc_wanted_ua;
+	uint8_t cc, prot;
+	int value;
+
+	if (want == cc_applied_ua) {
+		return;
+	}
+	if (!read_regs(CHARGER, CHG_CNFG_02, &cc, 1) || !read_regs(CHARGER, CHG_CNFG_06, &prot, 1)) {
+		return;
+	}
+	if (cc_own < 0) {
+		cc_own = cc & 0x3f;
+	}
+	if (want == 0) {
+		value = cc_own;
+	} else {
+		value = want <= 200000 ? 0x03 : want >= 4000000 ? 0x3c : 0x03 + (want - 200000) / 66670;
+		value = value > cc_own && cc_own >= 0x03 ? cc_own : value;      /* never above the charger's own */
+	}
+	if (!write_reg(CHARGER, CHG_CNFG_06, (uint8_t)(prot | 0x0c)) ||
+	    !write_reg(CHARGER, CHG_CNFG_02, (uint8_t)((cc & 0xc0) | value))) {
+		return;
+	}
+	write_reg(CHARGER, CHG_CNFG_06, (uint8_t)(prot & ~0x0c));
+	cc_applied_ua = want;
+	charge_limit_ma = want / 1000;
+	printf("akita battery: charge current %s (CHGCC 0x%02x, the charger's own 0x%02x)\n", want ? "held down by the "
+	    "heat" : "back to the charger's own", value, cc_own);
+}
+
+/*
+ * charge=0 (a boot argument for power tests on the cable): the charger's mode (CHG_CNFG_00 bits 3:0; Google's
+ * max77759_charger.c: 0 everything off, 5 charger and buck on) to 0 -- the phone then runs from its battery with the
+ * cable in, and the gauge's current is the phone's draw, as off the cable. Said with what it was; the next boot's
+ * bootloader sets its own again.
+ */
+#define CHG_CNFG_00             0xb9
+static void
+charge_off_for_tests(void)
+{
+	uint32_t charge = 1;
+	uint8_t mode = 0, now = 0;
+
+	if (!PE_parse_boot_argn("charge", &charge, sizeof(charge)) || charge != 0) {
+		return;
+	}
+	if (!read_regs(CHARGER, CHG_CNFG_00, &mode, 1)) {
+		printf("akita battery: charge=0: CHG_CNFG_00 not read\n");
+		return;
+	}
+	bool ok = write_reg(CHARGER, CHG_CNFG_00, (uint8_t)(mode & 0xf0));
+	(void)read_regs(CHARGER, CHG_CNFG_00, &now, 1);
+	printf("akita battery: charge=0: the charger and its buck off for this boot (CHG_CNFG_00 %#x -> %#x, %s): the phone "
+	    "runs from the battery with the cable in\n", mode, now, ok ? "written" : "NOT written");
+}
+
+static bool
+gauge_word(uint8_t reg, int32_t *value, bool is_signed)
+{
+	uint8_t b[2];
+
+	if (!read_regs(GAUGE, reg, b, 2)) {
+		return false;
+	}
+	*value = is_signed ? (int32_t)(int16_t)(b[0] | b[1] << 8) : (int32_t)(b[0] | b[1] << 8);
+	return true;
+}
+
+static bool
+battery_read(struct hakios_battery_state *s)
+{
+	int32_t status, rep_cap, soc, temp, vcell, current, full, cycles, design;
+	uint8_t int_ok, details;
+
+	if (!gauge_word(0x00, &status, false) || !gauge_word(0x05, &rep_cap, false) || !gauge_word(0x06, &soc, false) ||
+	    !gauge_word(0x08, &temp, true) || !gauge_word(0x09, &vcell, false) || !gauge_word(0x0a, &current, true) ||
+	    !gauge_word(0x10, &full, false) || !gauge_word(0x17, &cycles, false) || !gauge_word(0x18, &design, false) ||
+	    !read_regs(CHARGER, 0xb4, &int_ok, 1) || !read_regs(CHARGER, 0xb6, &details, 1)) {
+		return false;
+	}
+	bzero(s, sizeof(*s));
+	s->size = sizeof(*s);
+	s->percent_hundredths = (int32_t)(((int64_t)soc * 100 + 128) / 256);
+	s->voltage_uv = (int32_t)(((int64_t)vcell * 78125) / 1000);
+	s->current_ua = (int32_t)(((int64_t)current * 3125) / 10);
+	s->temperature_hundredths = (int32_t)(((int64_t)temp * 100) / 256);
+	s->present = !(status & 0x08);
+	s->external = (int_ok & 0x40) != 0;
+	if (!s->external) {
+		s->status = 2;                                  /* POWER_SUPPLY_STATUS_DISCHARGING */
+	} else {
+		switch (details & 0x0f) {
+		case 0: case 1: case 2: case 3:
+			s->status = 1;                          /* charging */
+			break;
+		case 4:
+			s->status = 4;                          /* full */
+			break;
+		default:
+			s->status = 3;                          /* on a charger, not charging */
+			break;
+		}
+	}
+	s->charge_uah = rep_cap * 2000;
+	s->full_uah = full * 2000;
+	s->design_uah = design * 2000;
+	s->cycles = cycles / 100;
+	/*
+	 * What is on the cable (the TCPC, TCPCI's standard registers): CC_STATUS says, when the phone is the sink (bit 4),
+	 * what the other end advertises on the CC line that is connected -- 1 USB's default current, 2 1.5 A, 3 3.0 A
+	 * (Android's current_max agreed: 3.0 A from a computer's USB-C port, CC_STATUS 0x13). Advertising 1.5 or 3 A makes
+	 * it a USB-C source; else a computer that configured the phone's USB is a computer's port (Android's "SDP"); else
+	 * not known. 5 V either way: nothing here asks for Power Delivery.
+	 */
+	{
+		uint8_t cc = 0, power = 0;
+
+		s->usb_type = 0;                                /* Darwin's "USB, unknown" */
+		if (s->external && read_regs(TCPC, TCPC_CC_STATUS, &cc, 1) && read_regs(TCPC, TCPC_POWER_STATUS, &power, 1) &&
+		    (cc & 0x10)) {
+			unsigned level = (cc & 0x03) ? (cc & 0x03) : ((cc >> 2) & 0x03);
+
+			s->usb_voltage_uv = 5000000;
+			s->usb_current_ua = level == 3 ? 3000000 : level == 2 ? 1500000 : 500000;
+			if (level >= 2) {
+				s->usb_type = 5;                /* USB-C: kIOPSFamilyCodeUSBCTypeC */
+			} else if (akita_usb_host_configured()) {
+				s->usb_type = 1;                /* SDP, a computer's port: kIOPSFamilyCodeUSBHost */
+			}
+		}
+	}
+	return true;
+}
+
+/*
+ * THE eUSB2 REPEATER after a cable comes back (the USB link never did: Windows saw no device after a replug, 11-09). The
+ * repeater (address 0x3e on this bus; U-Boot's `eusb repeater` enables it) starts with its port 1 disabled, and loses
+ * what U-Boot set when the cable -- its VBUS -- goes. Looked at every read (5 s) while on a cable: its GLOBAL_CONFIG's
+ * DISABLE_P1 cleared again, and the USB controller started again (akita_usb_reconnect) so that the host sees a fresh
+ * attach.
+ */
+#define REPEATER                0x3e
+#define RPTR_GLOBAL_CONFIG      0xb2
+#define RPTR_DISABLE_P1         0x40
+extern void akita_usb_reconnect(void);
+
+/*
+ * THE USB DATA SWITCH in the USB-C port controller (the MAX77759's TCPC, vendor registers; Google's tcpci_max77759.c,
+ * enable_data_path_locked): at every attach the chip's BC1.2 charger detection takes D+/D- for itself, and Android
+ * connects them to the USB PHY again afterwards -- USBSW_CTRL (0x93) = 0x09 -- "always, the hardware may not". The
+ * bootloader leaves it connected; after a replug nobody here did, and the host saw no device at all (11-09: the
+ * re-init of the link and the controller alone brings USB back with the cable in, not after a replug).
+ */
+#define TCPC_BC_STATUS1         0x87            /* bits 1:0 the charger type found (0: none yet) */
+#define TCPC_BC_CTRL1           0x8f            /* bit 0 BC1.2 detection on */
+#define TCPC_USBSW_CTRL         0x93
+#define USBSW_CONNECT           0x09
+
+static void
+usb_switch_say(const char *when)
+{
+	uint8_t sw = 0xff, bc = 0xff, st = 0xff;
+
+	(void)read_regs(TCPC, TCPC_USBSW_CTRL, &sw, 1);
+	(void)read_regs(TCPC, TCPC_BC_CTRL1, &bc, 1);
+	(void)read_regs(TCPC, TCPC_BC_STATUS1, &st, 1);
+	printf("akita battery: %s: USB data switch (TCPC 0x93) %#x, BC1.2 control %#x, status %#x\n", when, sw, bc, st);
+}
+
+/* after an attach: the charger detection's end awaited (3 s at most), then D+/D- connected to the USB PHY */
+static void
+usb_switch_connect(void)
+{
+	uint8_t st = 0, sw = 0;
+	unsigned waited = 0;
+
+	usb_switch_say("the cable is back");
+	while (waited < 3000 && read_regs(TCPC, TCPC_BC_STATUS1, &st, 1) && (st & 3) == 0) {
+		delay(100000);
+		waited += 100;
+	}
+	bool ok = write_reg(TCPC, TCPC_USBSW_CTRL, USBSW_CONNECT);
+
+	(void)read_regs(TCPC, TCPC_USBSW_CTRL, &sw, 1);
+	printf("akita battery: charger detection ended after %u ms (type %u); the USB data switch connected (%s, now %#x)\n",
+	    waited, st & 3, ok ? "written" : "NOT written", sw);
+}
+
+static void
+usb_repeater_check(bool external, bool was_external)
+{
+	uint8_t cfg = 0;
+
+	static bool said;
+
+	if (!said) {
+		said = true;
+		usb_switch_say("as the bootloader left it");
+	}
+	if (!external) {
+		if (was_external) {
+			printf("akita battery: the cable went\n");
+			usb_switch_say("the cable went");
+		}
+		return;
+	}
+	if (!was_external) {
+		usb_switch_connect();
+	}
+	if (!read_regs(REPEATER, RPTR_GLOBAL_CONFIG, &cfg, 1)) {
+		return;
+	}
+	if (cfg & RPTR_DISABLE_P1) {
+		bool ok = write_reg(REPEATER, RPTR_GLOBAL_CONFIG, (uint8_t)(cfg & ~RPTR_DISABLE_P1));
+		uint8_t now = 0;
+
+		delay(3000);
+		(void)read_regs(REPEATER, RPTR_GLOBAL_CONFIG, &now, 1);
+		printf("akita battery: the cable is back%s: the eUSB repeater's port was off (GLOBAL_CONFIG %#x), on again (%s, now %#x); "
+		    "USB started again\n", was_external ? "" : " (it had gone)", cfg, ok ? "written" : "NOT written", now);
+		akita_usb_reconnect();
+	} else if (!was_external) {
+		printf("akita battery: the cable is back; the eUSB repeater's port is on (GLOBAL_CONFIG %#x): USB started again\n", cfg);
+		akita_usb_reconnect();
+	}
+}
+
+static void
+akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	struct hakios_battery_state s;
+	uint32_t reads = 0, failed = 0;
+
+	unsigned say = 0;                       /* boot-arg battery_say=N: a line every N reads (N x 5 s), for power tests */
+	bool was_external = true;
+
+	PE_parse_boot_argn("battery_say", &say, sizeof(say));
+	for (unsigned tick = 0;; tick++) {
+		if (battery_read(&s)) {
+			if (reads == 0) {
+				charge_off_for_tests();
+			}
+			reads++;
+			hakios_battery_report(&s);
+			usb_repeater_check(s.external, was_external);
+			was_external = s.external;
+			if (say != 0 && tick % say == 0) {
+				/* (the coulomb counter in uAh -- its drop over minutes, unplugged, is the phone's mean draw -- and the
+				 * gauge's AvgCurrent, 0x0b, 312.5 uA a step as Current) */
+				int32_t avg = 0;
+				(void)gauge_word(0x0b, &avg, true);
+				printf("akita battery say: %d mA (mean %d mA), %d mV, charge %d uAh, %s\n", s.current_ua / 1000,
+				    (int)(((int64_t)avg * 3125) / 10000), s.voltage_uv / 1000, s.charge_uah,
+				    s.external ? "on a charger" : "not on a charger");
+			}
+			if (tick % 60 == 0) {           /* every five minutes, and the first */
+				printf("akita battery: %d.%02d%%, %d mV, %d mA, %d.%d C, %s (CHG_DTLS %d), %d of %d mAh, "
+				    "%d cycles (%u reads, %u failed)\n", s.percent_hundredths / 100, s.percent_hundredths % 100,
+				    s.voltage_uv / 1000, s.current_ua / 1000, s.temperature_hundredths / 100,
+				    (s.temperature_hundredths % 100) / 10, s.external ? (s.status == 1 ? "charging" :
+				    s.status == 4 ? "full" : "on a charger, not charging") : "not on a charger", s.status,
+				    s.charge_uah / 1000, s.full_uah / 1000, s.cycles, reads, failed);
+			}
+		} else {
+			failed++;
+		}
+		charge_limit_apply();
+		delay_for_interval(5000, NSEC_PER_MSEC);
+	}
+}
+
+static void
+akita_battery_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(akita_battery_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		printf("akita battery: no thread\n");
+	}
+}
+
+__startup_func
+static void
+akita_battery_init(void)
+{
+	uint32_t enabled = 0;
+	uint64_t deadline;
+	static thread_call_t start;
+
+	if (!PE_parse_boot_argn("fuelgauge", &enabled, sizeof(enabled)) || !enabled) {
+		return;
+	}
+	i2c = ml_io_map(HSI2C_PHYS, 0x1000);
+	if (!i2c) {
+		printf("akita battery: could not map the I2C controller; off\n");
+		return;
+	}
+	/* as U-Boot left it, normally; else the two things a transfer needs (the timings are the bootloader's either way) */
+	if (!(rd(CONF) & CONF_AUTO_MODE) || (rd(FIFO_CTL) & (FIFO_RX_EN | FIFO_TX_EN)) != (FIFO_RX_EN | FIFO_TX_EN)) {
+		printf("akita battery: the I2C controller not as U-Boot leaves it (CONF %#x FIFO_CTL %#x): auto mode, FIFOs on\n",
+		    rd(CONF), rd(FIFO_CTL));
+		wr(CONF, rd(CONF) | CONF_AUTO_MODE);
+		wr(FIFO_CTL, rd(FIFO_CTL) | FIFO_RX_EN | FIFO_TX_EN);
+	}
+	/* a thread of its own once the kernel is up (IOKit for the power source): started from a thread call, 5 s from now */
+	start = thread_call_allocate(akita_battery_start, NULL);
+	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(start, deadline);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, akita_battery_init);
