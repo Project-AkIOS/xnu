@@ -8,9 +8,10 @@
  * iPhone (the photos, read with a camera's protocol): its endpoints go to /dev/hakios-ptp (hakios.akita_ptp.c), where
  * a program of the user space answers (userland/src/ptp_responder.c).
  *
- * The controller: Google's bootloader drives it for its own fastboot, and U-Boot for its own (xl), so its clocks, the
- * eUSB2 PHY and the repeater are up when the kernel starts (U-Boot's `eusb init`). Here: the controller stopped and
- * soft-reset (whatever U-Boot's gadget left), the event buffer, endpoint 0, run. Registers as Linux's drivers/usb/dwc3
+ * The controller: Google's bootloader drives it for its own fastboot and turns the eUSB2 PHY off before it hands over;
+ * akios_usb_phy_zuma.c brings the PHY's supplies, the repeater, the PMU's isolation and the link up first (what HakiOS's
+ * U-Boot did with `eusb init`). Here: the controller stopped and soft-reset (whatever a loader's gadget left), the
+ * event buffer, endpoint 0, run. Registers as Linux's drivers/usb/dwc3
  * (core.h, gadget.h, ep0.c) name them. Polled (the event buffer's interrupt masked) every millisecond from a thread.
  *
  * Memory the controller reads and writes (the event buffer, TRBs, buffers): one physically contiguous piece, used through
@@ -1001,65 +1002,13 @@ usb_watchdog(uint64_t now)
 static volatile int restart_asked;
 
 /*
- * THE eUSB2 LINK AGAIN (U-Boot's `eusb init`, cmd/hakios_eusb.c, as Google's Linux driver brings it up at every plug):
- * when the cable goes the repeater loses power, and the link between the SoC's eUSB2 PHY and it must be made again --
- * a restart of the controller alone left the host seeing nothing (11-09). The link control (ESS_CTL, 0x11100000) and
- * the PHY (0x11110000); the PMU's isolation bit stays as the bootloader left it (the SoC kept its power).
+ * THE eUSB2 LINK AGAIN (as Google's Linux driver brings it up at every plug): when the cable goes the repeater loses
+ * power, and the link between the SoC's eUSB2 PHY and it must be made again -- a restart of the controller alone left
+ * the host seeing nothing (11-09). akios_usb_phy_zuma.c: akios_usb_phy_link; akios_usb_phy_up (the PHY's supplies,
+ * the repeater, the PMU's isolation, then the link) before the first start.
  */
-#define USBCON_PHYS             0x11100000UL
-#define EUSB_PHYS               0x11110000UL
-#define USBCON_LINKCTRL         0x04
-#define USBCON_LINK_CLKRST      0x0c
-#define USBCON_UTMI_CTRL        0x10
-#define EUSB_RST_CTRL           0x00
-#define EUSB_CMN_CTRL           0x04
-#define EUSB_PLLCFG0            0x08
-#define EUSB_PLLCFG1            0x0c
-#define EUSB_TXTUNE             0x14
-#define EUSB_TESTSE             0x20
-static vm_offset_t usbcon_regs, eusb_regs;
-
-static void
-clrset(vm_offset_t base, uint32_t off, uint32_t clr, uint32_t set)
-{
-	volatile uint32_t *r = (volatile uint32_t *)(base + off);
-
-	*r = (*r & ~clr) | set;
-}
-
-static void
-eusb_reinit(void)
-{
-	if (usbcon_regs == 0) {
-		usbcon_regs = ml_io_map(USBCON_PHYS, 0x1000);
-		eusb_regs = ml_io_map(EUSB_PHYS, 0x1000);
-	}
-	/* the link: Q-channel off, filters, a link reset, VBUS and B-session forced valid */
-	clrset(usbcon_regs, USBCON_LINKCTRL, 1u << 8, 1u << 9 | 1u << 10 | 1u << 11 | 1u << 12);
-	delay(500);
-	clrset(usbcon_regs, USBCON_LINKCTRL, 0xf0, 1u << 8 | 0xf0);
-	clrset(usbcon_regs, USBCON_LINK_CLKRST, 0, 1);
-	delay(10);
-	clrset(usbcon_regs, USBCON_LINK_CLKRST, 1, 0);
-	clrset(usbcon_regs, USBCON_UTMI_CTRL, 0, 3);
-	/* the eUSB2 PHY: held in reset, repeater mode at 19.2 MHz (PLL feedback 368), out of IDDQ, enabled, out of reset */
-	clrset(eusb_regs, EUSB_RST_CTRL, 0, 1u << 0 | 1u << 1 | 1u << 4 | 1u << 5);
-	clrset(eusb_regs, EUSB_CMN_CTRL, 7u << 4, 1u << 10);
-	clrset(eusb_regs, EUSB_PLLCFG0, 0xfffu << 8, 368u << 8);
-	clrset(eusb_regs, EUSB_PLLCFG1, 0xfu << 8, 0);
-	clrset(eusb_regs, EUSB_TXTUNE, 3u << 1, 0);
-	clrset(eusb_regs, EUSB_TESTSE, 1u << 6, 0);
-	clrset(eusb_regs, EUSB_CMN_CTRL, 1u << 0, 0);
-	delay(10);
-	clrset(eusb_regs, EUSB_RST_CTRL, 1u << 0, 0);
-	delay(10);
-	clrset(eusb_regs, EUSB_CMN_CTRL, 0, 1u << 0);
-	delay(3600);
-	clrset(eusb_regs, EUSB_RST_CTRL, 1u << 4 | 1u << 5, 0);
-	printf("akita usb: the eUSB2 link made again: RST_CTRL %#x CMN_CTRL %#x LINKCTRL %#x UTMI_CTRL %#x\n",
-	    *(volatile uint32_t *)(eusb_regs + EUSB_RST_CTRL), *(volatile uint32_t *)(eusb_regs + EUSB_CMN_CTRL),
-	    *(volatile uint32_t *)(usbcon_regs + USBCON_LINKCTRL), *(volatile uint32_t *)(usbcon_regs + USBCON_UTMI_CTRL));
-}
+void akios_usb_phy_up(void);
+void akios_usb_phy_link(void);
 
 void akita_usb_reconnect(void);
 void
@@ -1109,6 +1058,15 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 	akita_usbmux_init();
 	akita_ptp_init();
 	akita_serial_init();                    /* AkIOS (11-22) */
+	/* AkIOS (11-25): the PHY as Google's bootloader leaves it is off; brought up with the controller off the bus (a
+	 * loader's gadget may have left it running) */
+	if (rd(GSNPSID) != 0 && rd(GSNPSID) != ~0u) {
+		wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
+		for (unsigned i = 0; i < 100000 && !(rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+			delay(1);
+		}
+	}
+	akios_usb_phy_up();
 	if (!controller_start()) {
 		start_result = 0;
 		for (unsigned i = 0; i < 24; i++) {     /* on the screen (-v) for two minutes: why there is no USB */
@@ -1148,7 +1106,7 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 			printf("akita usb: started again (the cable came back)\n");
 			bulk_disable();
 			wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);            /* (off the bus while the link is made again) */
-			eusb_reinit();
+			akios_usb_phy_link();
 			(void)controller_start();
 			statuses = 0;           /* (the status lines again, to see the new link come up) */
 		}

@@ -155,6 +155,7 @@ bsd/dev/hakios.akita_usb.c               optional hakios_akita_usb
 bsd/dev/hakios.akita_usbmux.c            optional hakios_akita_usb
 bsd/dev/hakios.akita_ptp.c               optional hakios_akita_usb
 bsd/dev/hakios.akita_serial.c            optional hakios_akita_usb
+bsd/dev/akios_usb_phy_zuma.c             optional hakios_akita_usb
 bsd/dev/hakios.akita_pcie.c              optional hakios_akita_wifi
 bsd/dev/hakios.akita_bcm.c               optional hakios_akita_wifi
 # end of the HakiOS drivers
