@@ -61,6 +61,7 @@
 #include <libkern/crc.h>
 #include <vm/memory_types.h>
 #include "hakios.ufshc.h"
+#include "akios_ufs_zuma.h"
 
 extern processor_t thread_bind(processor_t processor);
 extern processor_t cpu_to_processor(int cpu);
@@ -196,6 +197,19 @@ static LCK_GRP_DECLARE(ufs_lck_grp, "hakios-ufs");
 static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
 /* One writer at a time; never held while the mailbox is, nor while user memory is touched. */
 static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
+
+/*
+ * AkIOS (11-25): no loader page at all (the chain firmware -> UniXNU -> DarwinBoot -> XNU): this kernel drives zuma's
+ * UFS controller itself (akios_ufs_zuma.c) and reads the partition tables itself (akios_gpt_read, below). The page
+ * the rest of this file reads is then made here, in this kernel's memory, with the same entries the loader used to
+ * offer; ufs_request goes to the controller instead of the loader, and reads that need no bounce go straight to it
+ * from many threads at once (ufs_read).
+ */
+static bool ufs_akios;
+static LCK_MTX_DECLARE(ufs_stats_lock, &ufs_lck_grp);
+static int akios_ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst, const uint8_t *src);
+static int akios_ufs_read_direct(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len);
+static bool akios_ufs_make_page(void);
 
 /*
  * Saving the data volume without being asked (userland/src/var_store.c).
@@ -417,6 +431,9 @@ ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *d
 	if (ufs_dead) {
 		return EIO;
 	}
+	if (ufs_akios) {
+		return akios_ufs_request(op, part, lba, count, dst, src);
+	}
 	if (op == BLOCK_OP_READ) {
 		if (part == ufs_last_part && lba == ufs_last_end) {
 			ufs_sequential++;
@@ -557,6 +574,7 @@ hakios_ufs_report(const char *when)
 		return;
 	}
 	ufshc_report(when);
+	akios_zufs_report(when);
 	absolutetime_to_nanoseconds(ufs_page->answer.ticks, &loader_ns);
 	printf("ufs: %s: %llu requests (%llu of 4 KB or less, %llu to 64 KB, %llu more; %llu right after "
 	    "the one before), %llu errors, %llu bytes; waiting %llu ms, of it in ReadBlocks %llu ms; "
@@ -564,7 +582,10 @@ hakios_ufs_report(const char *when)
 	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
 	printf("ufs: %s: %llu reads waited for another's to end (over 50 us), %llu ms in all, the longest %llu ms\n", when,
 	    ufs_lock_waits, ufs_lock_wait_us / 1000, ufs_lock_wait_max_us / 1000);
-	if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
+	if (ufs_akios) {
+		printf("ufs: %s: %llu writes into the iPhone's volumes, %llu bytes; %llu did not finish, %llu refused here\n", when,
+		    ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused);
+	} else if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
 		printf("ufs: %s: %llu writes into darwin, %llu bytes, read back by the loader; %llu did not "
 		    "finish, %llu refused here\n", when, ufs_writes, ufs_write_bytes, ufs_write_errors,
 		    ufs_write_refused);
@@ -754,6 +775,9 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 
 	if (offset > part_size || len > part_size - offset) {
 		return EINVAL;
+	}
+	if (ufs_akios) {
+		return akios_ufs_read_direct(part, offset, dst, len);
 	}
 	if (ufs_native_on && ufs_lun[part] != 0xff) {
 		int error = ufs_read_native(part, offset, dst, len);
@@ -1959,6 +1983,330 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, ufs_native, CTLTYPE_INT | CTLFLAG_RW | CTLFL
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_native_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_native_fallbacks,
     "times a read of this kernel's own UFS driver failed and the loader's was used instead");
 
+/* ---- AkIOS: the storage without a loader (zuma's controller, akios_ufs_zuma.c) ---- */
+
+/*
+ * A request of the loader's kind -- native blocks [lba, lba + count) of partition part, at most a buffer of them --
+ * made through this kernel's own driver. Called where ufs_request is (ufs_lock held), for writes, flushes and the
+ * reads that went the loader's way.
+ */
+static int
+akios_ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst, const uint8_t *src)
+{
+	volatile struct loader_block_part *e;
+	uint64_t bytes, started = mach_absolute_time(), ns;
+	uint8_t lun;
+	int error;
+
+	if (part >= ufs_parts || (ufs_page->part[part].flags & BLOCK_PART_UNIT)) {
+		return EINVAL;
+	}
+	e = &ufs_page->part[part];
+	lun = (uint8_t)e->unit;
+	bytes = count * e->block_size;
+	if (op != BLOCK_OP_FLUSH && (count == 0 || lba > e->blocks || count > e->blocks - lba || bytes > ufs_buffer_size)) {
+		return EINVAL;
+	}
+	switch (op) {
+	case BLOCK_OP_READ:
+		error = akios_zufs_read(lun, e->start_lba + lba, count, ufs_buffer);
+		if (error == 0) {
+			memcpy(dst, ufs_buffer, (size_t)bytes);
+		}
+		break;
+	case BLOCK_OP_WRITE:
+	case BLOCK_OP_WRITE_FAST:
+		/* (BLOCK_OP_WRITE: on the flash when it returns -- forced unit access -- as the loader's read-back was) */
+		if (((uintptr_t)src & 63) != 0) {
+			memcpy(ufs_buffer, src, (size_t)bytes);
+			src = ufs_buffer;
+		}
+		error = akios_zufs_write(lun, e->start_lba + lba, count, src, op == BLOCK_OP_WRITE);
+		if (error == 0) {
+			ufs_writes++;
+			ufs_write_bytes += bytes;
+		}
+		break;
+	case BLOCK_OP_FLUSH:
+		error = akios_zufs_sync(lun);
+		break;
+	default:
+		error = EINVAL;
+		break;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
+	os_atomic_add(&ufs_wait_us, ns / 1000, relaxed);
+	if (error != 0) {
+		os_atomic_inc(&ufs_errors, relaxed);
+		printf("ufs: %s: blocks %llu..%llu: the %s failed (%d)\n", e->name, lba, lba + count - 1,
+		    op == BLOCK_OP_READ ? "read" : op == BLOCK_OP_FLUSH ? "flush" : "write", error);
+	}
+	return error;
+}
+
+/*
+ * Bytes [offset, offset + len) of partition part, already checked against its size, straight from the controller:
+ * no lock of this file is held, so many threads read at once (the controller takes as many commands as it has
+ * slots). Whole blocks into memory of the right alignment go there directly; anything else through a bounce of this
+ * call's own.
+ */
+static int
+akios_ufs_read_direct(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
+{
+	volatile struct loader_block_part *e = &ufs_page->part[part];
+	uint64_t nbs = e->block_size, started = mach_absolute_time(), ns, total = len;
+	uint8_t lun = (uint8_t)e->unit, *bounce = NULL;
+	size_t bounce_size = 0;
+	int error = 0;
+
+	if (len == 0) {
+		return 0;
+	}
+	if (e->flags & BLOCK_PART_UNIT) {
+		return ENXIO;
+	}
+	lck_mtx_lock(&ufs_stats_lock);
+	ufs_count(part, len);
+	if (part == ufs_last_part && offset / nbs == ufs_last_end) {
+		ufs_sequential++;
+	}
+	ufs_last_part = part;
+	ufs_last_end = (offset + len + nbs - 1) / nbs;
+	lck_mtx_unlock(&ufs_stats_lock);
+
+	if (offset % nbs == 0 && len % nbs == 0 && ((uintptr_t)dst & 63) == 0) {
+		error = akios_zufs_read(lun, e->start_lba + offset / nbs, len / nbs, dst);
+	} else {
+		while (len > 0 && error == 0) {
+			uint64_t first = offset / nbs, skip = offset % nbs;
+			uint64_t count = MIN((skip + len + nbs - 1) / nbs, (uint64_t)AKIOS_ZUFS_CMD_BYTES / nbs), take;
+
+			if (bounce == NULL) {
+				bounce_size = (size_t)(count * nbs);
+				bounce = kalloc_data(bounce_size, Z_WAITOK);
+				if (bounce == NULL) {
+					return ENOMEM;
+				}
+			}
+			take = MIN(count * nbs - skip, len);
+			error = akios_zufs_read(lun, e->start_lba + first, count, bounce);
+			if (error == 0) {
+				memcpy(dst, bounce + skip, (size_t)take);
+			}
+			offset += take;
+			dst += take;
+			len -= take;
+		}
+		if (bounce != NULL) {
+			kfree_data(bounce, bounce_size);
+		}
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
+	os_atomic_add(&ufs_wait_us, ns / 1000, relaxed);
+	if (error != 0) {
+		os_atomic_inc(&ufs_errors, relaxed);
+		printf("ufs: %s: bytes %llu..%llu: the read failed (%d)\n", e->name, offset, offset + len - 1, error);
+		return error;
+	}
+	os_atomic_inc(&ufs_requests, relaxed);
+	os_atomic_add(&ufs_bytes, total, relaxed);
+	if (total <= 4096) {
+		os_atomic_inc(&ufs_small, relaxed);
+	} else if (total <= 65536) {
+		os_atomic_inc(&ufs_medium, relaxed);
+	} else {
+		os_atomic_inc(&ufs_large, relaxed);
+	}
+	return 0;
+}
+
+/* the type GUID the iPhone's volumes have on this phone (tools/darwin-split.py), as the GPT stores it */
+static const uint8_t akios_ios_volume_type[16] = {
+	0xef, 0x57, 0x34, 0x7c, 0x00, 0x00, 0xaa, 0x11, 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac,
+};
+
+/*
+ * A GPT header in hdr (one block of bs bytes) that is right for where it was read (at): its signature, its size, its
+ * CRC, its own place, and a table that fits on the unit.
+ */
+static bool
+akios_gpt_header_ok(uint8_t *hdr, uint32_t bs, uint64_t at, uint64_t blocks)
+{
+	uint32_t hsize, want, got, n, esz;
+	uint64_t mine, table;
+
+	if (memcmp(hdr, "EFI PART", 8) != 0) {
+		return false;
+	}
+	memcpy(&hsize, hdr + 12, 4);
+	memcpy(&want, hdr + 16, 4);
+	memcpy(&mine, hdr + 24, 8);
+	memcpy(&table, hdr + 72, 8);
+	memcpy(&n, hdr + 80, 4);
+	memcpy(&esz, hdr + 84, 4);
+	if (hsize < 92 || hsize > bs || mine != at || esz < 128 || esz > 4096 || (esz & 7) != 0 || n == 0 || n > 1024) {
+		return false;
+	}
+	memset(hdr + 16, 0, 4);
+	got = crc32(0, hdr, hsize);
+	memcpy(hdr + 16, &want, 4);
+	return got == want && table >= 2 && table < blocks && ((uint64_t)n * esz + bs - 1) / bs <= blocks - table;
+}
+
+/*
+ * The partitions of one logical unit into the page, from its GPT: the primary header and table, both CRC-checked, or
+ * else the backup at the unit's end. Names as the loader made them (UTF-16 to ASCII, '?' past it, 35 at most).
+ */
+static bool
+akios_gpt_read(struct loader_block *pg, uint8_t lun, bool writes)
+{
+	uint32_t bs = akios_zufs_lun_bsize(lun), n = 0, esz = 0, ecrc = 0, added = 0;
+	uint64_t blocks = akios_zufs_lun_blocks(lun), table_lba = 0, table_bytes = 0;
+	uint8_t *hdr = kalloc_data(bs, Z_WAITOK), *table = NULL;
+	const char *which = NULL;
+
+	if (hdr == NULL) {
+		return false;
+	}
+	for (int k = 0; k < 2 && which == NULL; k++) {
+		uint64_t at = k == 0 ? 1 : blocks - 1;
+
+		if (akios_zufs_read(lun, at, 1, hdr) != 0 || !akios_gpt_header_ok(hdr, bs, at, blocks)) {
+			printf("ufs: LUN %u: no good %s GPT header at block %llu\n", lun, k == 0 ? "primary" : "backup", at);
+			continue;
+		}
+		memcpy(&table_lba, hdr + 72, 8);
+		memcpy(&n, hdr + 80, 4);
+		memcpy(&esz, hdr + 84, 4);
+		memcpy(&ecrc, hdr + 88, 4);
+		table_bytes = (uint64_t)n * esz;
+		table = kalloc_data((size_t)((table_bytes + bs - 1) / bs * bs), Z_WAITOK);
+		if (table == NULL) {
+			break;
+		}
+		if (akios_zufs_read(lun, table_lba, (table_bytes + bs - 1) / bs, table) == 0 &&
+		    crc32(0, table, (size_t)table_bytes) == ecrc) {
+			which = k == 0 ? "primary" : "backup";
+			break;
+		}
+		printf("ufs: LUN %u: the %s GPT's table at block %llu is not right (its CRC)\n", lun, k == 0 ? "primary" : "backup",
+		    table_lba);
+		kfree_data(table, (size_t)((table_bytes + bs - 1) / bs * bs));
+		table = NULL;
+	}
+	kfree_data(hdr, bs);
+	if (which == NULL) {
+		if (table != NULL) {
+			kfree_data(table, (size_t)((table_bytes + bs - 1) / bs * bs));
+		}
+		return false;
+	}
+	for (uint32_t i = 0; i < n && pg->parts < BLOCK_MAX_PARTS; i++) {
+		const uint8_t *ent = table + (size_t)i * esz;
+		struct loader_block_part *bp = &pg->part[pg->parts];
+		static const uint8_t zero[16];
+		uint64_t first, last;
+		unsigned c;
+
+		if (memcmp(ent, zero, 16) == 0) {
+			continue;               /* an unused entry */
+		}
+		memcpy(&first, ent + 32, 8);
+		memcpy(&last, ent + 40, 8);
+		if (last < first || last >= blocks) {
+			printf("ufs: LUN %u: GPT entry %u: blocks %llu..%llu are not on the unit: left out\n", lun, i, first, last);
+			continue;
+		}
+		memset(bp, 0, sizeof(*bp));
+		for (c = 0; c + 1 < sizeof(bp->name) && c < 36; c++) {
+			uint16_t ch = (uint16_t)(ent[56 + 2 * c] | ent[57 + 2 * c] << 8);
+
+			if (ch == 0) {
+				break;
+			}
+			bp->name[c] = ch < 0x80 ? (char)ch : '?';
+		}
+		bp->name[c] = 0;
+		bp->block_size = bs;
+		bp->blocks = last - first + 1;
+		bp->start_lba = first;
+		bp->unit = lun;
+		bp->lun = lun;
+		/*
+		 * The iPhone's volumes iOS writes (the loader's block_is_ios_volume): ios_*, but never ios_system or
+		 * ios_preboot, which the build writes from the computer; their type, on LUN 0, in blocks of 4096.
+		 */
+		if (writes && strncmp(bp->name, "ios_", 4) == 0 && strcmp(bp->name, "ios_system") != 0 &&
+		    strcmp(bp->name, "ios_preboot") != 0) {
+			if (memcmp(ent, akios_ios_volume_type, 16) != 0 || lun != 0 || bs != 4096) {
+				printf("ufs: %s: no write will be made: not the iPhone volumes' type, or not on LUN 0 in blocks of 4096\n",
+				    bp->name);
+			} else if (!akios_zufs_allow_write(lun, first, last)) {
+				printf("ufs: %s: no write will be made: no room for its range\n", bp->name);
+			} else {
+				bp->flags |= BLOCK_PART_WRITABLE;
+			}
+		}
+		pg->parts++;
+		added++;
+	}
+	kfree_data(table, (size_t)((table_bytes + bs - 1) / bs * bs));
+	printf("ufs: LUN %u: %u partitions from its %s GPT\n", lun, added, which);
+	return true;
+}
+
+/*
+ * The page the rest of this file reads, made here: the partitions of every unit that answers (LUN 0 first), then
+ * the units themselves (unit0, unit1, ...: BLOCK_PART_UNIT), as the loader listed them; a buffer of this kernel's.
+ */
+static bool
+akios_ufs_make_page(void)
+{
+	struct loader_block *pg;
+	uint32_t mask, writes = 0;
+
+	if (!akios_zufs_probe()) {
+		printf("ufs: no loader page and zuma's UFS controller is not usable: no storage\n");
+		return false;
+	}
+	pg = kalloc_data(sizeof(*pg), Z_WAITOK | Z_ZERO);
+	ufs_buffer = kalloc_data(4u << 20, Z_WAITOK);
+	if (pg == NULL || ufs_buffer == NULL) {
+		printf("ufs: no memory for the partition table: no storage\n");
+		return false;
+	}
+	PE_parse_boot_argn("ufs_write", &writes, sizeof(writes));
+	mask = akios_zufs_lun_mask();
+	for (uint8_t lun = 0; lun < AKIOS_ZUFS_MAX_LUNS; lun++) {
+		if ((mask & (1u << lun)) && !akios_gpt_read(pg, lun, writes == 1) && lun == 0) {
+			printf("ufs: LUN 0 has no partition table this kernel can read: no storage\n");
+			kfree_data(pg, sizeof(*pg));
+			return false;
+		}
+	}
+	for (uint8_t lun = 0; lun < AKIOS_ZUFS_MAX_LUNS && pg->parts < BLOCK_MAX_PARTS; lun++) {
+		struct loader_block_part *bp = &pg->part[pg->parts];
+
+		if (!(mask & (1u << lun))) {
+			continue;
+		}
+		snprintf(bp->name, sizeof(bp->name), "unit%u", lun);
+		bp->block_size = akios_zufs_lun_bsize(lun);
+		bp->blocks = akios_zufs_lun_blocks(lun);
+		bp->unit = lun;
+		bp->lun = lun;
+		bp->flags = BLOCK_PART_UNIT;
+		pg->parts++;
+	}
+	pg->magic = BLOCK_MAGIC;
+	pg->version = BLOCK_VERSION;
+	pg->size = sizeof(*pg);
+	pg->buffer_size = 4u << 20;
+	pg->write_caps = BLOCK_CAN_FAST;        /* writes flushed when the file system asks (SYNCHRONIZE CACHE) */
+	ufs_page = pg;
+	return true;
+}
+
 /* ---- bringing it up ---- */
 
 void
@@ -1994,23 +2342,34 @@ hakios_ufs_init(void)
 		}
 	}
 	if (!PE_parse_boot_argn("ufs_shared_pa", &pa, sizeof(pa)) || pa == 0) {
-		return;                 /* the loader was not asked for ufs=2: there is nothing to read through */
-	}
-	base = ml_io_map_unmappable((vm_offset_t)(pa & ~(UFS_PAGE - 1)),
-	    ((pa & (UFS_PAGE - 1)) + sizeof(struct loader_block) + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_WCOMB);
-	ufs_page = (volatile struct loader_block *)(base + (pa & (UFS_PAGE - 1)));
-	if (ufs_page->magic != BLOCK_MAGIC || ufs_page->version != BLOCK_VERSION ||
-	    ufs_page->size != sizeof(struct loader_block) || ufs_page->parts > BLOCK_MAX_PARTS) {
-		printf("ufs: the loader's page at %llx is not one this kernel knows (magic %llx, version %u, size %u)\n",
-		    pa, ufs_page->magic, ufs_page->version, ufs_page->size);
-		return;
+		/*
+		 * No loader serves the storage (the AkIOS chain): this kernel's own driver of zuma's controller, unless
+		 * ufs_zuma=0. Its page is made here (akios_ufs_make_page), with its own buffer.
+		 */
+		check = 1;
+		PE_parse_boot_argn("ufs_zuma", &check, sizeof(check));
+		if (check == 0 || !akios_ufs_make_page()) {
+			return;
+		}
+		ufs_akios = true;
+		pa = 0;
+	} else {
+		base = ml_io_map_unmappable((vm_offset_t)(pa & ~(UFS_PAGE - 1)),
+		    ((pa & (UFS_PAGE - 1)) + sizeof(struct loader_block) + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_WCOMB);
+		ufs_page = (volatile struct loader_block *)(base + (pa & (UFS_PAGE - 1)));
+		if (ufs_page->magic != BLOCK_MAGIC || ufs_page->version != BLOCK_VERSION ||
+		    ufs_page->size != sizeof(struct loader_block) || ufs_page->parts > BLOCK_MAX_PARTS) {
+			printf("ufs: the loader's page at %llx is not one this kernel knows (magic %llx, version %u, size %u)\n",
+			    pa, ufs_page->magic, ufs_page->version, ufs_page->size);
+			return;
+		}
+		buffer_pa = ufs_page->buffer_pa;
+		ufs_buffer = (const uint8_t *)(ml_io_map_unmappable((vm_offset_t)(buffer_pa & ~(UFS_PAGE - 1)),
+		    ((buffer_pa & (UFS_PAGE - 1)) + ufs_page->buffer_size + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_DEFAULT) +
+		    (buffer_pa & (UFS_PAGE - 1)));
 	}
 	ufs_parts = ufs_page->parts;
 	ufs_buffer_size = ufs_page->buffer_size;
-	buffer_pa = ufs_page->buffer_pa;
-	ufs_buffer = (const uint8_t *)(ml_io_map_unmappable((vm_offset_t)(buffer_pa & ~(UFS_PAGE - 1)),
-	    ((buffer_pa & (UFS_PAGE - 1)) + ufs_buffer_size + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_DEFAULT) +
-	    (buffer_pa & (UFS_PAGE - 1)));
 	ufs_seq = ufs_page->answer.answered;      /* a loader that served an earlier kernel counts on from there */
 
 	ufs_bmajor = bdevsw_add(-1, &ufs_bdevsw);
@@ -2036,8 +2395,13 @@ hakios_ufs_init(void)
 		made++;
 	}
 	ufs_ready = true;
-	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
-	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
+	if (ufs_akios) {
+		printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only but for the "
+		    "iPhone's volumes, through this kernel's own driver of zuma's UFS controller\n", made);
+	} else {
+		printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
+		    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
+	}
 
 	/*
 	 * ufs_write=1: /dev/rufs_darwin takes writes, past the Darwin volume and the cryptexes. darwin
@@ -2048,7 +2412,9 @@ hakios_ufs_init(void)
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
 		uint32_t offered = ufs_page->write_part_plus_one;
 
-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
+		if (ufs_akios) {
+			offered = 0;    /* no darwin partition any more: only the iPhone's volumes, marked below */
+		} else if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
 			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
 			    "line too, and a loader that knows about writes), or its write_first %llu != %llu: "
 			    "the storage stays read only\n",
@@ -2141,7 +2507,7 @@ hakios_ufs_init(void)
 	 */
 	check = 0;
 	memset(ufs_lun, 0xff, sizeof(ufs_lun));
-	if (PE_parse_boot_argn("ufs_native", &check, sizeof(check)) && check != 0) {
+	if (!ufs_akios && PE_parse_boot_argn("ufs_native", &check, sizeof(check)) && check != 0) {
 		struct ufshc_loader offer = {
 			.hc_pa = ufs_page->native.hc_pa, .area_pa = ufs_page->native.area_pa,
 			.area_size = ufs_page->native.area_size, .ucd_offset = ufs_page->native.ucd_offset,
