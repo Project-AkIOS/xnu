@@ -534,6 +534,14 @@ void
 console_write(char *str, int size)
 {
 	if (disableConsoleOutput) {
+#if defined(ARM64_BOARD_CONFIG_BCM2837)
+		/* AkIOS: the video console is off (the display is iOS's), but the log the loader and pstore keep goes on */
+		for (int i = 0; i < size; i++) {
+			if (str[i] != '\r') {
+				loader_log_putc(str[i]);
+			}
+		}
+#endif
 		return;
 	}
 

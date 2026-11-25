@@ -256,8 +256,6 @@ fallthrough:
  *		inlined, given there is only one call site).
  */
 
-extern void loader_log_putc(char c);
-
 int
 kmputc(__unused dev_t dev, char c)
 {
@@ -369,9 +367,8 @@ kmoutput(struct tty * tp)
 		for (cp = buf; cp < &buf[cc]; cp++) {
 			/* output the buffer one charatcer at a time */
 			*cp = *cp & 0x7f;
-			/* What user space writes to /dev/console also goes to the loader's log. */
-			loader_log_putc((char)*cp);
 		}
+		/* (what user space writes reaches the loader's log through console_write, osfmk/console/serial_console.c) */
 		if (cc > 1) {
 			console_write((char *)buf, cc);
 		} else {
