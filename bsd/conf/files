@@ -149,6 +149,7 @@ bsd/dev/hakios.akita_thermal.c           optional hakios_akita_thermal
 bsd/dev/hakios.akita_dvfs.c              optional hakios_akita_dvfs
 bsd/dev/hakios.akita_rtc.c               optional hakios_akita_rtc
 bsd/dev/hakios.akita_power.c             optional hakios_akita_power
+bsd/dev/akios_wdt_zuma.c                 optional hakios_akita_power
 bsd/dev/hakios.akita_mct.c               optional hakios_akita_mct
 bsd/dev/hakios.akita_trusty.c            optional hakios_akita_trusty
 bsd/dev/hakios.akita_usb.c               optional hakios_akita_usb
