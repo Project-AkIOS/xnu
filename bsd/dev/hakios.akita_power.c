@@ -275,6 +275,20 @@ hakios_platform_halt(int reboot)
 	if (PE_parse_boot_argn("loader_return_after", &after, sizeof(after))) {
 		return;                 /* xl's run: the loader takes it back */
 	}
+	if (!reboot) {
+		/*
+		 * Boot-arg halt_restarts=1 (11-25; ak gives it to every test boot, never to a flashed image): a halt or a
+		 * shutdown restarts instead. Powered off with the cable in, the bootloader goes into charging mode and Android
+		 * comes up with USB as a MIDI device, out of the computer's reach until someone changes it by hand; and a
+		 * power-off loses RAM, so pstore -- the boot's only log -- is gone. A restart keeps both.
+		 */
+		uint32_t restarts = 0;
+
+		if (PE_parse_boot_argn("halt_restarts", &restarts, sizeof(restarts)) && restarts != 0) {
+			printf("akita: shut down asked for: restarting instead (halt_restarts=1)\n");
+			reboot = 1;
+		}
+	}
 	if (reboot) {
 		/*
 		 * Boot-arg restart_fastboot=1 (11-15; tools/bootrun.sh gives it with QUIET=1): every restart of this boot
