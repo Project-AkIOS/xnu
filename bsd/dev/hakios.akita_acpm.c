@@ -159,3 +159,63 @@ out:
 	lck_mtx_unlock(&acpm_lock);
 	return error;
 }
+
+/*
+ * A PMIC register through ACPM's PMIC channel (2): the request's first word is the PMIC's bus (bits 15:12: 0 the main
+ * PMIC S2MPG14, 1 the sub PMIC S2MPG15), the register block (11:8: 1 the regulators) and the register (7:0); the
+ * second the function (bits 7:0: 0 read, 1 write), the value (15:8) and a mask (23:16); the answer's status in bits
+ * 31:24 of the second word, the value read in 15:8. As the thermal, RTC and AoC drivers use it.
+ *
+ *   int akios_pmic_read(bus, block, reg, &value)                 0, or an errno
+ *   int akios_pmic_update(bus, block, reg, mask, value, &was)    the bits of mask set to value's; written only when that
+ *                                                                changes the register; was: what it held before
+ */
+#define PMIC_CHANNEL            2
+
+int akios_pmic_read(unsigned bus, unsigned block, unsigned reg, uint8_t *value);
+int akios_pmic_update(unsigned bus, unsigned block, unsigned reg, uint8_t mask, uint8_t value, uint8_t *was);
+
+static int
+pmic_xfer(bool write, unsigned bus, unsigned block, unsigned reg, uint8_t *value)
+{
+	uint32_t cmd[4] = { (bus & 0xf) << 12 | (block & 0xf) << 8 | (reg & 0xff),
+		            (write ? 1u : 0u) | (uint32_t)*value << 8 | 0xffu << 16, 0, 0 };
+	int error = akita_acpm_xfer(PMIC_CHANNEL, cmd);
+
+	if (error != 0) {
+		return error;
+	}
+	if ((cmd[1] >> 24) != 0) {
+		return EIO;
+	}
+	if (!write) {
+		*value = (uint8_t)(cmd[1] >> 8);
+	}
+	return 0;
+}
+
+int
+akios_pmic_read(unsigned bus, unsigned block, unsigned reg, uint8_t *value)
+{
+	*value = 0;
+	return pmic_xfer(false, bus, block, reg, value);
+}
+
+int
+akios_pmic_update(unsigned bus, unsigned block, unsigned reg, uint8_t mask, uint8_t value, uint8_t *was)
+{
+	uint8_t now = 0, want;
+	int error = pmic_xfer(false, bus, block, reg, &now);
+
+	if (was != NULL) {
+		*was = now;
+	}
+	if (error != 0) {
+		return error;
+	}
+	want = (uint8_t)((now & ~mask) | (value & mask));
+	if (want == now) {
+		return 0;
+	}
+	return pmic_xfer(true, bus, block, reg, &want);
+}
