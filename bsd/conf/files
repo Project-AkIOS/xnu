@@ -125,6 +125,7 @@ bsd/dev/hakios.btsk.c                    optional hakios_bt_host
 bsd/dev/hakios.battery.c                 optional hakios_battery
 bsd/dev/hakios.ufs.c                     optional hakios_ufs
 bsd/dev/hakios.ufshc.c                   optional hakios_ufs
+bsd/dev/akios_ufs_zuma.c                 optional hakios_ufs
 bsd/dev/hakios.sta.c                     optional hakios_wifi_station
 bsd/dev/hakios.apple80211.c              optional hakios_wifi_station
 bsd/dev/hakios.akita_aoc.c               optional hakios_akita_aoc
