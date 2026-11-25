@@ -4,10 +4,9 @@
  * boot-arg touchscreen=1.
  *
  * Who does what:
- *   U-Boot (devices/akita/u-boot, $hakios_touch, run at every start): the chip's two supplies through Google's power
- *       firmware (S2MPG14 LDO4M, AVDD, set to 3.0 V; LDO25M, DVDD, 1.8 V: `acpm`), the reset pin low and then high around
- *       it (gpp21-2). It has the ACPM client; the kernel has none.
- *   this driver: the SPI controller's clock (CMU_HSI0: USI2's mux to the 24.576 MHz crystal, divider 1, its gates held
+ *   this driver: the chip's two supplies through Google's power firmware (S2MPG14 LDO4M, AVDD, set to 3.0 V; LDO25M,
+ *       DVDD, 1.8 V: ACPM), the reset pin low and then high around it (gpp21-2) -- touch_power, once U-Boot's
+ *       $hakios_touch; the SPI controller's clock (CMU_HSI0: USI2's mux to the 24.576 MHz crystal, divider 1, its gates held
  *       on: 6.1 MHz on the wire, the controller dividing by four), the USI block in SPI mode, the controller itself
  *       (Samsung's s3c64xx: polled, 8-bit, mode 0, chip select by hand), and the Goodix protocol: where the chip keeps its
  *       touch report and how big a finger's record is (14 bytes on this chip, 8 on others), read from its description.
@@ -269,6 +268,55 @@ le32(const uint8_t *p)
 	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
+/*
+ * AkIOS (11-25): THE CHIP'S POWER, here now (it was U-Boot's $hakios_touch; the new chain has no such step): the reset
+ * pin (gpp21-2) an output, low; AVDD (S2MPG14 LDO4M, L4M_CTRL 0x2e: Android's tree says 3.0 V, 0x30 in bits 5:0; the
+ * bootloader leaves 3.3 V set and the LDO off) set and on (bit 7); DVDD (LDO25M, L25M_CTRL 0x43, 1.8 V) on (bit 7);
+ * 20 ms; the reset pin high, and the chip's own start awaited. Through ACPM (hakios.akita_acpm.c). Nothing is done when
+ * both are on at 3.0 V already (a loader powered the chip).
+ */
+extern int akios_pmic_read(unsigned bus, unsigned block, unsigned reg, uint8_t *value);
+extern int akios_pmic_update(unsigned bus, unsigned block, unsigned reg, uint8_t mask, uint8_t value, uint8_t *was);
+#define PMIC_MAIN               0
+#define PMIC_REGULATORS         1
+#define S2MPG14_L4M_CTRL        0x2e
+#define S2MPG14_L25M_CTRL       0x43
+#define LDO_ON                  0x80
+#define L4M_3V0                 0x30
+
+static void
+touch_power(void)
+{
+	uint8_t avdd = 0, dvdd = 0, avdd_now = 0, dvdd_now = 0;
+	int error;
+
+	if (akios_pmic_read(PMIC_MAIN, PMIC_REGULATORS, S2MPG14_L4M_CTRL, &avdd) != 0 ||
+	    akios_pmic_read(PMIC_MAIN, PMIC_REGULATORS, S2MPG14_L25M_CTRL, &dvdd) != 0) {
+		printf("akita touch: the PMIC could not be read through ACPM: the chip's power left as it is\n");
+		return;
+	}
+	if ((avdd & (LDO_ON | 0x3f)) == (LDO_ON | L4M_3V0) && (dvdd & LDO_ON)) {
+		printf("akita touch: powered already (L4M_CTRL %#x, L25M_CTRL %#x)\n", avdd, dvdd);
+		return;
+	}
+	wr(pin_reset + 0x44, rd(pin_reset + 0x44) & ~(1u << 2));                /* DAT low first, then */
+	wr(pin_reset + 0x40, (rd(pin_reset + 0x40) & ~(0xfu << 8)) | (1u << 8)); /* CON: pin 2 an output */
+	error = akios_pmic_update(PMIC_MAIN, PMIC_REGULATORS, S2MPG14_L4M_CTRL, 0x3f, L4M_3V0, NULL);
+	if (error == 0) {
+		error = akios_pmic_update(PMIC_MAIN, PMIC_REGULATORS, S2MPG14_L4M_CTRL, LDO_ON, LDO_ON, NULL);
+	}
+	if (error == 0) {
+		error = akios_pmic_update(PMIC_MAIN, PMIC_REGULATORS, S2MPG14_L25M_CTRL, LDO_ON, LDO_ON, NULL);
+	}
+	sleep_ms(20);
+	wr(pin_reset + 0x44, rd(pin_reset + 0x44) | (1u << 2));
+	(void)akios_pmic_read(PMIC_MAIN, PMIC_REGULATORS, S2MPG14_L4M_CTRL, &avdd_now);
+	(void)akios_pmic_read(PMIC_MAIN, PMIC_REGULATORS, S2MPG14_L25M_CTRL, &dvdd_now);
+	printf("akita touch: powered%s: L4M_CTRL %#x -> %#x, L25M_CTRL %#x -> %#x; out of reset (gpp21 CON %#x DAT %#x)\n",
+	    error ? " (A PMIC WRITE FAILED)" : "", avdd, avdd_now, dvdd, dvdd_now, rd(pin_reset + 0x40), rd(pin_reset + 0x44));
+	sleep_ms(100);                          /* (the chip's start, as after touch_reset) */
+}
+
 static void
 touch_reset(void)
 {
@@ -291,7 +339,7 @@ goodix_probe(void)
 	}
 	if (!goodix_checksum_ok(version, sizeof(version))) {
 		printf("akita touch: no valid version block (%02x %02x %02x %02x %02x %02x ... %02x %02x): is the chip powered "
-		    "(U-Boot's $hakios_touch)?\n", version[0], version[1], version[2], version[3], version[4], version[5],
+		    "(touch_power)?\n", version[0], version[1], version[2], version[3], version[4], version[5],
 		    version[26], version[27]);
 		return false;
 	}
@@ -644,6 +692,7 @@ akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &fast_span);
 	idle_looks = 80000 / poll_us;
 
+	touch_power();                          /* AkIOS (11-25) */
 	spi_clock_on();
 	if (!spi_init()) {
 		printf("akita touch: the SPI controller does not keep what is written: its clock is off\n");
