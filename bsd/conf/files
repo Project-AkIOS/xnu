@@ -143,6 +143,7 @@ bsd/dev/hakios.akita_modem.c             optional hakios_akita_modem
 bsd/dev/hakios.akita_modem_fs.c          optional hakios_akita_modem
 bsd/dev/hakios.akita_pcie0.c             optional hakios_akita_modem
 bsd/dev/hakios.akita_battery.c           optional hakios_akita_battery
+bsd/dev/akios_i2c11.c                    standard
 bsd/dev/hakios.akita_acpm.c              optional hakios_akita_acpm
 bsd/dev/hakios.akita_thermal.c           optional hakios_akita_thermal
 bsd/dev/hakios.akita_dvfs.c              optional hakios_akita_dvfs

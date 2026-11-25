@@ -8,9 +8,7 @@
  * defaults left (seen in iOS: CHG_CNFG_00 mode 5, charger and buck on).
  *
  * The bus: zuma's hsi2c@10cb0000 (Linux: i2c-11 under 10cb0000.hsi2c), an Exynos 7 HSI2C in a USI block, also the eUSB
- * repeater's. U-Boot's driver has set it up before the kernel (cmd/hakios_eusb.c, `eusb repeater`: auto mode, FIFOs on,
- * the bootloader's timings kept); here only transfers, polled, as U-Boot's drivers/i2c/exynos_hs_i2c.c does them (the
- * Exynos 7 variant: completion and errors in INT_STATUS). Nothing else in the kernel uses the bus.
+ * repeater's: its transfers are akios_i2c11.c's (one lock for both users; the USB port's driver is the other).
  *
  * The chips (Android: /sys/class/power_supply/maxfg is 11-0036, main-charger 11-0069), registers little-endian words
  * for the gauge, bytes for the charger. The scales were read against Android's own values on this phone (2026-11-02):
@@ -33,44 +31,6 @@
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 
-extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-
-#define HSI2C_PHYS              0x10cb0000UL
-
-/* the HSI2C's registers (U-Boot's struct exynos5_hsi2c) */
-#define CTL                     0x00
-#define FIFO_CTL                0x04
-#define INT_STAT                0x24
-#define FIFO_STAT               0x30
-#define TX_DATA                 0x34
-#define RX_DATA                 0x38
-#define CONF                    0x40
-#define AUTO_CONF               0x44
-#define TIMEOUT                 0x48
-#define TRANS_STATUS            0x50
-#define ADDR                    0x70
-
-#define CTL_FUNC_MODE_I2C       (1u << 0)
-#define CTL_MASTER              (1u << 3)
-#define CTL_RXCHON              (1u << 6)
-#define CTL_TXCHON              (1u << 7)
-#define FIFO_RX_EN              (1u << 0)
-#define FIFO_TX_EN              (1u << 1)
-#define CONF_AUTO_MODE          (1u << 31)
-#define AUTO_READ               (1u << 16)
-#define AUTO_STOP               (1u << 17)
-#define AUTO_RUN                (1u << 31)
-#define TIMEOUT_EN              (1u << 31)
-#define INT_DONE                (1u << 7)
-#define INT_ABORT               (1u << 8)
-#define INT_NO_ACK              (1u << 9)
-#define INT_NO_DEV              (1u << 10)
-#define INT_TIMEOUT             (1u << 11)
-#define INT_ALL                 (INT_DONE | INT_ABORT | INT_NO_ACK | INT_NO_DEV | INT_TIMEOUT)
-#define FIFO_TX_FULL            (1u << 7)
-#define FIFO_RX_EMPTY           (1u << 24)
-#define MASTER_BUSY             (1u << 17)
-#define WAIT_US                 10000
 
 #define GAUGE                   0x36
 #define CHARGER                 0x69
@@ -84,103 +44,20 @@ extern bool akita_usb_host_configured(void);    /* drivers/usb/hakios.akita_usb.
 static bool akita_usb_host_configured(void) { return false; }
 #endif
 
-static vm_offset_t i2c;
-static uint32_t errors;
+/* the bus is shared with the USB port's driver (the eUSB repeater): akios_i2c11.c, under its lock */
+extern bool akios_i2c11_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+extern bool akios_i2c11_write(uint8_t addr, uint8_t reg, uint8_t value);
 
-static inline uint32_t
-rd(uint32_t off)
-{
-	return *(volatile uint32_t *)(i2c + off);
-}
-
-static inline void
-wr(uint32_t off, uint32_t v)
-{
-	*(volatile uint32_t *)(i2c + off) = v;
-}
-
-/* until (register & mask) == want; false after WAIT_US */
-static bool
-wait_for(uint32_t off, uint32_t mask, uint32_t want)
-{
-	for (unsigned i = 0; i < WAIT_US; i++) {
-		if ((rd(off) & mask) == want) {
-			return true;
-		}
-		delay(1);
-	}
-	return false;
-}
-
-/* the end of a transfer: done, or what went wrong (0 for done) */
-static uint32_t
-transfer_end(void)
-{
-	for (unsigned i = 0; i < WAIT_US; i++) {
-		uint32_t s = rd(INT_STAT);
-
-		if (s & INT_ALL) {
-			wr(INT_STAT, s);
-			return s & (INT_ABORT | INT_NO_ACK | INT_NO_DEV | INT_TIMEOUT) ? s : 0;
-		}
-		delay(1);
-	}
-	return ~0u;
-}
-
-/* one transfer to or from the chip at addr: len bytes, a stop after it or not (a repeated start follows) */
-static bool
-transfer(uint8_t addr, bool read, uint8_t *buf, unsigned len, bool stop)
-{
-	uint32_t end;
-	bool ok = true;
-
-	wr(TIMEOUT, rd(TIMEOUT) & ~TIMEOUT_EN);
-	wr(ADDR, (uint32_t)(addr & 0x3ff) << 10);
-	wr(CTL, (read ? CTL_RXCHON : CTL_TXCHON) | CTL_FUNC_MODE_I2C | CTL_MASTER);
-	wr(INT_STAT, INT_ALL);
-	wr(AUTO_CONF, len | AUTO_RUN | (stop ? AUTO_STOP : 0) | (read ? AUTO_READ : 0));
-	for (unsigned i = 0; i < len && ok; i++) {
-		if (read) {
-			ok = wait_for(FIFO_STAT, FIFO_RX_EMPTY, 0);
-			if (ok) {
-				buf[i] = (uint8_t)rd(RX_DATA);
-			}
-		} else {
-			ok = wait_for(FIFO_STAT, FIFO_TX_FULL, 0);
-			if (ok) {
-				wr(TX_DATA, buf[i]);
-			}
-		}
-	}
-	end = transfer_end();
-	if (stop) {
-		wait_for(TRANS_STATUS, MASTER_BUSY, 0);
-	}
-	wr(CTL, CTL_FUNC_MODE_I2C);
-	if (!ok || end) {
-		if (errors++ < 8) {
-			printf("akita battery: I2C %s of %u bytes at %#x failed (%s, INT_STAT %#x)\n", read ? "read" : "write",
-			    len, addr, ok ? "the end" : "the FIFO", end);
-		}
-		return false;
-	}
-	return true;
-}
-
-/* len bytes from register reg of the chip at addr: the register's number written, then a repeated start and the read */
 static bool
 read_regs(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
 {
-	return transfer(addr, false, &reg, 1, false) && transfer(addr, true, buf, len, true);
+	return akios_i2c11_read(addr, reg, buf, len);
 }
 
 static bool
 write_reg(uint8_t addr, uint8_t reg, uint8_t value)
 {
-	uint8_t b[2] = { reg, value };
-
-	return transfer(addr, false, b, 2, true);
+	return akios_i2c11_write(addr, reg, value);
 }
 
 /*
@@ -504,18 +381,6 @@ akita_battery_init(void)
 
 	if (!PE_parse_boot_argn("fuelgauge", &enabled, sizeof(enabled)) || !enabled) {
 		return;
-	}
-	i2c = ml_io_map(HSI2C_PHYS, 0x1000);
-	if (!i2c) {
-		printf("akita battery: could not map the I2C controller; off\n");
-		return;
-	}
-	/* as U-Boot left it, normally; else the two things a transfer needs (the timings are the bootloader's either way) */
-	if (!(rd(CONF) & CONF_AUTO_MODE) || (rd(FIFO_CTL) & (FIFO_RX_EN | FIFO_TX_EN)) != (FIFO_RX_EN | FIFO_TX_EN)) {
-		printf("akita battery: the I2C controller not as U-Boot leaves it (CONF %#x FIFO_CTL %#x): auto mode, FIFOs on\n",
-		    rd(CONF), rd(FIFO_CTL));
-		wr(CONF, rd(CONF) | CONF_AUTO_MODE);
-		wr(FIFO_CTL, rd(FIFO_CTL) | FIFO_RX_EN | FIFO_TX_EN);
 	}
 	/* a thread of its own once the kernel is up (IOKit for the power source): started from a thread call, 5 s from now */
 	start = thread_call_allocate(akita_battery_start, NULL);
