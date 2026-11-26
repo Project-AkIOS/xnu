@@ -29,6 +29,7 @@
 #include <sys/proc.h>
 
 #include "MiniIOSurface.h"
+#include "akios_shared_event.h"
 
 static_assert(sizeof(struct minisurf_plane) == 0x98, "plane layout");
 static_assert(offsetof(struct minisurf_plane, compression) == 0x6c && offsetof(struct minisurf_plane, extendedPixels) == 0x88,
@@ -63,6 +64,8 @@ enum {
 	kSurfaceMethodSetIndexedTimestamp = 33,
 	kSurfaceMethodLookupFromPort    = 34,
 	kSurfaceMethodCreatePort        = 35,
+	kSurfaceMethodSharedEventCreate = 36,   /* (options) -> (port name, the value's address): -[IOSurfaceSharedEvent initWithOptions:] */
+	kSurfaceMethodSharedEventInfo   = 38,   /* (port name) -> (0, the value's address, trace id, 0) */
 	kSurfaceMethodDetachModeCode    = 43,
 	kSurfaceMethodSetOwnershipIdentity = 44,
 };
@@ -1006,6 +1009,10 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn trapRemoveCVBridged(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRemoveAttachments(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapUnsupported(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn trapSharedEventWait(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn trapSharedEventSignal(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn methodSharedEventCreate(IOExternalMethodArguments * args);
+	IOReturn methodSharedEventInfo(IOExternalMethodArguments * args);
 	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
 	IOReturn useCountCommon(uint32_t sid, uint32_t category, int delta);
 
@@ -1044,8 +1051,8 @@ IOSurfaceRootUserClient::start(IOService * provider)
 	fTraps[kSurfaceTrapUnlock].func = (IOTrap) & IOSurfaceRootUserClient::trapUnlock;
 	fTraps[kSurfaceTrapDetach].func = (IOTrap) & IOSurfaceRootUserClient::trapDetach;
 	fTraps[kSurfaceTrapRelease].func = (IOTrap) & IOSurfaceRootUserClient::trapRelease;
-	fTraps[kSurfaceTrapSharedEventWait].func = (IOTrap) & IOSurfaceRootUserClient::trapUnsupported;
-	fTraps[kSurfaceTrapSharedEventSignal].func = (IOTrap) & IOSurfaceRootUserClient::trapUnsupported;
+	fTraps[kSurfaceTrapSharedEventWait].func = (IOTrap) & IOSurfaceRootUserClient::trapSharedEventWait;
+	fTraps[kSurfaceTrapSharedEventSignal].func = (IOTrap) & IOSurfaceRootUserClient::trapSharedEventSignal;
 	fTraps[kSurfaceTrapRemoveCVBridged].func = (IOTrap) & IOSurfaceRootUserClient::trapRemoveCVBridged;
 	fTraps[kSurfaceTrapRemoveAttachments].func = (IOTrap) & IOSurfaceRootUserClient::trapRemoveAttachments;
 	fTraps[kSurfaceTrapSignalEvent].func = (IOTrap) & IOSurfaceRootUserClient::trapUnsupported;
@@ -1787,6 +1794,10 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		return methodLookupFromPort(args);
 	case kSurfaceMethodCreatePort:
 		return methodCreatePort(args);
+	case kSurfaceMethodSharedEventCreate:
+		return methodSharedEventCreate(args);
+	case kSurfaceMethodSharedEventInfo:
+		return methodSharedEventInfo(args);
 
 	case kSurfaceMethodSetValue:
 	case kSurfaceMethodCopyValue:
@@ -2076,4 +2087,80 @@ IOSurfaceRootUserClient::trapUnsupported(void * p1, void * p2, void * p3, void *
 		IOLog("MiniIOSurface: an iOS 27 trap (shared event / transaction list) asked for: not served\n");
 	}
 	return kIOReturnUnsupported;
+}
+
+/* ---- shared events (akios_shared_event.cpp): MTLSharedEvent's kernel half ---- */
+
+IOReturn
+IOSurfaceRootUserClient::methodSharedEventCreate(IOExternalMethodArguments * args)
+{
+	IOSurfaceSharedEvent * e;
+	mach_port_name_t name = 0;
+	mach_vm_address_t address;
+
+	if (args->scalarOutputCount < 2) {
+		return kIOReturnBadArgument;
+	}
+	e = IOSurfaceSharedEvent::create();
+	if (e == NULL) {
+		return kIOReturnNoMemory;
+	}
+	address = e->addressInTask(fTask);
+	if (address == 0 || IOUserClient::copyPortNameForObjectInTask(fTask, e, &name) != kIOReturnSuccess) {
+		e->release();
+		return kIOReturnNoMemory;
+	}
+	e->release();                   /* (the port holds it now) */
+	args->scalarOutput[0] = name;
+	args->scalarOutput[1] = address;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOSurfaceRootUserClient::methodSharedEventInfo(IOExternalMethodArguments * args)
+{
+	IOSurfaceSharedEvent * e;
+
+	if (args->scalarInputCount < 1 || args->scalarOutputCount < 4) {
+		return kIOReturnBadArgument;
+	}
+	e = IOSurfaceSharedEvent::fromPortName(fTask, (mach_port_name_t)args->scalarInput[0]);
+	if (e == NULL) {
+		return kIOReturnBadArgument;
+	}
+	args->scalarOutput[0] = 0;
+	args->scalarOutput[1] = e->addressInTask(fTask);
+	args->scalarOutput[2] = e->traceID();
+	args->scalarOutput[3] = 0;
+	e->release();
+	return args->scalarOutput[1] != 0 ? kIOReturnSuccess : kIOReturnNoMemory;
+}
+
+/* (port name, value, milliseconds): -[IOSurfaceSharedEvent waitUntilSignaledValue:timeoutMS:] */
+IOReturn
+IOSurfaceRootUserClient::trapSharedEventWait(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
+{
+	IOSurfaceSharedEvent * e = IOSurfaceSharedEvent::fromPortName(fTask, (mach_port_name_t)(uintptr_t)p1);
+	IOReturn ret;
+
+	if (e == NULL) {
+		return kIOReturnBadArgument;
+	}
+	ret = e->wait((uint64_t)(uintptr_t)p2, (uint32_t)(uintptr_t)p3);
+	e->release();
+	return ret;
+}
+
+/* (port name, value): -[IOSurfaceSharedEvent setSignaledValue:] */
+IOReturn
+IOSurfaceRootUserClient::trapSharedEventSignal(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
+{
+	IOSurfaceSharedEvent * e = IOSurfaceSharedEvent::fromPortName(fTask, (mach_port_name_t)(uintptr_t)p1);
+
+	if (e == NULL) {
+		return kIOReturnBadArgument;
+	}
+	e->signal((uint64_t)(uintptr_t)p2);
+	e->release();
+	return kIOReturnSuccess;
 }

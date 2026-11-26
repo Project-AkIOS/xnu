@@ -83,6 +83,7 @@ iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
 iokit/Kernel/GenericARMPE.cpp			optional iokitcpp
 iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
 iokit/Kernel/akios_iogpu.cpp			optional iokitcpp
+iokit/Kernel/akios_shared_event.cpp		optional iokitcpp
 iokit/Kernel/MiniIOMedia.cpp			optional iokitcpp
 iokit/Kernel/AkitaUFSStorage.cpp		optional iokitcpp
 iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
