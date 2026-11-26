@@ -79,6 +79,7 @@ public:
 		uint32_t length;
 		uint64_t token;                 /* the "completed" block, echoed back */
 		uint64_t startNs;
+		uint64_t number;                /* the client's submission number (deferred frees wait for it) */
 		IOSharedDataQueue *nq;          /* held */
 		uint32_t waits, signals;
 		struct eventOp wait[kMaxEventOps], signal[kMaxEventOps];
@@ -105,6 +106,7 @@ public:
 	static void notify(IOSharedDataQueue *nq, uint64_t token, uint64_t startNs, uint64_t endNs, uint32_t status);
 	/* (fSubmitLock held) p filled in, owner and nq held by it: to the GPU now if nothing holds it back, else later */
 	void queuePending(struct pending *p);
+	uint64_t oldestPendingNumber(OSObject *owner);
 	/* a queue going: wait for its work (2 s at most), then complete what is left with an error */
 	void drainQueue(OSObject *owner, uint32_t queueID);
 

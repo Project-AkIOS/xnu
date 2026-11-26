@@ -131,6 +131,22 @@ waitsMet(struct IOGPU::pending *p)
 	return true;
 }
 
+/* the lowest number of the client's submissions not yet completed (~0: none out) */
+uint64_t
+IOGPU::oldestPendingNumber(OSObject *owner)
+{
+	uint64_t oldest = ~0ULL;
+
+	IOLockLock(fSubmitLock);
+	for (struct pending *p = fPending; p != NULL; p = p->next) {
+		if (p->owner == owner && p->number < oldest) {
+			oldest = p->number;
+		}
+	}
+	IOLockUnlock(fSubmitLock);
+	return oldest;
+}
+
 void
 IOGPU::queuePending(struct pending *p)
 {
@@ -181,11 +197,20 @@ IOGPU::completeReached(bool all)
 		} else if (p->hq < 0 || (!p->onGPU && all)) {
 			status = 1;                             /* (its queue went before it ran) */
 		} else if (p->length != 0 && hardwareQueueReached(p->hq) < p->seqno) {
-			if (!all) {
+			/*
+			 * The watchdog: a submission the GPU has not passed in 10 s is completed with an error (Metal's
+			 * MTLCommandBufferErrorTimeout), so its program does not wait for good; the queue's later work keeps its
+			 * order behind it on the GPU.
+			 */
+			if (!all && nowNs() - p->startNs < 10 * NSEC_PER_SEC) {
 				pp = &p->next;
 				continue;
 			}
-			status = 1;
+			if (!all && said++ < 8) {
+				IOLog("IOGPU: a command buffer (hardware queue %d, %llu) not done after 10 s: completed with an error\n",
+				    p->hq, p->seqno);
+			}
+			status = all ? 1 : 2;           /* kIOGPUCommandBufferCallbackErrorTimeout */
 		} else if (p->length != 0 && hardwareQueueFaulted(p->hq, p->seqno)) {
 			status = 0xb;                           /* PageFault */
 		}
@@ -450,7 +475,12 @@ class IOGPUDeviceUserClient : public IOUserClient
 		uint64_t gpuBase, gpuLength;    /* the GPU mapping (page-aligned) */
 		uint32_t sharedSlot;            /* in the client-shared blocks */
 		bool prepared;
+		struct resource *nextDeferred;
+		uint64_t deferredUntil;         /* freed once every submission of the client numbered below this is done */
 	};
+	struct resource *fDeferred;     /* deleted while the GPU may still use them */
+	uint64_t fSubmissions;          /* this client's submissions so far (numbers 1, 2, ...; under the submission lock) */
+	void freeDeferred(bool all);
 	struct resource **fResources;
 	uint32_t fResourceCount;        /* entries in fResources */
 	int fAS;                        /* the GPU address space (-1: not made yet) */
@@ -640,6 +670,9 @@ IOGPUDeviceUserClient::releaseAll(void)
 	}
 	for (uint32_t i = 1; i <= kMaxNotificationQueues; i++) {
 		destroyNotificationQueue(i);
+	}
+	if (fLock != NULL && fGPU != NULL) {
+		freeDeferred(true);     /* (the queues are drained or given up by now) */
 	}
 	if (fLock != NULL) {
 		IOLockLock(fLock);
@@ -1222,6 +1255,38 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 	return kIOReturnSuccess;
 }
 
+/*
+ * (fLock not held) The resources deleted while the GPU might still use them are freed once every submission the client
+ * had made by then is done: IOGPU.framework deletes a resource as soon as its last Metal object goes, which can be
+ * before the command buffers that use it have run (it never waits: "Resource freed while busy" is an assertion).
+ */
+void
+IOGPUDeviceUserClient::freeDeferred(bool all)
+{
+	uint64_t oldest = all ? ~0ULL : fGPU->oldestPendingNumber(this);
+	struct resource *done = NULL, **pp;
+
+	IOLockLock(fLock);
+	for (pp = &fDeferred; *pp != NULL;) {
+		struct resource *r = *pp;
+
+		if (r->deferredUntil <= oldest) {
+			*pp = r->nextDeferred;
+			r->nextDeferred = done;
+			done = r;
+		} else {
+			pp = &r->nextDeferred;
+		}
+	}
+	while (done != NULL) {
+		struct resource *r = done;
+
+		done = r->nextDeferred;
+		releaseResource(r);
+	}
+	IOLockUnlock(fLock);
+}
+
 IOReturn
 IOGPUDeviceUserClient::deleteResource(uint32_t id)
 {
@@ -1233,9 +1298,15 @@ IOGPUDeviceUserClient::deleteResource(uint32_t id)
 		fResources[id - 1] = NULL;
 	}
 	if (r != NULL) {
-		releaseResource(r);
+		/* (its id is free again at once; its memory and GPU mapping wait for the submissions made so far) */
+		fGPU->lockSubmissions();
+		r->deferredUntil = fSubmissions + 1;
+		fGPU->unlockSubmissions();
+		r->nextDeferred = fDeferred;
+		fDeferred = r;
 	}
 	IOLockUnlock(fLock);
+	freeDeferred(false);
 	/* (never kIOReturnBusy: IOGPU.framework asserts "Resource freed while busy" on it) */
 	return r != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
 }
@@ -1667,11 +1738,13 @@ IOGPUDeviceUserClient::submit(uint32_t queueID, const uint8_t *args, uint32_t ar
 		p->startNs = start;
 		kernelCommands(&a, p);
 		fGPU->lockSubmissions();
+		p->number = ++fSubmissions;     /* (numbered and queued under one lock: a delete sees both or neither) */
 		IOGPU::notify(nq, a.scheduledToken, start, start, 0);
 		fGPU->queuePending(p);
 		fGPU->unlockSubmissions();
 	}
 	nq->release();
+	freeDeferred(false);
 	return kIOReturnSuccess;
 }
 
