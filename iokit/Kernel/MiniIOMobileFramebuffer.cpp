@@ -36,6 +36,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include "akios_iogpu.h"
+#include "akios_shared_event.h"
 
 #include "MiniIOSurface.h"
 
@@ -90,6 +91,92 @@ enum {
 #define SWAP27_LIMIT_SET        0x359
 #define SWAP27_BRIGHTNESS       0x35e
 #define SWAP27_LIMIT            0x376
+
+/*
+ * The swap's GPU fences (IOMobileFramebufferSwapSetEventWait / SwapSetEventSignal / ...SignalOnGlass): shared events
+ * (akios_shared_event.cpp) by their port names in the caller's task, with values. The display waits for each layer's
+ * wait value before it shows the frame (the GPU has drawn it), signals "on glass" once the frame is on the panel, and
+ * each layer's signal value when it lets go of that layer's surface. A swap that is not shown signals all at once.
+ */
+#define SWAP27_WAIT_VALUE(l)    (0x50 + 8 * (l))
+#define SWAP27_GLASS_VALUE      0x70
+#define SWAP27_SIGNAL_VALUE(l)  (0x78 + 8 * (l))
+#define SWAP27_WAIT_PORT(l)     (0x2a8 + 4 * (l))
+#define SWAP27_GLASS_PORT       0x2b8
+#define SWAP27_SIGNAL_PORT(l)   (0x2bc + 4 * (l))
+
+struct swap_events {
+	IOSurfaceSharedEvent * wait[4];
+	uint64_t waitValue[4];
+	IOSurfaceSharedEvent * signal[4];
+	uint64_t signalValue[4];
+	IOSurfaceSharedEvent * glass;
+	uint64_t glassValue;
+};
+
+static void
+swapEventsFrom27(const uint8_t * req, task_t task, struct swap_events * ev)
+{
+	bzero(ev, sizeof(*ev));
+	for (unsigned l = 0; l < 4; l++) {
+		uint32_t wp = *(const uint32_t *) (req + SWAP27_WAIT_PORT(l)), sp = *(const uint32_t *) (req + SWAP27_SIGNAL_PORT(l));
+
+		if (wp != 0) {
+			ev->wait[l] = IOSurfaceSharedEvent::fromPortName(task, wp);
+			ev->waitValue[l] = *(const uint64_t *) (req + SWAP27_WAIT_VALUE(l));
+		}
+		if (sp != 0) {
+			ev->signal[l] = IOSurfaceSharedEvent::fromPortName(task, sp);
+			ev->signalValue[l] = *(const uint64_t *) (req + SWAP27_SIGNAL_VALUE(l));
+		}
+	}
+	if (*(const uint32_t *) (req + SWAP27_GLASS_PORT) != 0) {
+		ev->glass = IOSurfaceSharedEvent::fromPortName(task, *(const uint32_t *) (req + SWAP27_GLASS_PORT));
+		ev->glassValue = *(const uint64_t *) (req + SWAP27_GLASS_VALUE);
+	}
+}
+
+/* the GPU's signals for the frame, SWAP_GPU_MS at most for all of them; false if one was not reached */
+static bool
+swapEventsWait(struct swap_events * ev, uint32_t ms)
+{
+	uint64_t deadline, now;
+	bool all = true;
+
+	clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+	for (unsigned l = 0; l < 4; l++) {
+		if (ev->wait[l] != NULL) {
+			uint64_t left;
+
+			now = mach_absolute_time();
+			absolutetime_to_nanoseconds(deadline > now ? deadline - now : 0, &left);
+			all = ev->wait[l]->wait(ev->waitValue[l], (uint32_t) (left / NSEC_PER_MSEC)) == kIOReturnSuccess && all;
+		}
+	}
+	return all;
+}
+
+static void
+swapEventsGlass(struct swap_events * ev)
+{
+	if (ev->glass != NULL) {
+		ev->glass->signal(ev->glassValue);
+	}
+}
+
+/* each layer's surface let go of: its signal; then the events dropped */
+static void
+swapEventsDone(struct swap_events * ev)
+{
+	for (unsigned l = 0; l < 4; l++) {
+		if (ev->signal[l] != NULL) {
+			ev->signal[l]->signal(ev->signalValue[l]);
+		}
+		OSSafeReleaseNULL(ev->signal[l]);
+		OSSafeReleaseNULL(ev->wait[l]);
+	}
+	OSSafeReleaseNULL(ev->glass);
+}
 
 #define kFBNotifyVSync          5
 #define kFBNotifyTypes          8
@@ -617,6 +704,7 @@ public:
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
+	struct swap_events fSwapEvents[SWAP_QUEUE];             /* ... and their fences (held) */
 	unsigned        fSwapFirst, fSwapsWaiting;
 	uint32_t        fSwapPresentedID, fSwapShownID;   /* (SwapWait: the last swap handed over, and the last on the panel) */
 	uint32_t        fSwapScannedID;         /* (fb_swapwait=3: the last swap the panel has begun to read, the one before let go of) */
@@ -680,7 +768,7 @@ public:
 	void publishModes(void);
 	void publishRefresh(void);
 	MiniIOSurface * defaultSurface(void);
-	void present(const uint8_t * swap);
+	void present(const uint8_t * swap, struct swap_events * events = NULL);
 	IOReturn swapWait(uint32_t id, uint32_t flags);
 	IOReturn swapPoll(uint32_t id, uint32_t flags);
 	void swapScanned(uint32_t id);
@@ -2105,8 +2193,14 @@ IOMobileFramebuffer::swapWait(uint32_t id, uint32_t flags)
 
 /* SwapEnd: the swap is handed to the thread that puts frames on the panel, as soon as that has no other waiting. */
 void
-IOMobileFramebuffer::present(const uint8_t * swap)
+IOMobileFramebuffer::present(const uint8_t * swap, struct swap_events * events)
 {
+	struct swap_events none;
+
+	if (events == NULL) {
+		bzero(&none, sizeof(none));
+		events = &none;
+	}
 	AbsoluteTime deadline;
 
 	uint64_t now = mach_absolute_time(), period, pause;
@@ -2150,6 +2244,8 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 			IOLockWakeup(fSwapLock, &fSwapShownID, false);
 			IOLockWakeup(fSwapLock, &fSwapScannedID, false);
 			IOLockUnlock(fSwapLock);
+			swapEventsGlass(events);        /* (not shown: nobody may wait for it) */
+			swapEventsDone(events);
 			return;
 		}
 	}
@@ -2159,6 +2255,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	gFBPresented = fSwapPresentedID;
 	gFBPresentedSurface = swapWord(swap, SWAP_SURFACE(0));
 	memcpy(fSwap[slot], swap, SWAP_SIZE);
+	fSwapEvents[slot] = *events;            /* (the slot holds them now) */
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 
@@ -2193,6 +2290,7 @@ IOMobileFramebuffer::presenter(void)
 	uint64_t lastFrame = 0, settleTime;
 	unsigned fastFrames = 0;
 	uint32_t shownDrawn[SWAP_LAYERS] = { 0 };       /* what the GPU had last been asked to draw into the surfaces on the panel */
+	struct swap_events events;
 
 	nanoseconds_to_absolutetime(SETTLE_MS * NSEC_PER_MSEC, &settleTime);
 
@@ -2252,7 +2350,14 @@ IOMobileFramebuffer::presenter(void)
 		IOLockLock(fSwapLock);
 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
+		events = fSwapEvents[fSwapFirst];
+		bzero(&fSwapEvents[fSwapFirst], sizeof(events));
 		IOLockUnlock(fSwapLock);
+		/* the GPU's own word that it has drawn the frame, before the surfaces' guess (MiniIOSurfaceDrawn, in show) */
+		if (!swapEventsWait(&events, SWAP_GPU_MS)) {
+			IOLog("MiniIOMobileFramebuffer: swap %u: its GPU fences not reached after %u ms; shown as it is\n",
+			    swapWord(swap, SWAP_ID), SWAP_GPU_MS);
+		}
 		{
 			uint64_t now = mach_absolute_time();
 
@@ -2263,6 +2368,7 @@ IOMobileFramebuffer::presenter(void)
 			}
 			show(swap, surfaces);
 			lastFrame = mach_absolute_time();
+			swapEventsGlass(&events);
 		}
 		unsettled = gFilter == 2 && !fFilterFrame;
 		/*
@@ -2278,6 +2384,7 @@ IOMobileFramebuffer::presenter(void)
 				surfaces[layer] = NULL;
 			}
 		}
+		swapEventsDone(&events);                /* (the surfaces are the caller's again) */
 		MiniIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
 	}
 }
@@ -3083,9 +3190,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			if (legacy == NULL) {
 				return kIOReturnNoMemory;
 			}
+			struct swap_events events;
+
 			swapFrom27((const uint8_t *) args->structureInput, legacy);
+			swapEventsFrom27((const uint8_t *) args->structureInput, fTask, &events);
 			swapBrightness(legacy);
-			fOwner->present(legacy);
+			fOwner->present(legacy, &events);
 			IOFree(legacy, SWAP_SIZE);
 			return kIOReturnSuccess;
 		}
