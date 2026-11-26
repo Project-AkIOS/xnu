@@ -9,6 +9,7 @@
  */
 #include "akios_iogpu.h"
 #include "MiniIOSurface.h"
+#include "akios_shared_event.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
@@ -93,55 +94,110 @@ IOGPU::notify(IOSharedDataQueue *nq, uint64_t token, uint64_t startNs, uint64_t 
 	}
 }
 
-void
-IOGPU::addPending(OSObject *owner, uint32_t queueID, int hq, uint64_t seqno, uint64_t token, uint64_t startNs,
-    IOSharedDataQueue *nq)
+static void
+releasePending(struct IOGPU::pending *p)
 {
-	struct pending *p = (struct pending *)IOMallocZero(sizeof(*p));
-
-	if (p == NULL) {
-		notify(nq, token, startNs, nowNs(), 1);
-		return;
+	for (uint32_t i = 0; i < p->waits; i++) {
+		OSSafeReleaseNULL(p->wait[i].event);
 	}
-	owner->retain();
-	nq->retain();
-	p->owner = owner;
-	p->queueID = queueID;
-	p->hq = hq;
-	p->seqno = seqno;
-	p->token = token;
-	p->startNs = startNs;
-	p->nq = nq;
-	p->next = fPending;
-	fPending = p;
+	for (uint32_t i = 0; i < p->signals; i++) {
+		OSSafeReleaseNULL(p->signal[i].event);
+	}
+	OSSafeReleaseNULL(p->nq);
+	OSSafeReleaseNULL(p->owner);
+	IOFree(p, sizeof(*p));
+}
+
+/* (fSubmitLock held) is something of p's queue ahead of it still waiting to go to the GPU? */
+static bool
+heldBack(struct IOGPU::pending *list, struct IOGPU::pending *p)
+{
+	for (struct IOGPU::pending *q = list; q != NULL && q != p; q = q->next) {
+		if (q->owner == p->owner && q->queueID == p->queueID && !q->onGPU && q->hq >= 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+waitsMet(struct IOGPU::pending *p)
+{
+	for (uint32_t i = 0; i < p->waits; i++) {
+		if (p->wait[i].event->value() < p->wait[i].value) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void
+IOGPU::queuePending(struct pending *p)
+{
+	struct pending **pp = &fPending;
+
+	while (*pp != NULL) {
+		pp = &(*pp)->next;              /* (oldest first: a queue's buffers keep their order) */
+	}
+	p->next = NULL;
+	*pp = p;
+	completeReached(false);         /* (to the GPU at once when nothing holds it back) */
 	thread_wakeup(&fPending);
 }
 
-/* (fSubmitLock held) the submissions the GPU has passed get their "completed" notification; all: every one */
+/*
+ * (fSubmitLock held) Moves every command buffer on: one whose waits are met (and nothing of its queue ahead of it
+ * waits) goes to the GPU; one the GPU has passed signals its events and gets its "completed" notification.
+ * all: every one completes now (with an error if the GPU had not passed it).
+ */
 void
 IOGPU::completeReached(bool all)
 {
 	struct pending **pp = &fPending, *p;
+	static int said;
 
 	while ((p = *pp) != NULL) {
 		uint32_t status = 0;
 
-		if (p->hq < 0) {
-			status = 1;                     /* (its queue went before the GPU said) */
-		} else if (hardwareQueueReached(p->hq) < p->seqno) {
+		if (p->hq >= 0 && !p->onGPU && !all) {
+			if (heldBack(fPending, p) || !waitsMet(p)) {
+				pp = &p->next;
+				continue;
+			}
+			if (p->length != 0) {
+				p->seqno = submitToHardwareQueue(p->hq, p->stream, p->length);
+				if (p->seqno == 0) {
+					if (said++ < 8) {
+						IOLog("IOGPU: a stream (0x%llx, %u bytes) was refused by the GPU's queue\n", p->stream, p->length);
+					}
+					status = 0xa;                   /* InvalidInput */
+				}
+			}
+			p->onGPU = true;
+			if (status == 0 && p->length != 0) {
+				pp = &p->next;
+				continue;                       /* (looked at again below on a later pass) */
+			}
+		} else if (p->hq < 0 || (!p->onGPU && all)) {
+			status = 1;                             /* (its queue went before it ran) */
+		} else if (p->length != 0 && hardwareQueueReached(p->hq) < p->seqno) {
 			if (!all) {
 				pp = &p->next;
 				continue;
 			}
 			status = 1;
-		} else if (hardwareQueueFaulted(p->hq, p->seqno)) {
-			status = 0xb;                   /* kIOGPUCommandBufferCallbackErrorPageFault: MTLCommandBufferErrorPageFault */
+		} else if (p->length != 0 && hardwareQueueFaulted(p->hq, p->seqno)) {
+			status = 0xb;                           /* PageFault */
+		}
+		/* its events signalled first, then the notification (Apple's order: stamps, then the entry) */
+		if (status == 0) {
+			for (uint32_t i = 0; i < p->signals; i++) {
+				p->signal[i].event->signal(p->signal[i].value);
+			}
 		}
 		notify(p->nq, p->token, p->startNs, nowNs(), status);
 		*pp = p->next;
-		p->nq->release();
-		p->owner->release();
-		IOFree(p, sizeof(*p));
+		releasePending(p);
 	}
 }
 
@@ -179,9 +235,15 @@ IOGPU::drainQueue(OSObject *owner, uint32_t queueID)
 		IOLockLock(fSubmitLock);
 		completeReached(false);
 		for (struct pending *p = fPending; p != NULL; p = p->next) {
-			left |= p->owner == owner && p->queueID == queueID;
+			left |= p->owner == owner && p->queueID == queueID && p->onGPU;
 		}
 		if (!left) {
+			for (struct pending *p = fPending; p != NULL; p = p->next) {
+				if (p->owner == owner && p->queueID == queueID) {
+					p->hq = -1;             /* (still waiting for events: given up) */
+				}
+			}
+			completeReached(false);
 			IOLockUnlock(fSubmitLock);
 			return;
 		}
@@ -196,7 +258,7 @@ IOGPU::drainQueue(OSObject *owner, uint32_t queueID)
 	}
 	completeReached(false);
 	IOLockUnlock(fSubmitLock);
-	IOLog("IOGPU: a command queue went with work the GPU had not finished in 2 s\n");
+	IOLog("IOGPU: a command queue went with work not finished in 2 s, or waiting for events\n");
 }
 
 /*
@@ -402,6 +464,7 @@ class IOGPUDeviceUserClient : public IOUserClient
 	void deleteQueue(uint32_t id);
 	void destroyNotificationQueue(uint32_t id);
 	IOReturn submit(uint32_t queueID, const uint8_t *args, uint32_t argsSize, uint32_t count);
+	void kernelCommands(const struct IOGPUCommandBufferArgs *a, struct IOGPU::pending *p);
 
 	static const IOExternalTrap sTraps[14];
 	IOReturn t_submit_command_buffer(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
@@ -1425,6 +1488,94 @@ struct IOGPUCommandBufferArgs {
 	uint32_t streamFlags;           /* +0x3c */
 };
 
+/*
+ * A command buffer's kernel commands, as its segment list names them (records: control word at +0xc; bit 30 with
+ * kind 1 a list of byte ranges of the kernel-command shmem, kind 2 the end; bit 30 clear a resource segment list of
+ * low30 bytes; bit 31 the last). Each command is {u32 type, u32 size, payload}. Kept: 3 (signal a shared event) and
+ * 0xb (the same with an agent mask) -- signalled when the GPU has passed the buffer; 4 (wait for one) -- the buffer
+ * goes to the GPU once it is reached; 0xd (signal when scheduled) -- at once. The buffer runs as one stream, so its
+ * waits hold back all of it and its signals come after all of it: later than Apple's, never too early.
+ * The rest (0xf resource groups, 2 sleep, 8 purged, 9 protection, 0xe responsible tasks, ...) is not acted on yet.
+ */
+void
+IOGPUDeviceUserClient::kernelCommands(const struct IOGPUCommandBufferArgs *a, struct IOGPU::pending *p)
+{
+	const uint8_t *seg, *kcmd;
+	uint64_t segLen, kcmdLen, off = 0;
+	static int said;
+
+	IOLockLock(fLock);
+	if (a->segmentListShmem < 1 || a->segmentListShmem > kMaxShmem || a->kernelCommandsShmem < 1 ||
+	    a->kernelCommandsShmem > kMaxShmem || fShmem[a->segmentListShmem - 1].memory == NULL ||
+	    fShmem[a->kernelCommandsShmem - 1].memory == NULL) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	seg = (const uint8_t *)fShmem[a->segmentListShmem - 1].memory->getBytesNoCopy();
+	segLen = fShmem[a->segmentListShmem - 1].memory->getLength();
+	kcmd = (const uint8_t *)fShmem[a->kernelCommandsShmem - 1].memory->getBytesNoCopy();
+	kcmdLen = fShmem[a->kernelCommandsShmem - 1].memory->getLength();
+
+	while (off + 0x10 <= segLen) {
+		uint32_t ctl = *(const uint32_t *)(seg + off + 0xc), kind = ctl & 0x3fffffff;
+
+		if (!(ctl & (1u << 30))) {
+			if (kind < 0x10 || kind > segLen - off) {
+				break;
+			}
+			off += kind;                            /* (resources: residency, later) */
+		} else if (kind == 1) {
+			uint32_t n = *(const uint32_t *)(seg + off + 8);
+
+			if (off + 0x10 + 8ULL * n > segLen) {
+				break;
+			}
+			for (uint32_t r = 0; r < n; r++) {
+				uint32_t begin = *(const uint32_t *)(seg + off + 0x10 + 8 * r);
+				uint32_t end = *(const uint32_t *)(seg + off + 0x14 + 8 * r);
+
+				for (uint64_t c = begin; c + 8 <= end && end <= kcmdLen;) {
+					uint32_t type = *(const uint32_t *)(kcmd + c), size = *(const uint32_t *)(kcmd + c + 4);
+
+					if (size < 8 || (size & 3) || c + size > end) {
+						break;
+					}
+					if ((type == 3 || type == 4 || type == 0xb || type == 0xd) && size >= 0x18) {
+						uint32_t port = *(const uint32_t *)(kcmd + c + 8);
+						uint64_t value = *(const uint64_t *)(kcmd + c + 0x10);
+						IOSurfaceSharedEvent *e = IOSurfaceSharedEvent::fromPortName(fTask, port);
+
+						if (e == NULL) {
+							if (said++ < 8) {
+								IOLog("IOGPU: kernel command %u names no shared event (port 0x%x)\n", type, port);
+							}
+						} else if (type == 0xd) {
+							e->signal(value);
+							e->release();
+						} else if (type == 4 && p->waits < IOGPU::kMaxEventOps) {
+							p->wait[p->waits].event = e;
+							p->wait[p->waits++].value = value;
+						} else if (type != 4 && p->signals < IOGPU::kMaxEventOps) {
+							p->signal[p->signals].event = e;
+							p->signal[p->signals++].value = value;
+						} else {
+							e->release();
+						}
+					}
+					c += size;
+				}
+			}
+			off += 0x10 + 8ULL * n;
+		} else {
+			break;                                  /* (kind 2: the end) */
+		}
+		if (ctl & (1u << 31)) {
+			break;
+		}
+	}
+	IOLockUnlock(fLock);
+}
+
 IOReturn
 IOGPUDeviceUserClient::submit(uint32_t queueID, const uint8_t *args, uint32_t argsSize, uint32_t count)
 {
@@ -1452,25 +1603,32 @@ IOGPUDeviceUserClient::submit(uint32_t queueID, const uint8_t *args, uint32_t ar
 	}
 	for (uint32_t i = 0; i < count; i++) {
 		IOGPUCommandBufferArgs a;
-		uint64_t start = IOGPU::nowNs(), seqno = 0;
+		struct IOGPU::pending *p = (struct IOGPU::pending *)IOMallocZero(sizeof(*p));
+		uint64_t start = IOGPU::nowNs();
 
 		bzero(&a, sizeof(a));
 		memcpy(&a, args + (size_t)i * argsSize, argsSize);
-		if (a.streamLength != 0) {
-			seqno = fGPU->submitToHardwareQueue(q.hq, a.stream, a.streamLength);
-			if (seqno == 0 && said++ < 8) {
-				IOLog("IOGPU: a stream (0x%llx, %u bytes) was refused by the GPU's queue\n", a.stream, a.streamLength);
-			}
+		if (p == NULL) {
+			fGPU->lockSubmissions();
+			IOGPU::notify(nq, a.scheduledToken, start, start, 0);
+			IOGPU::notify(nq, a.completedToken, start, start, 1);
+			fGPU->unlockSubmissions();
+			continue;
 		}
+		retain();
+		nq->retain();
+		p->owner = this;
+		p->nq = nq;
+		p->queueID = queueID;
+		p->hq = q.hq;
+		p->stream = a.stream;
+		p->length = a.streamLength;
+		p->token = a.completedToken;
+		p->startNs = start;
+		kernelCommands(&a, p);
 		fGPU->lockSubmissions();
 		IOGPU::notify(nq, a.scheduledToken, start, start, 0);
-		if (a.streamLength == 0) {
-			IOGPU::notify(nq, a.completedToken, start, IOGPU::nowNs(), 0);   /* nothing for the GPU to do */
-		} else if (seqno == 0) {
-			IOGPU::notify(nq, a.completedToken, start, IOGPU::nowNs(), 0xa); /* InvalidInput */
-		} else {
-			fGPU->addPending(this, queueID, q.hq, seqno, a.completedToken, start, nq);
-		}
+		fGPU->queuePending(p);
 		fGPU->unlockSubmissions();
 	}
 	nq->release();

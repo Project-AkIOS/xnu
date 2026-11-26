@@ -61,17 +61,29 @@ protected:
 	IOBufferMemoryDescriptor *fStamps;      /* u32 stamps that the GPU's completions advance; mapped read-only into clients */
 	void retireStandIns(void);
 
-	/* submitted command buffers waiting for the GPU (completionThread posts their "completed" notifications) */
+	/*
+	 * Command buffers between submission and completion, oldest first: waiting for shared events before they go to
+	 * the GPU (held back in their queue's order), or on the GPU. completionThread moves them on.
+	 */
+public:
+	enum { kMaxEventOps = 8 };
+	struct eventOp { class IOSurfaceSharedEvent *event; uint64_t value; };       /* (event held) */
 	struct pending {
 		struct pending *next;
-		OSObject *owner;                /* the user client (held): its queue, for draining at delete */
+		OSObject *owner;                /* the user client (held) */
 		uint32_t queueID;
 		int hq;                         /* -1: given up (its queue went): completes with an error at once */
+		bool onGPU;                     /* submitted to hq (seqno) */
 		uint64_t seqno;
+		uint64_t stream;                /* what goes to the GPU once the waits are met (length 0: nothing) */
+		uint32_t length;
 		uint64_t token;                 /* the "completed" block, echoed back */
 		uint64_t startNs;
 		IOSharedDataQueue *nq;          /* held */
+		uint32_t waits, signals;
+		struct eventOp wait[kMaxEventOps], signal[kMaxEventOps];
 	};
+protected:
 	struct pending *fPending;
 	IOLock *fSubmitLock;                    /* fPending, and every notification queue's enqueue and port */
 	thread_t fCompletionThread;
@@ -91,8 +103,8 @@ public:
 	void unlockSubmissions(void) { IOLockUnlock(fSubmitLock); }
 	/* (fSubmitLock held) */
 	static void notify(IOSharedDataQueue *nq, uint64_t token, uint64_t startNs, uint64_t endNs, uint32_t status);
-	void addPending(OSObject *owner, uint32_t queueID, int hq, uint64_t seqno, uint64_t token, uint64_t startNs,
-	    IOSharedDataQueue *nq);
+	/* (fSubmitLock held) p filled in, owner and nq held by it: to the GPU now if nothing holds it back, else later */
+	void queuePending(struct pending *p);
 	/* a queue going: wait for its work (2 s at most), then complete what is left with an error */
 	void drainQueue(OSObject *owner, uint32_t queueID);
 
