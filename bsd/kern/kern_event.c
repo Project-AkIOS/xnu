@@ -8922,12 +8922,17 @@ kev_post_msg_internal(struct kev_msg *event_msg, int wait)
 		total_size += event_msg->dv[i].data_length;
 	}
 
-	if (total_size > MLEN) {
+	/*
+	 * AkIOS (11-26): up to a cluster, not only a small mbuf. iOS 27's IO80211.framework wants Apple80211's
+	 * assoc-done event with 0x21c bytes behind it (on an iPhone that event comes through the driver's event pipe);
+	 * posted as a kernel event of more than MLEN it was refused here, and every Wi-Fi join timed out unanswered.
+	 */
+	if (total_size > MCLBYTES) {
 		os_atomic_inc(&kevtstat.kes_toobig, relaxed);
 		return EMSGSIZE;
 	}
 
-	m = m_get(wait, MT_DATA);
+	m = total_size > MLEN ? m_getcl(wait, MT_DATA, 0) : m_get(wait, MT_DATA);
 	if (m == 0) {
 		os_atomic_inc(&kevtstat.kes_nomem, relaxed);
 		return ENOMEM;

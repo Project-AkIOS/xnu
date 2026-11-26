@@ -380,6 +380,17 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 	result->ssid_length = bss->ssid_length;
 	memcpy(result->ssid, bss->ssid, bss->ssid_length);
 	result->age_ms = bss->age_ms;
+	/*
+	 * (11-26) when it was heard, on the clock CoreWiFi measures a result's age by (mach_continuous_time, the boot's):
+	 * left 0, every result was as old as the boot, and auto-join's maxAge filter threw them all out ("All scan
+	 * results are filtered out"), so a known network was never rejoined. The station's age in ms taken off now.
+	 */
+	{
+		uint64_t now = mach_continuous_time(), ago;
+
+		nanoseconds_to_absolutetime((uint64_t)bss->age_ms * NSEC_PER_MSEC, &ago);
+		result->timestamp = now > ago ? now - ago : 0;
+	}
 	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
 	memcpy(result->elements, bss->elements, result->elements_length);
 	/* (11-26) the kinds it speaks: by band and rates, then HT (element 45) and VHT (element 191) */
@@ -528,11 +539,23 @@ get(struct apple80211req *request)
 		kfree_data(answer, sizeof(*answer));
 		return error;
 	}
-	case 21:                                /* how the last join went (0: not over yet) */
+	case 21: {                              /* how the last join went */
+		/*
+		 * (11-26) iOS 27 reads it as STATE: {version, result} in a 16-byte buffer, the result at offset 4
+		 * (_dispatchAsyncAssocEvent: RawGet 21, then __errorForAssociateResult), and 0xffff means "not over yet, ask
+		 * again". Answered in req_val only, the buffer stayed empty: a join that worked was reported failed (error
+		 * -3902), Settings said "Failed to join" and wifid never saved the network, so it never rejoined it.
+		 */
+		struct {
+			uint32_t version, result;
+		} answer = { .version = 1 };
+
 		lck_mtx_lock(&apple80211_lock);
-		request->req_val = (int32_t)join_result;
+		answer.result = join_result != 0 ? join_result : 0xffff;
 		lck_mtx_unlock(&apple80211_lock);
-		return 0;
+		request->req_val = (int32_t)answer.result;
+		return request->req_len >= sizeof(answer) ? give(request, &answer, sizeof(answer)) : 0;
+	}
 	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
 		struct hakios_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
 		unsigned index;
@@ -810,7 +833,18 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 		lck_mtx_lock(&apple80211_lock);
 		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
 		lck_mtx_unlock(&apple80211_lock);
-		post(EVENT_ASSOC_DONE, NULL, 0);
+		{
+			/*
+			 * (11-26) iOS 27's assoc-done event carries 0x21c bytes (_dispatchAsyncAssocEvent: ten records of 0x34
+			 * bytes about the access points tried, then words at 0x208..0x218, 0x210 an extended status of
+			 * 1000-1010 when there is one) and only then asks ASSOCIATE_RESULT how the join went. With no data it
+			 * gave up at once with -3902 ("not supported", join_status 0xaaaaaaaa): every join reported failed.
+			 * All zeros: no records, no extended status; the outcome is request 21's.
+			 */
+			static const uint8_t assoc_done[0x21c];
+
+			post(EVENT_ASSOC_DONE, assoc_done, sizeof(assoc_done));
+		}
 		break;
 	case HAKIOS_STA_LINK: {
 		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
