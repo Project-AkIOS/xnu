@@ -545,6 +545,8 @@ public:
 	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
 	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
 	virtual IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+	/* IOConnectGetService: the GPU (the driver reads the GPU's description from its properties) */
+	virtual IOService *getService(void) APPLE_KEXT_OVERRIDE { return fGPU; }
 	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon) APPLE_KEXT_OVERRIDE;
 };
