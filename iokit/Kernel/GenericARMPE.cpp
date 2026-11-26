@@ -328,6 +328,31 @@ GenericARMPE::start(IOService * provider)
 	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */
 	registerService();
 
+	/*
+	 * (11-26) /arm-io's children: on an iPhone AppleARMIO publishes each one as a nub (AppleARMIODevice) that its driver
+	 * matches by name. Here, so far, only those a driver of this kernel matches and that are wanted as services: "bluetooth"
+	 * (AppleBluetoothModule; bluetoothd looks it up by name). Each is a device-tree nub as the top-level ones are, attached
+	 * to this platform expert (an IOPlatformDevice asks its provider to compare names: it has to be the expert, not the
+	 * arm-io nub); in the device tree it stays where it is, IODeviceTree:/arm-io/bluetooth.
+	 */
+	{
+		static const char * const armio[] = { "/arm-io/bluetooth" };
+
+		for (unsigned int i = 0; i < sizeof(armio) / sizeof(armio[0]); i++) {
+			IORegistryEntry * entry = IORegistryEntry::fromPath(armio[i], gIODTPlane);
+			IOService * nub = entry != NULL ? createNub(entry) : NULL;
+
+			if (nub != NULL) {
+				if (nub->attach(this)) {
+					nub->registerService();
+					IOLog("GenericARMPE: %s published\n", armio[i]);
+				}
+				nub->release();
+			}
+			OSSafeReleaseNULL(entry);
+		}
+	}
+
 	/* Stand-ins for the closed graphics drivers that the Darwin window server talks to. */
 	MiniIOSurfaceStart(this);
 	MiniIOMobileFramebufferStart(this);

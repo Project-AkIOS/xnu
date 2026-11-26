@@ -330,11 +330,10 @@ struct hakios_bt_platform {                     /* (hakios.bthost.c's, field for
 	int     (*send)(const uint8_t *h4, unsigned length);
 	int     (*receive)(uint8_t *h4, unsigned room, unsigned wait_ms);
 	void    (*wake)(void);
-	int     (*wifi_address)(uint8_t out[6]);
 	bool    wakes;
 };
+extern void hakios_bthost_register(const struct hakios_bt_platform *platform);
 extern void hakios_bthost_start(const struct hakios_bt_platform *platform);
-extern void hakios_bthost_publish(const struct hakios_bt_platform *platform);
 extern void hakios_bthost_wake(void);
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
 
@@ -350,6 +349,8 @@ static uint8_t rx_ring[RX_RING];
 static volatile uint32_t rx_head, rx_tail;      /* written by the handler, by the reader */
 static volatile uint32_t rx_interrupts, rx_lost;
 static bool rx_by_interrupt;
+static uint8_t rx_partial[4096];                   /* akita_bt_receive: the bytes of a packet not yet whole */
+static unsigned rx_have;                         /* (emptied at each function_on: nothing half-read survives a power cycle, 11-26) */
 
 static void
 akita_bt_interrupt(__unused void *context, __unused uint32_t intid)
@@ -438,6 +439,7 @@ akita_bt_function_on(void)
 {
 	static const uint8_t rate[] = { 0x01, 0x18, 0xfc, 0x06, 0x00, 0x00, 0x00, 0x09, 0x3d, 0x00 };
 
+	rx_have = 0;
 	if (!firmware_download()) {
 		printf("akita bt: the firmware did NOT load\n");
 		return EIO;
@@ -507,8 +509,6 @@ h4_length(const uint8_t *b, unsigned have)
 static int
 akita_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms)
 {
-	static uint8_t partial[4096];
-	static unsigned have;
 	static uint32_t said;
 	static uint64_t counted_ns;
 	uint64_t t0 = now_ns();
@@ -523,51 +523,35 @@ akita_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms)
 			unsigned want;
 
 			last_traffic_ns = now_ns();
-			if (have == sizeof(partial)) {
-				have = 0;                       /* (a packet longer than any the controller sends: the framing is lost) */
+			if (rx_have == sizeof(rx_partial)) {
+				rx_have = 0;                       /* (a packet longer than any the controller sends: the framing is lost) */
 			}
-			partial[have++] = byte;
-			want = h4_length(partial, have);
+			rx_partial[rx_have++] = byte;
+			want = h4_length(rx_partial, rx_have);
 			if (want == ~0u) {
 				if (said++ < 8) {
 					printf("akita bt: receive: %02x is not an H4 packet type: dropped (UERSTAT %#x)\n", byte, rd(uart + UERSTAT));
 				}
-				have = 0;
-			} else if (want != 0 && have == want) {
-				unsigned n = have;
+				rx_have = 0;
+			} else if (want != 0 && rx_have == want) {
+				unsigned n = rx_have;
 
-				have = 0;
+				rx_have = 0;
 				if (n > room) {
 					return -EMSGSIZE;
 				}
-				memcpy(h4, partial, n);
+				memcpy(h4, rx_partial, n);
 				return (int)n;
 			}
 		}
 		if (now_ns() - t0 >= (uint64_t)wait_ms * NSEC_PER_MSEC) {
-			if (!rx_by_interrupt && have == 0 && now_ns() - last_traffic_ns > NSEC_PER_SEC) {
+			if (!rx_by_interrupt && rx_have == 0 && now_ns() - last_traffic_ns > NSEC_PER_SEC) {
 				delay_for_interval(10, NSEC_PER_MSEC);
 			}
 			return 0;
 		}
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
-}
-
-/* the loader's /chosen mac-address-wifi0: this phone's own (the Bluetooth address is made of it, one up) */
-static int
-akita_bt_wifi_address(uint8_t out[6])
-{
-	DTEntry chosen;
-	const void *mac = NULL;
-	unsigned int size = 0;
-
-	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
-	    SecureDTGetProperty(chosen, "mac-address-wifi0", &mac, &size) != kSuccess || size != 6) {
-		return ENOENT;
-	}
-	memcpy(out, mac, 6);
-	return 0;
 }
 
 static struct hakios_bt_platform akita_bt_platform = {
@@ -577,10 +561,12 @@ static struct hakios_bt_platform akita_bt_platform = {
 	.function_off = akita_bt_function_off,
 	.send = akita_bt_send,
 	.receive = akita_bt_receive,
-	.wifi_address = akita_bt_wifi_address,
 };
 
-/* bt=1: a look -- the chip on, its firmware loaded, its name said. bt=2: the controller given to iOS (hakios.bthost.c) */
+/*
+ * bt=1: a look -- the chip on, its firmware loaded, its name said. bt=2: the controller given to iOS (hakios.bthost.c):
+ * switched on now, 30 s into the boot, unless AppleBluetoothModule's user client was asked first (hakios_bthost_start).
+ */
 static void
 akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 {
@@ -588,35 +574,12 @@ akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 
 	PE_parse_boot_argn("bt", &mode, sizeof(mode));
 	if (mode >= 2) {
-		uint32_t irq = 1;
-
-		PE_parse_boot_argn("bt_irq", &irq, sizeof(irq));
-		want_interrupt = irq != 0;
-		akita_bt_platform.wakes = want_interrupt;
 		hakios_bthost_start(&akita_bt_platform);
 		return;
 	}
 	if (akita_bt_power_on() == 0) {
 		printf("akita bt: the controller answers\n");
 		printf("akita bt: the firmware %s\n", firmware_download() ? "runs" : "did NOT load");
-	}
-}
-
-/* the registry's "bluetooth" service and its address at once, long before the controller is switched on (30 s): bluetoothd,
-   started for SpringBoard within seconds of it, needs them or exits (hakios_bthost_publish) */
-static void
-akita_bt_publish_thread(__unused void *arg, __unused wait_result_t wr_)
-{
-	hakios_bthost_publish(&akita_bt_platform);
-}
-
-static void
-akita_bt_publish(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
-{
-	thread_t thread;
-
-	if (kernel_thread_start(akita_bt_publish_thread, NULL, &thread) == KERN_SUCCESS) {
-		thread_deallocate(thread);
 	}
 }
 
@@ -651,18 +614,21 @@ akita_bt_init(void)
 		printf("akita bt: could not map its registers\n");
 		return;
 	}
+	if (mode >= 2) {
+		/*
+		 * (11-26) The operations given to the chip-independent half at once: AppleBluetoothModule (the device tree's
+		 * /arm-io/bluetooth) and its serial client publish the control and switch the controller as soon as IOKit and
+		 * BSD are up; the old early "bluetooth" service (bt_early) is gone with hakios.bluetooth.cpp.
+		 */
+		uint32_t irq = 1;
+
+		PE_parse_boot_argn("bt_irq", &irq, sizeof(irq));
+		want_interrupt = irq != 0;
+		akita_bt_platform.wakes = want_interrupt;
+		hakios_bthost_register(&akita_bt_platform);
+	}
 	start = thread_call_allocate(akita_bt_start, NULL);
 	clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(start, deadline);
-	uint32_t early = 1;
-
-	PE_parse_boot_argn("bt_early", &early, sizeof(early));      /* (bt_early=0: the node only when the bridge starts, as before 11-16) */
-	if (mode >= 2 && early != 0) {
-		static thread_call_t publish;
-
-		publish = thread_call_allocate(akita_bt_publish, NULL);
-		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
-		thread_call_enter_delayed(publish, deadline);
-	}
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, akita_bt_init);

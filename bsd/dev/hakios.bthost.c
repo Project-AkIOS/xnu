@@ -1,8 +1,16 @@
 /*
  * Bluetooth, the half that is the same on every phone: what iOS's bluetoothd looks for and talks to -- the kernel
  * control com.apple.uart.sk.bluetooth and the Skywalk kernel pipe behind it (hakios.btsk.c), the nodes /dev/btwake,
- * /dev/btreset and /dev/btpoweroff, the registry's service "bluetooth" (hakios.bluetooth.cpp) -- and one thread that
- * carries whole H4 packets between bluetoothd and the controller, changing the few answers Apple's stack will not take.
+ * /dev/btreset and /dev/btpoweroff -- and one thread that switches the controller on, off and over again and carries
+ * whole H4 packets between bluetoothd and the controller, changing the few answers Apple's stack will not take.
+ *
+ * (11-26) Presented the way a UART iPhone presents it: the device tree's /arm-io/bluetooth (tools/ak/adt.py: transport
+ * H4BC, the address) is the service bluetoothd and BlueTool look up by name, AppleBluetoothModule on it
+ * (iokit/Kernel/AppleBluetoothModule.cpp) is the power, open, power-cycle and address user client they call, and
+ * AppleOnboardSerialBSDClient below it publishes the kernel control and the pipe as soon as BSD is up
+ * (hakios_bthost_publish), long before the controller is: a connection made early waits in skel_ctl_connect until the
+ * controller answers. The old platform-attached "bluetooth" service (hakios.bluetooth.cpp, once upstream's
+ * RedwoodBluetooth.cpp) is gone.
  *
  * From upstream's branch mtk (redwood_mtkbt_skel.c, 2026-11-10: the skeleton of its MediaTek driver, proven there on
  * the Infinix Hot 20's MT6631 as part of redwood_connsys.c; docs/bluetooth-mtk-porting.md there says how each part was
@@ -34,12 +42,10 @@
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
 extern kern_return_t thread_terminate(thread_t thread);
 
-extern bool HakiosBluetoothNode(void);                         /* iokit/Kernel/RedwoodBluetooth.cpp: the service "bluetooth" */
-extern void HakiosBluetoothAddress(const uint8_t *wifi);       /* its local-mac-address: the Wi-Fi address, one up */
-extern void hakios_btsk_init(void);                            /* redwood_btsk.c: the Skywalk kernel pipe bluetoothd's packets go through */
+extern void hakios_btsk_init(void);                            /* hakios.btsk.c: the Skywalk kernel pipe bluetoothd's packets go through */
 extern bool hakios_btsk_uuid(uuid_t out);
 extern void hakios_btsk_deliver(const uint8_t *bytes, unsigned length);
-void hakios_bthost_written(const uint8_t *bytes, unsigned length);    /* called by redwood_btsk.c with what bluetoothd wrote */
+void hakios_bthost_written(const uint8_t *bytes, unsigned length);    /* called by hakios.btsk.c with what bluetoothd wrote */
 
 #define say(fmt, ...) printf("bthost: " fmt "\n", ##__VA_ARGS__)
 
@@ -81,11 +87,9 @@ struct hakios_bt_platform {
 	/* optional: called before each send, for a transport that sleeps (BTIF's wake on the Infinix) */
 	void    (*wake)(void);
 	/*
-	 * optional: the Wi-Fi radio's address, six bytes, for the registry's local-mac-address (the Bluetooth one is made of it, last byte + 1).
-	 * Leave it NULL when the Wi-Fi driver calls HakiosBluetoothAddress() itself, as redwood_net.c does. Without an address from either,
-	 * bluetoothd says "No bluetooth on this device." and stops.
+	 * (11-26: the Wi-Fi address the registry's local-mac-address was made of is gone from here: the address is the device
+	 * tree's, /arm-io/bluetooth's local-mac-address, = /chosen/mac-address-bluetooth0, both from tools/ak/adt.py)
 	 */
-	int     (*wifi_address)(uint8_t out[6]);
 	/*
 	 * true: the phone's driver calls hakios_bthost_wake() when bytes have come (its interrupt), and receive with wait_ms 0
 	 * returns at once. The bridge then sleeps until bluetoothd writes or the controller speaks, instead of asking every
@@ -182,7 +186,7 @@ skel_queue_locked(const uint8_t *bytes, size_t length)
 	return true;
 }
 
-/* H4 bytes the Skywalk channel's user wrote (redwood_btsk.c's sync_tx) */
+/* H4 bytes the Skywalk channel's user wrote (hakios.btsk.c's sync_tx) */
 static int skel_event;                          /* what the bridge sleeps on */
 static volatile bool skel_pending;              /* something to do, said before the wake-up */
 
@@ -206,138 +210,185 @@ hakios_bthost_written(const uint8_t *bytes, unsigned length)
 
 /*
  * ---- what this controller says of itself that Apple's stack will not take as it is ----
- * Every rule here was found on the MT6631 (the runs are in redwood_connsys.c's bt_quirks and docs/bluetooth-x6826b.md). Each one only rewrites an
- * answer that has exactly the form that controller gave; a controller that answers otherwise is passed through unchanged, and then bluetoothd's
- * own log (BTLOG, src/inject.c's watcher) says which command it stopped at.
- *  - Apple's vendor commands (OGF 0x3f) are Broadcom's; the MediaTek controller says "Unknown HCI Command" (Command Status, status 1) to each
- *    and bluetoothd restarts ("VSC stall detected", reason 3602). Each is answered as done: Command Complete, status 0, and the data its parser
- *    reads after the status -- a byte for 0xfd48, 16 for 0xfce2 with sub-command 0x15, 0x36 or 0x0d, 64 (the first 0x51) for 0xfd1b,
- *    none for the rest. (0x0d, bluetoothd's profiling statistics every ~30 s, with none: _BCM_ProfilingStatsEventParser
- *    asserted "ByteStream_NumReadBytesAvail(*pBs) >= 2" and bluetoothd aborted, each new one ~30 s later -- the BCM4383, 11-16)
- *    (data on 0xfce9 left the next command unsent).
- *  - Write_Default_Erroneous_Data_Reporting (0x0c5b), also "Unknown HCI Command", is answered as done.
- *  - Read_Local_Supported_Commands: the controller leaves the LE commands of octets 25-28 and LE Host Support of octet 24 clear although it
- *    answers them; bluetoothd looks in the mask before it sends one and gives up ("HCI initialization failed"). The bits are OR-ed in.
+ * (11-26) An explicit list, no longer every vendor command. Until today every Apple vendor command (OGF 0x3f) the controller
+ * did not know (Command Complete, status 1) was turned into a success with zero bytes after it; but bluetoothd takes most
+ * failures cleanly -- 0xfd23 sub-command 0x0a, Read_Local_Controller_Cached_Info: _BCM_ReadLocalControllerCachedInfoEventParser
+ * logs the status and calls back with it, and the caller says "Failed to read local Fast LE Connection data from controller"
+ * and goes on (research of 11-26 on 24B156's bluetoothd) -- and a made-up success tells it a feature is there that is not
+ * (the empty Fast LE record of 11-23 said "Fast LE v0 available"). So a failure now goes up as the controller said it,
+ * except for the commands below. Checked against this file's history, command by command (11-26):
+ *  - 0xfe3b, low-power core statistics (11-17): its failure, passed through, was "EnhancedProfilingStats VSC failed with
+ *    status 701" and a restart -- the one failure known to be fatal; done, with the most an event carries (251 zero bytes:
+ *    _BCM_LowPowerCoreStatsEventParser reads ~60 counters, 200 bytes ran out at bcm_vsc.c line 823 of 825);
+ *  - 0xfce2, every sub-command (Olympic diagnostics and antenna settings, 11-16/17 on 16.6.1): what went wrong was a made-up
+ *    success with too few bytes after it -- sub 0x0d's _BCM_ProfilingStatsEventParser asserted
+ *    "ByteStream_NumReadBytesAvail(*pBs) >= 2", sub 0x42 and then 0x2c reported a VSC stall and restarted bluetoothd
+ *    (bluetooth-olympic-vsc-stall.md); done, with 16 zero bytes (the ones with no completion of their own, 0x2a and 0x3a,
+ *    ignore them). Whether bluetoothd takes their failure was never tried: the research of 11-26 names them fatal, and
+ *    Bluetooth works with them done, so done they stay;
+ *  - 0xfce9 sub-command 0x37 (11-17): the same story, "1, 0x37" made into a success made _BCM_U8_U8_U8EventParser assert
+ *    ">= 1" on the bytes after the 0x37, ~0.6 s into every start; done, three zero bytes after the 0x37 (its failure as
+ *    such never tried either);
+ *  - Write_Default_Erroneous_Data_Reporting (0x0c5b), "Unknown HCI Command" as a Command Status from the MT6631 (upstream's:
+ *    a Command Status where a Command Complete is waited for is a stall to bluetoothd whatever the command); done.
+ * (0xfdf0 and 0xfce2 sub 0x42 are not given to the controller at all, and 0x204a neither: skel_bridge_once answers them.
+ * 0xfdf0 the BCM4383 never answers, it streams a memory dump instead: 11-17.)
+ * And a second group, NOT CHECKED: the vendor commands the BCM4383 refused in every iOS 27 boot so far (the kernel logs of
+ * 11-24..26: "vendor command ...: the controller says it does not know it"), all answered done with 200 zero bytes by the
+ * old rule, with Bluetooth working: 0xfd47, 0xfe10, 0xfe29, 0xfe2c, 0xfe37, 0xfe91; and 0xfce9's other sub-commands, whose
+ * answers the old rule turned into successes without a word (0x01, 0x05, 0x1e, 0x35, 0x61 came back "done" in those logs;
+ * which of them really were cannot be told from the log). Whether bluetoothd takes their failure is not known yet; they
+ * stay done until it is (boot-arg bt_vsc=0: passed through like any other, to find out). Every other refused command,
+ * 0xfd23 sub 0x0a first, goes up as it is: if one turns out fatal, it says so here (the log line "passed through"),
+ * and bt_vsc=2 brings the old blanket rule back, every refused vendor command done, for a quick way back.
+ * Each rewrite and each failure passed through is said in the kernel log once per command (and sub-command).
+ *
+ * The MT6631 said "unknown" the other way, a Command Status with status 1 where a Command Complete is waited for (which
+ * bluetoothd takes for a stall whatever the command): for the commands of the list that form is answered the same way.
  */
+struct skel_fix {
+	uint16_t        opcode;
+	int16_t         sub;            /* the sub-command (the first parameter), echoed after the status; -1: any */
+	uint8_t         data;           /* bytes after the status in the answer made, at least (the echoed sub-command among them) */
+	bool            checked;        /* found to stop bluetoothd (above); false: the iOS 27 group, not checked yet */
+};
+
+static const struct skel_fix skel_fixes[] = {
+	{ 0xfce2, -1, 16, true },
+	{ 0xfce9, 0x37, 4, true },
+	{ 0xfe3b, -1, 251, true },
+	{ 0x0c5b, -1, 0, true },
+	{ 0xfd47, -1, 200, false },
+	{ 0xfe10, -1, 200, false },
+	{ 0xfe29, -1, 200, false },
+	{ 0xfe2c, -1, 200, false },
+	{ 0xfe37, -1, 200, false },
+	{ 0xfe91, -1, 200, false },
+	{ 0xfce9, -1, 0, false },       /* (after 0x37: the first match counts) */
+};
+
 static uint8_t skel_vsc_sub;            /* the first parameter of the last 0xfce2 command sent: its kind */
+static uint32_t skel_vsc_mode = 1;      /* boot-arg bt_vsc: 0 the checked list only, 1 and the iOS 27 group, 2 every vendor command */
+
+/* true the first time KEY (what was done, sub-command, opcode) is seen: each rewrite said once */
+static bool
+skel_first(uint32_t key)
+{
+	static uint32_t seen[96];
+	static unsigned count;
+
+	for (unsigned i = 0; i < count; i++) {
+		if (seen[i] == key) {
+			return false;
+		}
+	}
+	if (count < sizeof(seen) / sizeof(seen[0])) {
+		seen[count++] = key;
+	}
+	return true;
+}
+
+static const struct skel_fix *
+skel_fix_for(uint16_t opcode, int sub)
+{
+	static const struct skel_fix blanket = { 0, -1, 200, false };
+
+	for (unsigned i = 0; i < sizeof(skel_fixes) / sizeof(skel_fixes[0]); i++) {
+		const struct skel_fix *f = &skel_fixes[i];
+
+		if (f->opcode == opcode && (f->sub < 0 || f->sub == sub) && (f->checked || skel_vsc_mode >= 1)) {
+			return f;
+		}
+	}
+	return skel_vsc_mode >= 2 && (opcode >> 10) == 0x3f ? &blanket : NULL;
+}
+
+/*
+ * The answer made for a command of the list: Command Complete, status 0, the bytes the controller gave after its status
+ * (have of them, at from), and zeros up to f->data. Its length.
+ */
+static unsigned
+skel_answer_done(uint8_t *packet, uint16_t opcode, const uint8_t *from, unsigned have, const struct skel_fix *f, const char *how)
+{
+	uint8_t kept[32];
+	unsigned data;
+
+	if (have > sizeof(kept)) {
+		have = sizeof(kept);
+	}
+	data = have > f->data ? have : f->data;
+	if (have != 0) {
+		memcpy(kept, from, have);
+	}
+	packet[0] = 0x04;
+	packet[1] = 0x0e;
+	packet[2] = (uint8_t)(4 + data);
+	packet[3] = 0x01;
+	packet[4] = (uint8_t)opcode;
+	packet[5] = (uint8_t)(opcode >> 8);
+	packet[6] = 0x00;
+	memset(packet + 7, 0, data);
+	if (have != 0) {
+		memcpy(packet + 7, kept, have);
+	}
+	if (skel_first(0x01000000u | ((uint32_t)(have != 0 ? kept[0] : 0) << 16) | opcode)) {
+		say("vendor command %#x (sub-command %#x): the controller %s; answered as done, %u bytes after the status (%s)",
+		    opcode, have != 0 ? kept[0] : 0u, how, data, f->checked ? "on the list" :
+		    f->opcode == 0 ? "bt_vsc=2, every vendor command" : "the iOS 27 group, not checked");
+	}
+	return 7 + data;
+}
 
 static unsigned
 skel_quirks(uint8_t *packet, unsigned length)
 {
 	static const uint8_t le_commands[4] = { 0xf7, 0xff, 0xff, 0x7f };
 
+	/* Command Status, status 1 (the MT6631's "unknown"), for a command of the list: done */
+	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01) {
+		const uint16_t opcode = (uint16_t)(packet[5] | (packet[6] << 8));
+		const struct skel_fix *f = skel_fix_for(opcode, opcode == 0xfce2 ? skel_vsc_sub : -1);
 
-	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01 && packet[4] == 0x01 &&
-	    (packet[6] >> 2) == 0x3f) {
-		/* (11-17: every 0xfce2 sub-command, not only the antenna ones: 16.6.1's bluetoothd checks a minimum of return data
-		 * on more of them -- 0x42, then 0x2c stalled it in turn; 16 zero bytes satisfy each, and the ones with no
-		 * completion of their own, 0x2a and 0x3a, ignore them) */
-		const bool antenna = packet[5] == 0xe2 && packet[6] == 0xfc;
-		const bool cal = packet[5] == 0x1b && packet[6] == 0xfd;
-		const bool data = antenna || cal || (packet[5] == 0x48 && packet[6] == 0xfd);
-		const unsigned extra = cal ? 64 : (antenna ? 16 : (data ? 1 : 0));
-
-		packet[1] = 0x0e;
-		packet[2] = (uint8_t)(4 + extra);
-		packet[4] = packet[5];
-		packet[5] = packet[6];
-		packet[6] = 0x00;
-		for (unsigned i = 0; i < extra; i++) {
-			packet[7 + i] = 0x00;
+		if (f != NULL && f->sub < 0) {
+			return skel_answer_done(packet, opcode, NULL, 0, f, "says it does not know it (Command Status)");
 		}
-		if (cal) {
-			packet[7] = 0x51;               /* the table's number (a guess that bluetoothd took) */
-		}
-		return 7 + extra;
+		return length;
 	}
-	/*
-	 * The same for a controller that says it the other way -- Command Complete with status 1 (the Pixel 8a's BCM4383 to
-	 * 0xfce2, 0xfd47, 0xfd48: Apple's vendor commands are for Apple's own Broadcom chips, and this one has not got them
-	 * all): answered as done, with the same data after the status.
-	 */
-	if (length > 7 && packet[0] == 0x04 && packet[1] == 0x0e && (packet[5] >> 2) == 0x3f && packet[6] == 0x01) {
-		/* (one that came with bytes after its status, 0xfce9 on the BCM4383: the status alone) */
-		packet[6] = 0x00;
-		/*
-		 * 0xfce9 sub-command 0x37 (11-17, 16.6.1): the BCM4383 says "1, 0x37" and bluetoothd's
-		 * _BCM_U8_U8_U8EventParser (bcm_vsc.c) asserts "ByteStream_NumReadBytesAvail(*pBs) >= 1" on the bytes after
-		 * the 0x37 and aborts, ~0.6 s into each start: three zero bytes after it.
-		 */
-		if (length == 8 && packet[4] == 0xe9 && packet[5] == 0xfc && packet[7] == 0x37) {
-			packet[2] = 0x08;
-			packet[8] = packet[9] = packet[10] = 0x00;
-			return 11;
+	/* Command Complete with a failure (the BCM4383's "unknown" is status 1, then the sub-command if there was one) */
+	if (length >= 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == length - 3 && packet[6] != 0x00) {
+		const uint16_t opcode = (uint16_t)(packet[4] | (packet[5] << 8));
+		const int sub = length > 7 ? packet[7] : -1;
+		const struct skel_fix *f = packet[6] == 0x01 ? skel_fix_for(opcode, sub) : NULL;
+
+		if (f != NULL) {
+			return skel_answer_done(packet, opcode, packet + 7, length - 7, f, "says it does not know it");
 		}
-		/*
-		 * 0xfd23 ("LE meta 2") sub-command 0x0a, BD_VSC_LE_META2_READ_LOCAL_CONTROLLER_CACHED_INFO (11-23, iOS 27's
-		 * bluetoothd): the BCM4383 says "1, 0x0a" (unknown), done above with nothing after the sub-command; bluetoothd's
-		 * _BCM_ReadLocalControllerCachedInfoEventParser reads a byte, a 16-bit length and exactly that many bytes,
-		 * asserted "ByteStream_NumReadBytesAvail(*pBs) >= 1" (bcm_vsc.c:936) and aborted ~1.5 s into every start -- and
-		 * backboardd, attached to it synchronously, kept SpringBoard (Setup's region page) waiting behind it. An empty
-		 * record: 0, length 0.
-		 */
-		if (length == 8 && packet[4] == 0x23 && packet[5] == 0xfd && packet[7] == 0x0a) {
-			packet[2] = 0x08;
-			packet[8] = packet[9] = packet[10] = 0x00;
-			return 11;
+		if ((opcode >> 10) == 0x3f && skel_first(0x02000000u | ((uint32_t)(sub & 0xff) << 16) | opcode)) {
+			say("vendor command %#x%s%x: status %#x from the controller, passed through as it is", opcode,
+			    sub >= 0 ? " sub-command 0x" : "", sub >= 0 ? (unsigned)sub : 0u, packet[6]);
 		}
 		return length;
 	}
 	/*
-	 * A vendor command the controller knows and answers done with no data at all (0xfe3b, 11-17): 16.6.1's bluetoothd
-	 * parses statistics out of several (_BCM_LowPowerCoreStatsEventParser asserted "ByteStream_NumReadBytesAvail(*pBs)
-	 * >= 4" and aborted, each start ~0.6 s in): 64 zero bytes after the status, enough for each such parser; the ones
-	 * that read nothing ignore them. (0xfce2 0x42 and 0xfce9 0x37 the same way: one assertion after another.)
+	 * A vendor command the controller knows and answers done with no data at all (0xfe3b on 16.6.1, 11-17): bluetoothd
+	 * parses statistics out of several (_BCM_LowPowerCoreStatsEventParser asserted "ByteStream_NumReadBytesAvail(*pBs) >= 4"
+	 * and aborted, each start ~0.6 s in): 200 zero bytes after the status, enough for each such parser; the ones that read
+	 * nothing ignore them. Not 0xfce9 (data on 0xfce9 left the next command unsent, upstream's MT6631).
 	 */
 	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x04 && (packet[5] >> 2) == 0x3f && packet[6] == 0x00 &&
 	    !(packet[4] == 0xe9 && packet[5] == 0xfc)) {
+		if (skel_first(0x03000000u | packet[4] | (packet[5] << 8))) {
+			say("vendor command %#x: done with nothing after the status; 200 zero bytes added", packet[4] | (packet[5] << 8));
+		}
 		packet[2] = 4 + 200;
 		memset(packet + 7, 0, 200);
 		return 7 + 200;
 	}
 	/*
-	 * 0xfe3b (low-power core statistics, 11-17) keeps the controller's own "unknown" (status 1): with status 0 16.6.1's
-	 * _BCM_LowPowerCoreStatsEventParser reads a record of ~60 counters in unrolled loops (bcm_vsc.c 765-825+; 200 zero
-	 * bytes ran out at 823) and asserts; with a non-zero status it reads nothing (bluetoothd __text+0x12c6a4: cbz w0) but the caller restarts.
+	 * Read_Local_Supported_Commands: the MT6631 left the LE commands of octets 25-28 and LE Host Support of octet 24 clear
+	 * although it answers them; bluetoothd looks in the mask before it sends one and gives up ("HCI initialization failed").
+	 * The bits are OR-ed in.
 	 */
-	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[4] == 0x3b && packet[5] == 0xfe) {
-		/* (not so: a failed status is "EnhancedProfilingStats VSC failed with status 701" and bluetoothd restarts,
-		 * reason 701 -- done, then, with the most an event carries, 251 zero bytes: 200 ran out at line 823 of 825) */
-		packet[2] = 4 + 251;
-		packet[6] = 0x00;
-		memset(packet + 7, 0, 251);
-		return 7 + 251;
-	}
-	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x04 && (packet[5] >> 2) == 0x3f && packet[6] == 0x01) {
-		const bool antenna = packet[4] == 0xe2 && packet[5] == 0xfc;   /* (every sub-command: see above) */
-		const bool cal = packet[4] == 0x1b && packet[5] == 0xfd;
-		const bool data = antenna || cal || (packet[4] == 0x48 && packet[5] == 0xfd);
-		/* (the rest, 11-17: 200 zero bytes, not none -- 0xfe3b comes here, status 1, and 16.6.1's
-		 * _BCM_LowPowerCoreStatsEventParser asserts >= 4 bytes; see the branch above) */
-		const unsigned extra = cal ? 64 : (antenna ? 16 : (data ? 1 : 200));   /* (200: 0xfe3b's parser reads ~36 32-bit counters, bcm_vsc.c lines 765-805; 64 ran out at 784) */
-		static uint32_t said;
-
-		if (said++ < 64) {
-			say("vendor command %#x: the controller says it does not know it; answered as done (%u bytes of data)",
-			    packet[4] | (packet[5] << 8), extra);
-		}
-		packet[2] = (uint8_t)(4 + extra);
-		packet[6] = 0x00;
-		for (unsigned i = 0; i < extra; i++) {
-			packet[7 + i] = 0x00;
-		}
-		if (cal) {
-			packet[7] = 0x51;
-		}
-		return 7 + extra;
-	}
-	if (length == 7 && memcmp(packet, "\x04\x0f\x04\x01\x01\x5b\x0c", 7) == 0) {
-		packet[1] = 0x0e;
-		packet[4] = 0x5b;
-		packet[5] = 0x0c;
-		packet[6] = 0x00;
-		return 7;
-	}
 	if (length >= 7 + 64 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x44 && packet[4] == 0x02 && packet[5] == 0x10 && packet[6] == 0x00) {
 		for (unsigned i = 0; i < 4; i++) {
 			packet[7 + 25 + i] |= le_commands[i];
@@ -354,6 +405,42 @@ skel_quirks(uint8_t *packet, unsigned length)
  */
 static kern_ctl_ref skel_ctl_ref;
 
+/* the controller's state, the bridge thread's to change (skel_thread) */
+enum { SKEL_OFF, SKEL_STARTING, SKEL_ON, SKEL_FAILED };
+static volatile int skel_state = SKEL_OFF;
+#define SKEL_CONNECT_WAIT_S     120u            /* the longest a connection waits for the controller (the inject's two minutes) */
+
+/*
+ * (11-26) The control is there from BSD's start (hakios_bthost_publish), the controller only once its firmware runs (~30 s,
+ * hakios.akita_bt.c). A connection made in between -- launchd starts bluetoothd for SpringBoard within seconds -- waits
+ * here until the controller answers (or has failed, or two minutes have gone by), with bluetoothd's start held as the
+ * injected wait in bluetoothd held it until today: a bluetoothd that opened the transport and got no answer died
+ * "reason 1201" and its successors aborted (11-16). STOPGAP-ish: on a UART iPhone the controller is up before bluetoothd
+ * runs (BlueTool boots it from bluetoothd's own request, our BlueTool stand-in does not), so nothing there needs to wait.
+ */
+static void
+skel_wait_for_controller(const char *who)
+{
+	uint32_t since = skel_ms();
+
+	if (skel_state == SKEL_ON || skel_state == SKEL_FAILED) {
+		return;
+	}
+	say("control: %s connects before the controller is up: waiting for it", who);
+	while (skel_state != SKEL_ON && skel_state != SKEL_FAILED && skel_ms() - since < SKEL_CONNECT_WAIT_S * 1000u) {
+		assert_wait_timeout((event_t)&skel_state, THREAD_ABORTSAFE, 500, NSEC_PER_MSEC);
+		if (skel_state == SKEL_ON || skel_state == SKEL_FAILED) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			break;
+		}
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_INTERRUPTED) {
+			break;
+		}
+	}
+	say("control: %s waited %u ms: the controller is %s", who, skel_ms() - since,
+	    skel_state == SKEL_ON ? "up" : skel_state == SKEL_FAILED ? "NOT up (failed)" : "still not up; going on anyway");
+}
+
 static errno_t
 skel_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused void **unitinfo)
 {
@@ -361,6 +448,7 @@ skel_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused v
 
 	proc_selfname(name, sizeof(name));
 	say("control connected by %s (pid %d): unit %u", name, proc_selfpid(), sac->sc_unit);
+	skel_wait_for_controller(name);
 	/* (11-23) each bluetoothd's own exchange said from its start: a crash-looping one's last commands were past the limit */
 	skel_said_in = skel_said_out = 0;
 	return 0;
@@ -615,15 +703,19 @@ skel_hci(const char *what, uint16_t opcode)
 	return false;
 }
 
-/* what is written is sent a packet at a time; what comes is given to the Skywalk channel. Never returns. */
+/*
+ * One round of the bridge: what is written is sent a packet at a time; what comes is given to the Skywalk channel. With a
+ * controller that wakes the bridge (wakes), it sleeps here until either happens, a second at the most. (11-26: one round
+ * at a time, no longer a loop of its own, so that the thread can switch the controller off and on between two rounds.)
+ */
 static void
-skel_bridge(void)
+skel_bridge_once(void)
 {
 	const struct hakios_bt_platform *p = &mtkbt_platform;
-	uint32_t pending_since = 0, errors = 0;
-	bool said_pending = false;
+	static uint32_t pending_since = 0, errors = 0;
+	static bool said_pending = false;
 
-	for (;;) {
+	{
 		int length;
 
 		for (;;) {
@@ -760,8 +852,28 @@ skel_bridge(void)
 	}
 }
 
+/* the bridge thread's state changed: said to whoever waits for it (skel_wait_for_controller) */
 static void
-skel_thread(__unused void *arg, __unused wait_result_t w)
+skel_set_state(int state)
+{
+	skel_state = state;
+	wakeup((event_t)&skel_state);
+}
+
+/*
+ * What AppleBluetoothModule's user client and the phone's driver ask of the controller (hakios_bthost_power): power on or
+ * off, a power cycle. Done by the bridge thread between two rounds, since the platform's operations are never called from
+ * two threads; the asker waits for skel_done to reach its number.
+ */
+static LCK_MTX_DECLARE(skel_ask_lock, &skel_lck_grp);
+static volatile bool skel_want_on;
+static volatile uint32_t skel_cycles_asked, skel_cycles_done;
+static volatile uint32_t skel_asked, skel_done;
+static bool skel_thread_started, skel_dead;
+
+/* the controller switched on, its firmware loaded and asked what a host asks first; true when all six are answered */
+static bool
+skel_up(void)
 {
 	static const struct {
 		const char *what;
@@ -778,21 +890,16 @@ skel_thread(__unused void *arg, __unused wait_result_t w)
 	unsigned good = 0;
 	int error;
 
-	if (!skel_platform_complete(p)) {
-		say("the platform is not complete: no Bluetooth");
-		goto out;
-	}
 	say("%s: power on", p->name);
 	if ((error = p->power_on()) != 0) {
 		say("power_on failed (%d): no Bluetooth", error);
-		goto out;
+		return false;
 	}
 	say("%s: Bluetooth's function on", p->name);
 	if ((error = p->function_on()) != 0) {
 		say("function_on failed (%d): no Bluetooth", error);
-		goto out;
+		return false;
 	}
-	/* the controller, asked what a host asks first; all six must be answered before iOS is shown anything */
 	for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
 		good += skel_hci(probe[i].what, probe[i].opcode);
 	}
@@ -800,78 +907,233 @@ skel_thread(__unused void *arg, __unused wait_result_t w)
 	if (good != sizeof(probe) / sizeof(probe[0])) {
 		say("not a controller iOS can be given: Bluetooth's function off");
 		p->function_off();
-		goto out;
+		return false;
 	}
-	/* (the registry's "bluetooth" service and its address: made early, hakios_bthost_start) */
-	if (!skel_nodes() || !skel_ctl_register()) {
-		p->function_off();
-		goto out;
-	}
-	hakios_btsk_init();
 	say("%s: the bridge runs", p->name);
-	skel_bridge();
-out:
-	thread_terminate(current_thread());
+	return true;
 }
 
-/* a phone's Bluetooth driver, with its controller's operations: the thread above started. The operations are copied. */
-void hakios_bthost_start(const struct hakios_bt_platform *platform);
-/*
- * The registry's "bluetooth" service WITH its local-mac-address, for a phone's driver to call as soon as IOKit is up
- * (hakios_bthost_start does it too; once is enough). bluetoothd reads the address the moment it starts
- * (FindLocalMacAddress) and exits "No bluetooth on this device." without it; launchd starts it for SpringBoard's
- * BluetoothManager within seconds of SpringBoard, and an attach that went to a dying bluetoothd never came back --
- * Control Center's button stayed "unavailable" (BluetoothManager's state 0) for good while Settings, attaching later,
- * worked. The address is the platform's (on the Pixel the loader's device tree: there at once).
- */
-void
-hakios_bthost_publish(const struct hakios_bt_platform *platform)
+static void
+skel_thread(__unused void *arg, __unused wait_result_t w)
 {
-	static bool published;
+	const struct hakios_bt_platform *p = &mtkbt_platform;
 
-	if (published || platform == NULL) {
+	if (!skel_platform_complete(p)) {
+		say("the platform is not complete: no Bluetooth");
+		skel_dead = true;
+		skel_set_state(SKEL_FAILED);
+		skel_done = skel_asked;
+		wakeup((event_t)&skel_done);
+		thread_terminate(current_thread());
 		return;
 	}
-	if (platform->wifi_address != NULL) {
-		uint8_t wifi[6] = { 0 };
-		uint8_t all_or = 0, all_and = 0xff;
-		int error = platform->wifi_address(wifi);
+	for (;;) {
+		uint32_t asked = skel_asked, cycles = skel_cycles_asked;
 
-		for (unsigned i = 0; i < 6; i++) {
-			all_or |= wifi[i];
-			all_and &= wifi[i];
+		if (cycles != skel_cycles_done) {
+			/* a power cycle (the user client's 3 and 5): off, and on again below if it is wanted on */
+			if (skel_state == SKEL_ON) {
+				say("%s: power cycle: Bluetooth's function off", p->name);
+				p->function_off();
+			}
+			skel_set_state(SKEL_OFF);
+			skel_cycles_done = cycles;
 		}
-		if (error != 0 || all_or == 0 || all_and == 0xff || (wifi[0] & 1)) {
-			say("wifi_address gave no address of a station (%d, %02x:%02x:%02x:%02x:%02x:%02x): none is published", error,
-			    wifi[0], wifi[1], wifi[2], wifi[3], wifi[4], wifi[5]);
+		if (skel_want_on && skel_state == SKEL_OFF) {
+			skel_set_state(SKEL_STARTING);
+			skel_set_state(skel_up() ? SKEL_ON : SKEL_FAILED);
+		} else if (!skel_want_on && (skel_state == SKEL_ON || skel_state == SKEL_FAILED)) {
+			if (skel_state == SKEL_ON) {
+				p->function_off();
+			}
+			say("%s: switched off, as asked", p->name);
+			skel_set_state(SKEL_OFF);
+		}
+		if (skel_done != asked) {
+			skel_done = asked;
+			wakeup((event_t)&skel_done);
+		}
+		if (skel_state == SKEL_ON) {
+			skel_bridge_once();
 		} else {
-			HakiosBluetoothAddress(wifi);
+			/* nothing to carry: asleep until asked again (what bluetoothd writes meanwhile waits in the queue) */
+			assert_wait_timeout((event_t)&skel_event, THREAD_UNINT, 1000, NSEC_PER_MSEC);
+			if (skel_pending) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
+			skel_pending = false;
 		}
 	}
-	for (unsigned tries = 0; tries < 40; tries++) {
-		if (HakiosBluetoothNode()) {
-			published = true;
-			say("the registry's \"bluetooth\" service published, with its address");
-			return;
-		}
-		delay_for_interval(250, NSEC_PER_MSEC);
-	}
-	say("the registry's \"bluetooth\" service could not be made in 10 s");
 }
 
+/*
+ * A phone's Bluetooth driver gives its controller's operations, at boot (they are copied): from then on the controller can be
+ * published, switched on and off. Nothing is done to the controller yet.
+ */
+void hakios_bthost_register(const struct hakios_bt_platform *platform);
+void
+hakios_bthost_register(const struct hakios_bt_platform *platform)
+{
+	static bool registered;
+
+	if (registered || platform == NULL) {
+		return;
+	}
+	registered = true;
+	mtkbt_platform = *platform;
+	(void)PE_parse_boot_argn("bt_vsc", &skel_vsc_mode, sizeof(skel_vsc_mode));
+}
+
+static bool
+skel_registered(void)
+{
+	return mtkbt_platform.name != NULL;
+}
+
+/*
+ * The kernel control com.apple.uart.sk.bluetooth, the Skywalk pipe behind it and the nodes /dev/btwake, /dev/btreset,
+ * /dev/btpoweroff: published once, as soon as BSD is up (11-26: by AppleOnboardSerialBSDClient's start, its IOResourceMatch
+ * IOBSD; hakios_bthost_start does it too, for a kernel whose device tree has no /arm-io/bluetooth). Until 11-26 they came
+ * only once the controller answered, ~45 s into the boot, and bluetoothd had to be held back in user space until then.
+ * false without a phone's controller (hakios_bthost_register) or when a part could not be made.
+ */
+bool hakios_bthost_publish(void);
+bool
+hakios_bthost_publish(void)
+{
+	static bool nodes, control, pipe;
+	uuid_t uuid;
+	bool done;
+
+	if (!skel_registered()) {
+		return false;
+	}
+	lck_mtx_lock(&skel_ask_lock);
+	if (!nodes) {
+		nodes = skel_nodes();
+	}
+	if (!control) {
+		control = skel_ctl_register();
+	}
+	if (!pipe) {
+		hakios_btsk_init();
+		pipe = hakios_btsk_uuid(uuid);
+	}
+	done = nodes && control && pipe;
+	lck_mtx_unlock(&skel_ask_lock);
+	return done;
+}
+
+/* the pipe's UUID as text (36 characters and the 0), for the registry's IOSkywalkNexusUUID; false until published */
+bool hakios_bthost_nexus_uuid(char *out, size_t size);
+bool
+hakios_bthost_nexus_uuid(char *out, size_t size)
+{
+	uuid_t uuid;
+	uuid_string_t text;
+
+	if (size < sizeof(text) || !hakios_btsk_uuid(uuid)) {
+		return false;
+	}
+	uuid_unparse_upper(uuid, text);
+	strlcpy(out, text, size);
+	return true;
+}
+
+static void
+skel_thread_start_locked(void)
+{
+	thread_t thread;
+
+	if (skel_thread_started) {
+		return;
+	}
+	skel_thread_started = true;
+	if (kernel_thread_start_priority(skel_thread, NULL, 81 /* BASEPRI_KERNEL */, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		skel_dead = true;
+		say("the bridge thread could not be started: no Bluetooth");
+	}
+}
+
+/*
+ * What the module's user client asks (iokit/Kernel/AppleBluetoothModule.cpp): 0 off, 1 on, 2 a power cycle (off and on
+ * again). Waits until the bridge thread has done it, at most wait_s seconds (0: does not wait). 0 when the controller is
+ * then as asked; ENODEV without a controller, EIO when it did not come up, ETIMEDOUT when the wait ran out.
+ */
+int hakios_bthost_power(int what, unsigned wait_s);
+int
+hakios_bthost_power(int what, unsigned wait_s)
+{
+	uint32_t mine, since = skel_ms();
+
+	if (!skel_registered() || skel_dead) {
+		return ENODEV;
+	}
+	lck_mtx_lock(&skel_ask_lock);
+	skel_want_on = what != 0;
+	if (what == 2 || (what == 1 && skel_state == SKEL_FAILED)) {
+		skel_cycles_asked++;            /* (on again after a failure: another try) */
+	}
+	mine = ++skel_asked;
+	skel_thread_start_locked();
+	lck_mtx_unlock(&skel_ask_lock);
+	hakios_bthost_wake();
+	if (wait_s == 0) {
+		return 0;
+	}
+	while ((int32_t)(skel_done - mine) < 0 && !skel_dead) {
+		if (skel_ms() - since > wait_s * 1000u) {
+			return ETIMEDOUT;
+		}
+		assert_wait_timeout((event_t)&skel_done, THREAD_ABORTSAFE, 250, NSEC_PER_MSEC);
+		if ((int32_t)(skel_done - mine) >= 0) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			break;
+		}
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_INTERRUPTED) {
+			return EINTR;
+		}
+	}
+	if (skel_dead) {
+		return ENODEV;
+	}
+	return (what != 0) == (skel_state == SKEL_ON) ? 0 : EIO;
+}
+
+/* the controller's state for the module's registry entry: 0 off, 1 starting, 2 on, 3 failed */
+int hakios_bthost_state(void);
+int
+hakios_bthost_state(void)
+{
+	return skel_state;
+}
+
+/*
+ * The phone's driver, once its controller may be switched on (hakios.akita_bt.c, 30 s into the boot): the operations
+ * registered if they are not yet, the control published if it is not yet, and the controller switched on -- the module's
+ * autoOn: nothing in iOS asks for it here, BlueTool's stand-in answers bluetoothd's "boot" without asking the module.
+ * Unless the user client has already been asked for something: then that is what stands.
+ */
+void hakios_bthost_start(const struct hakios_bt_platform *platform);
 void
 hakios_bthost_start(const struct hakios_bt_platform *platform)
 {
 	static bool started;
-	thread_t thread;
 
 	if (started || platform == NULL) {
 		return;
 	}
 	started = true;
-	mtkbt_platform = *platform;
-	hakios_bthost_publish(platform);
-	if (kernel_thread_start_priority(skel_thread, NULL, 81 /* BASEPRI_KERNEL */, &thread) == KERN_SUCCESS) {
-		thread_deallocate(thread);
+	hakios_bthost_register(platform);
+	if (!hakios_bthost_publish()) {
+		say("the kernel control, the pipe or the nodes could not be made: no Bluetooth for iOS");
+		return;
+	}
+	if (skel_asked == 0) {
+		(void)hakios_bthost_power(1, 0);
 	}
 }

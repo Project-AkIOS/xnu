@@ -98,7 +98,7 @@ iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
 # HakiOS drivers: made by tools/hakios-config.py kernel from drivers/*/conf. Edit those, not these lines.
 iokit/Kernel/hakios.stubs.cpp            optional iokitcpp
 iokit/Kernel/hakios.haptics_ready.cpp    optional iokitcpp
-iokit/Kernel/hakios.bluetooth.cpp        optional hakios_bt_host iokitcpp
+iokit/Kernel/AppleBluetoothModule.cpp     optional hakios_bt_host iokitcpp
 iokit/Kernel/hakios.battery.cpp          optional hakios_battery iokitcpp
 iokit/Kernel/hakios.wlan.cpp             optional hakios_wifi_station iokitcpp
 iokit/Kernel/hakios.akita_gpu.cpp        optional hakios_akita_mali iokitcpp

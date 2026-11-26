@@ -66,6 +66,26 @@ const char * gIOKernelConfigTables =
     "     'IOPropertyMatch' = { 'device-type' = Generic; };"
     "   }"
 /*
+ * AkIOS (11-26): Bluetooth as a UART iPhone has it (iokit/Kernel/AppleBluetoothModule.cpp): AppleBluetoothModule on the
+ * device tree's /arm-io/bluetooth (the nub GenericARMPE publishes; Apple's provider class is AppleARMIODevice, there is
+ * none here), with Apple's user client; and AppleOnboardSerialBSDClient once BSD is up, which publishes the kernel control
+ * com.apple.uart.sk.bluetooth (Apple's hangs on the UART's AppleOnboardSerialSync "bluetooth"; there is no such UART
+ * driver here, so on the module).
+ */
+#if defined(HAKIOS_BT_HOST)
+    "   ,{"
+    "     'IOClass'           = AppleBluetoothModule;"
+    "     'IOProviderClass'   = IOPlatformDevice;"
+    "     'IONameMatch'       = bluetooth;"
+    "     'IOUserClientClass' = AppleBluetoothModuleUserClient;"
+    "   }"
+    "   ,{"
+    "     'IOClass'           = AppleOnboardSerialBSDClient;"
+    "     'IOProviderClass'   = AppleBluetoothModule;"
+    "     'IOResourceMatch'   = IOBSD;"
+    "   }"
+#endif
+/*
  * AkIOS (11-22): the rest of IOStorageFamily's personalities are NOT registered yet,
  * so nothing matches IOMedia / IOBlockStorageDevice (MiniIOMedia's descriptive objects stay driverless). Draft from the
  * family's Info.plist (337.100.1, iOS side: no IOAppleLabelScheme). Before enabling IOMediaBSDClient, keep it off
