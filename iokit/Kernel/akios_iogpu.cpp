@@ -374,6 +374,17 @@ IOGPU::completionEvent(void)
 }
 
 IOReturn
+IOGPU::vendorMethod(OSObject *client, int as, uint32_t selector, IOExternalMethodArguments *args)
+{
+	return kIOReturnUnsupported;
+}
+
+void
+IOGPU::clientGone(OSObject *client, int as)
+{
+}
+
+IOReturn
 IOGPU::newVendorUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
     IOUserClient **handler)
 {
@@ -645,6 +656,7 @@ IOGPUDeviceUserClient::releaseAll(void)
 		fResourceCount = 0;
 	}
 	if (fAS >= 0) {
+		fGPU->clientGone(this, fAS);
 		fGPU->freeAddressSpace(fAS);
 		fAS = -1;
 	}
@@ -686,6 +698,14 @@ IOGPUDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
     IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
 {
 	if (selector >= sizeof(sMethods) / sizeof(sMethods[0])) {
+		bool ok;
+
+		if (selector < IOGPU::kIOGPUVendorSelectorBase + 64) {
+			IOLockLock(fLock);
+			ok = addressSpace();
+			IOLockUnlock(fLock);
+			return ok ? fGPU->vendorMethod(this, fAS, selector, args) : kIOReturnNoResources;
+		}
 		return kIOReturnUnsupported;
 	}
 	if (args->asyncWakePort != MACH_PORT_NULL) {

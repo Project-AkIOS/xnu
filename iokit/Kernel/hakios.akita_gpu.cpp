@@ -200,6 +200,12 @@ public:
 	virtual uint64_t hardwareQueueReached(int hq) APPLE_KEXT_OVERRIDE;
 	virtual bool hardwareQueueFaulted(int hq, uint64_t seqno) APPLE_KEXT_OVERRIDE;
 	virtual void *completionEvent(void) APPLE_KEXT_OVERRIDE { return &mali_irq_event; }
+	virtual IOReturn vendorMethod(OSObject *client, int as, uint32_t selector, IOExternalMethodArguments *args) APPLE_KEXT_OVERRIDE;
+	virtual void clientGone(OSObject *client, int as) APPLE_KEXT_OVERRIDE;
+
+	/* the IOGPU clients' tiler heaps (vendor selectors 56/57), for freeing what a client leaves */
+	enum { kMaxIOGPUHeaps = 32 };
+	struct { OSObject *client; int heap; } fHeaps[kMaxIOGPUHeaps];
 };
 OSDefineMetaClassAndStructors(HakiosGPU, IOGPU);
 
@@ -343,6 +349,76 @@ HakiosGPU::hardwareQueueFaulted(int hq, uint64_t seqno)
 	lost = akita_mali_lost(hq, 0, seqno);
 	IOLockUnlock(gLock);
 	return lost;
+}
+
+/*
+ * The Mali's selectors behind IOGPU's (IOGPUDeviceUserClient, type 1):
+ *   56 tiler heap: (chunk size, initial chunks, most chunks, target in flight) -> (handle, context GPU address, first
+ *      chunk's GPU address), in the client's address space (as panthor's TILER_HEAP_CREATE)
+ *   57 tiler heap gone: (handle)
+ */
+IOReturn
+HakiosGPU::vendorMethod(OSObject *client, int as, uint32_t selector, IOExternalMethodArguments *args)
+{
+	IOReturn ret = kIOReturnBadArgument;
+
+	switch (selector) {
+	case 56: {
+		uint64_t ctx = 0, first = 0;
+		int h, slot;
+
+		if (args->scalarInputCount != 4 || args->scalarOutputCount != 3) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gLock);
+		for (slot = 0; slot < kMaxIOGPUHeaps && fHeaps[slot].client != NULL; slot++) {
+		}
+		h = slot == kMaxIOGPUHeaps ? -1 : akita_mali_heap_new(as, (uint32_t)args->scalarInput[0],
+		    (uint32_t)args->scalarInput[1], (uint32_t)args->scalarInput[2], (uint32_t)args->scalarInput[3], &ctx, &first);
+		if (h >= 0) {
+			fHeaps[slot].client = client;
+			fHeaps[slot].heap = h;
+			args->scalarOutput[0] = (uint64_t)h + 1;
+			args->scalarOutput[1] = ctx;
+			args->scalarOutput[2] = first;
+			ret = kIOReturnSuccess;
+		} else {
+			ret = kIOReturnNoResources;
+		}
+		IOLockUnlock(gLock);
+		return ret;
+	}
+	case 57:
+		if (args->scalarInputCount != 1) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gLock);
+		for (int slot = 0; slot < kMaxIOGPUHeaps; slot++) {
+			if (fHeaps[slot].client == client && (uint64_t)fHeaps[slot].heap + 1 == args->scalarInput[0]) {
+				akita_mali_heap_free(fHeaps[slot].heap);
+				fHeaps[slot].client = NULL;
+				ret = kIOReturnSuccess;
+				break;
+			}
+		}
+		IOLockUnlock(gLock);
+		return ret;
+	default:
+		return kIOReturnUnsupported;
+	}
+}
+
+void
+HakiosGPU::clientGone(OSObject *client, int as)
+{
+	IOLockLock(gLock);
+	for (int slot = 0; slot < kMaxIOGPUHeaps; slot++) {
+		if (fHeaps[slot].client == client) {
+			akita_mali_heap_free(fHeaps[slot].heap);
+			fHeaps[slot].client = NULL;
+		}
+	}
+	IOLockUnlock(gLock);
 }
 
 void

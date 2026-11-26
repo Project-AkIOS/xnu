@@ -146,6 +146,14 @@ public:
 	virtual uint64_t hardwareQueueReached(int hq);
 	virtual bool hardwareQueueFaulted(int hq, uint64_t seqno);
 	virtual void *completionEvent(void);
+	/*
+	 * The vendor's own selectors, after IOGPU's 56 (as Apple's AGX adds its own behind the base table): called with
+	 * the client and its address space (made if need be); clientGone when the client closes, before its address space
+	 * goes, for whatever the vendor made for it.
+	 */
+	enum { kIOGPUVendorSelectorBase = 56 };
+	virtual IOReturn vendorMethod(OSObject *client, int as, uint32_t selector, IOExternalMethodArguments *args);
+	virtual void clientGone(OSObject *client, int as);
 
 	IOBufferMemoryDescriptor *stampMemory(void) { return fStamps; }
 	uint32_t stampOffset(unsigned channel) { return channel * sizeof(uint32_t); }
