@@ -571,10 +571,15 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 
 		if (phone_port < 0x8000) {
 			uint32_t button = phone_port - 0x7f00;   /* HAKIOS_BUTTON_LOCK 1, VOLUME_UP 2, VOLUME_DOWN 3, HOME 4 */
+			/* ... and to the kernel's buttons service when it is there (hid_buttons=1; else a no-op): Consumer usages */
+			static const uint32_t usage[5] = { 0, 0x30, 0xe9, 0xea, 0x40 };
+			extern void akios_hid_buttons_post(uint32_t usage_page, uint32_t usage, int down);
 
 			hakios_touch_inject(4 /* HAKIOS_BUTTON_DOWN */, button, 0, 0);
+			akios_hid_buttons_post(0x0c, usage[button], 1);
 			delay(100000);
 			hakios_touch_inject(5 /* HAKIOS_BUTTON_UP */, button, 0, 0);
+			akios_hid_buttons_post(0x0c, usage[button], 0);
 		} else {
 			uint32_t kind = (phone_port >> 13) & 3, x = ((phone_port >> 7) & 63) * 65535u / 63, y = (phone_port & 127) * 65535u / 127;
 

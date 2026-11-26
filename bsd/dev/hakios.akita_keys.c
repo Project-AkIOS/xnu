@@ -1,6 +1,9 @@
 /*
  * The keys of the Pixel 8a (akita) -- power, volume up, volume down -- as a source of button records for
- * /dev/hakios-touch (sys/hakios.input.h). Only with boot-arg buttons=1.
+ * /dev/hakios-touch (sys/hakios.input.h, boot-arg buttons=1) and of key events for the kernel's button service
+ * (iokit/Kernel/AkitaButtons.cpp, an IOHIDEventService that backboardd reads directly; boot-arg hid_buttons=1).
+ * Either boot-arg starts the polling; each turns on its own way out, and both may be on at once (the injection in
+ * backboardd then must not send /dev/hakios-touch's button records on as events: see AkitaButtons.cpp).
  *
  * Unlike the reference phone's, all three are pins of the SoC (Android's tree: gpio_keys, button@1..3, gpios on
  * gpa4 and gpa6), of zuma's always-on pin controller (pinctrl@154D0000, google,zuma-pinctrl). Its banks follow one
@@ -36,6 +39,7 @@
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern void akios_hid_buttons_post(uint32_t usage_page, uint32_t usage, int down);     /* AkitaButtons.cpp */
 
 #define ALIVE_PINCTRL           0x154d0000ULL
 #define ALIVE_PINCTRL_SIZE      0x1000
@@ -45,20 +49,31 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define BANK_DAT                0x4
 #define POLL_MS                 16
 
+/* the HID usages of the iPhone's buttons (AppleM68Buttons: hold, volup, voldown), all on the Consumer page */
+#define HID_PAGE_CONSUMER       0x0c
+#define HID_USAGE_POWER         0x30
+#define HID_USAGE_VOLUME_UP     0xe9
+#define HID_USAGE_VOLUME_DOWN   0xea
+
 static struct akita_key {
 	const char *name;
 	uint32_t record;        /* HAKIOS_BUTTON_* */
+	uint32_t usage;         /* its HID usage on the Consumer page */
 	uint32_t bank, pin;
 	int usable;             /* the pin is an input or an interrupt pin */
 	int seen_released;      /* not believed held before it has been seen up */
 	int held;               /* as last reported */
 	int last;               /* the last look */
 } keys[] = {
-	{ .name = "power", .record = HAKIOS_BUTTON_LOCK, .bank = BANK_GPA4, .pin = 0 },
-	{ .name = "volume down", .record = HAKIOS_BUTTON_VOLUME_DOWN, .bank = BANK_GPA4, .pin = 1 },
-	{ .name = "volume up", .record = HAKIOS_BUTTON_VOLUME_UP, .bank = BANK_GPA6, .pin = 2 },
+	{ .name = "power", .record = HAKIOS_BUTTON_LOCK, .usage = HID_USAGE_POWER, .bank = BANK_GPA4, .pin = 0 },
+	{ .name = "volume down", .record = HAKIOS_BUTTON_VOLUME_DOWN, .usage = HID_USAGE_VOLUME_DOWN, .bank = BANK_GPA4,
+	  .pin = 1 },
+	{ .name = "volume up", .record = HAKIOS_BUTTON_VOLUME_UP, .usage = HID_USAGE_VOLUME_UP, .bank = BANK_GPA6,
+	  .pin = 2 },
 };
 
+static int to_touch_device;     /* buttons=1: records for /dev/hakios-touch */
+static int to_hid_service;      /* hid_buttons=1: key events for AkitaButtons */
 static vm_offset_t pinctrl;
 static thread_call_t call;
 
@@ -87,7 +102,12 @@ tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			}
 			if (k->seen_released) {
 				k->held = down;
-				hakios_touch_post(down ? HAKIOS_BUTTON_DOWN : HAKIOS_BUTTON_UP, k->record, 0, 0);
+				if (to_touch_device) {
+					hakios_touch_post(down ? HAKIOS_BUTTON_DOWN : HAKIOS_BUTTON_UP, k->record, 0, 0);
+				}
+				if (to_hid_service) {
+					akios_hid_buttons_post(HID_PAGE_CONSUMER, k->usage, down);
+				}
 				printf("akita keys: %s %s\n", k->name, down ? "pressed" : "released");
 			}
 		}
@@ -103,7 +123,14 @@ akita_keys_init(void)
 {
 	uint32_t enabled = 0;
 
-	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled)) || !enabled) {
+	if (PE_parse_boot_argn("buttons", &enabled, sizeof(enabled)) && enabled) {
+		to_touch_device = 1;
+	}
+	enabled = 0;
+	if (PE_parse_boot_argn("hid_buttons", &enabled, sizeof(enabled)) && enabled) {
+		to_hid_service = 1;
+	}
+	if (!to_touch_device && !to_hid_service) {
 		return;                 /* nothing is touched unless a boot-argument asks */
 	}
 	pinctrl = ml_io_map(ALIVE_PINCTRL, ALIVE_PINCTRL_SIZE);

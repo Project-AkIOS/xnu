@@ -1040,6 +1040,11 @@ extern void hakios_boot_step_log(const char *prefix, const char *message);
 
 			hakios_haptics_ready_init(); /* AHSFirmwareReadyNotifier: audiomxd's haptic server waits for it (11-23) */
 		}
+		{
+			extern void akios_hid_buttons_init(void);
+
+			akios_hid_buttons_init();    /* AkitaButtons, the keys as an IOHIDEventService; boot-arg hid_buttons=1 (11-26) */
+		}
 		hakios_audio_init();           /* /dev/hakios-audio */
 		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
 #if APFS
