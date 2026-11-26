@@ -20,6 +20,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOSharedDataQueue.h>
 
 class IOAcceleratorES : public IOService
 {
@@ -60,6 +61,41 @@ protected:
 	IOBufferMemoryDescriptor *fStamps;      /* u32 stamps that the GPU's completions advance; mapped read-only into clients */
 	void retireStandIns(void);
 
+	/* submitted command buffers waiting for the GPU (completionThread posts their "completed" notifications) */
+	struct pending {
+		struct pending *next;
+		OSObject *owner;                /* the user client (held): its queue, for draining at delete */
+		uint32_t queueID;
+		int hq;                         /* -1: given up (its queue went): completes with an error at once */
+		uint64_t seqno;
+		uint64_t token;                 /* the "completed" block, echoed back */
+		uint64_t startNs;
+		IOSharedDataQueue *nq;          /* held */
+	};
+	struct pending *fPending;
+	IOLock *fSubmitLock;                    /* fPending, and every notification queue's enqueue and port */
+	thread_t fCompletionThread;
+	static void completionThread(void *self, wait_result_t);
+	void completeReached(bool all);
+
+public:
+	/* (the notification entry IOGPU.framework dequeues: 0x28 bytes) */
+	struct notification {
+		uint64_t token;
+		uint64_t startNs, endNs;
+		uint32_t status, pad;
+		uint64_t faultAddress;
+	};
+	static uint64_t nowNs(void);
+	void lockSubmissions(void) { IOLockLock(fSubmitLock); }
+	void unlockSubmissions(void) { IOLockUnlock(fSubmitLock); }
+	/* (fSubmitLock held) */
+	static void notify(IOSharedDataQueue *nq, uint64_t token, uint64_t startNs, uint64_t endNs, uint32_t status);
+	void addPending(OSObject *owner, uint32_t queueID, int hq, uint64_t seqno, uint64_t token, uint64_t startNs,
+	    IOSharedDataQueue *nq);
+	/* a queue going: wait for its work (2 s at most), then complete what is left with an error */
+	void drainQueue(OSObject *owner, uint32_t queueID);
+
 public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
@@ -85,6 +121,19 @@ public:
 	    uint32_t flags);
 	/* the pages gone from the GPU's tables, and the GPU's view updated before this returns (the memory may go next) */
 	virtual void unmapFromAddressSpace(int as, uint64_t va, uint64_t len);
+
+	/*
+	 * The GPU's own queues (Apple's channels/work queues): one per IOGPU command queue, in its client's address space.
+	 * Work goes in as (GPU address, length) of a vendor stream; each submission gets a sequence number 1, 2, ...
+	 * (0: refused), and reached() says how far the GPU is. completionEvent() is woken when the GPU may have finished
+	 * something (its interrupt).
+	 */
+	virtual int newHardwareQueue(int as, uint8_t priority);
+	virtual void freeHardwareQueue(int hq);
+	virtual uint64_t submitToHardwareQueue(int hq, uint64_t stream, uint32_t length);
+	virtual uint64_t hardwareQueueReached(int hq);
+	virtual bool hardwareQueueFaulted(int hq, uint64_t seqno);
+	virtual void *completionEvent(void);
 
 	IOBufferMemoryDescriptor *stampMemory(void) { return fStamps; }
 	uint32_t stampOffset(unsigned channel) { return channel * sizeof(uint32_t); }

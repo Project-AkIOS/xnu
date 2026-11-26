@@ -194,6 +194,12 @@ public:
 	virtual bool mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint64_t offset, uint64_t len,
 	    uint32_t flags) APPLE_KEXT_OVERRIDE;
 	virtual void unmapFromAddressSpace(int as, uint64_t va, uint64_t len) APPLE_KEXT_OVERRIDE;
+	virtual int newHardwareQueue(int as, uint8_t priority) APPLE_KEXT_OVERRIDE;
+	virtual void freeHardwareQueue(int hq) APPLE_KEXT_OVERRIDE;
+	virtual uint64_t submitToHardwareQueue(int hq, uint64_t stream, uint32_t length) APPLE_KEXT_OVERRIDE;
+	virtual uint64_t hardwareQueueReached(int hq) APPLE_KEXT_OVERRIDE;
+	virtual bool hardwareQueueFaulted(int hq, uint64_t seqno) APPLE_KEXT_OVERRIDE;
+	virtual void *completionEvent(void) APPLE_KEXT_OVERRIDE { return &mali_irq_event; }
 };
 OSDefineMetaClassAndStructors(HakiosGPU, IOGPU);
 
@@ -283,6 +289,60 @@ HakiosGPU::unmapFromAddressSpace(int as, uint64_t va, uint64_t len)
 	akita_mali_vm_unmap(as, va, len);
 	akita_mali_vm_flush(as);        /* at once: the memory is given back after this */
 	IOLockUnlock(gLock);
+}
+
+/* an IOGPU command queue's hardware queue: a CSF group of one queue (its ring 64 KiB) */
+int
+HakiosGPU::newHardwareQueue(int as, uint8_t priority)
+{
+	const uint32_t ring = 64 * 1024;
+	int g;
+
+	IOLockLock(gLock);
+	g = akita_mali_group_new(as, 1, &ring, priority);
+	IOLockUnlock(gLock);
+	return g;
+}
+
+void
+HakiosGPU::freeHardwareQueue(int hq)
+{
+	IOLockLock(gLock);
+	akita_mali_group_free(hq);
+	IOLockUnlock(gLock);
+}
+
+uint64_t
+HakiosGPU::submitToHardwareQueue(int hq, uint64_t stream, uint32_t length)
+{
+	uint64_t seqno;
+
+	IOLockLock(gLock);
+	seqno = akita_mali_submit(hq, 0, stream, length);
+	IOLockUnlock(gLock);
+	return seqno;
+}
+
+uint64_t
+HakiosGPU::hardwareQueueReached(int hq)
+{
+	uint64_t seqno;
+
+	IOLockLock(gLock);
+	seqno = akita_mali_reached(hq, 0);
+	IOLockUnlock(gLock);
+	return seqno;
+}
+
+bool
+HakiosGPU::hardwareQueueFaulted(int hq, uint64_t seqno)
+{
+	bool lost;
+
+	IOLockLock(gLock);
+	lost = akita_mali_lost(hq, 0, seqno);
+	IOLockUnlock(gLock);
+	return lost;
 }
 
 void

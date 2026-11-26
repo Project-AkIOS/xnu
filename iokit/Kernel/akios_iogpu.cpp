@@ -62,8 +62,141 @@ IOGPU::start(IOService *provider)
 		return false;
 	}
 	bzero(fStamps->getBytesNoCopy(), page_size);
+	fSubmitLock = IOLockAlloc();
+	if (fSubmitLock == NULL || kernel_thread_start(completionThread, this, &fCompletionThread) != KERN_SUCCESS) {
+		return false;
+	}
 	retireStandIns();
 	return true;
+}
+
+uint64_t
+IOGPU::nowNs(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+void
+IOGPU::notify(IOSharedDataQueue *nq, uint64_t token, uint64_t startNs, uint64_t endNs, uint32_t status)
+{
+	struct notification n = { token, startNs, endNs, status, 0, 0 };
+	static int said;
+
+	/* (the standard "data available" message goes to the port when the queue was empty: IODataQueue's own) */
+	if (nq == NULL || !nq->enqueue(&n, sizeof(n))) {
+		if (said++ < 8) {
+			IOLog("IOGPU: a notification (token 0x%llx, status %u) found no room\n", token, status);
+		}
+	}
+}
+
+void
+IOGPU::addPending(OSObject *owner, uint32_t queueID, int hq, uint64_t seqno, uint64_t token, uint64_t startNs,
+    IOSharedDataQueue *nq)
+{
+	struct pending *p = (struct pending *)IOMallocZero(sizeof(*p));
+
+	if (p == NULL) {
+		notify(nq, token, startNs, nowNs(), 1);
+		return;
+	}
+	owner->retain();
+	nq->retain();
+	p->owner = owner;
+	p->queueID = queueID;
+	p->hq = hq;
+	p->seqno = seqno;
+	p->token = token;
+	p->startNs = startNs;
+	p->nq = nq;
+	p->next = fPending;
+	fPending = p;
+	thread_wakeup(&fPending);
+}
+
+/* (fSubmitLock held) the submissions the GPU has passed get their "completed" notification; all: every one */
+void
+IOGPU::completeReached(bool all)
+{
+	struct pending **pp = &fPending, *p;
+
+	while ((p = *pp) != NULL) {
+		uint32_t status = 0;
+
+		if (p->hq < 0) {
+			status = 1;                     /* (its queue went before the GPU said) */
+		} else if (hardwareQueueReached(p->hq) < p->seqno) {
+			if (!all) {
+				pp = &p->next;
+				continue;
+			}
+			status = 1;
+		} else if (hardwareQueueFaulted(p->hq, p->seqno)) {
+			status = 0xb;                   /* kIOGPUCommandBufferCallbackErrorPageFault: MTLCommandBufferErrorPageFault */
+		}
+		notify(p->nq, p->token, p->startNs, nowNs(), status);
+		*pp = p->next;
+		p->nq->release();
+		p->owner->release();
+		IOFree(p, sizeof(*p));
+	}
+}
+
+/*
+ * Completions: woken by the GPU's interrupt (completionEvent) and by new submissions; a millisecond's look at most
+ * while work is out, in case an interrupt is missed.
+ */
+void
+IOGPU::completionThread(void *self, wait_result_t)
+{
+	IOGPU *gpu = (IOGPU *)self;
+
+	thread_set_thread_name(current_thread(), "IOGPU completions");
+	IOLockLock(gpu->fSubmitLock);
+	for (;;) {
+		gpu->completeReached(false);
+		if (gpu->fPending == NULL) {
+			IOLockSleep(gpu->fSubmitLock, &gpu->fPending, THREAD_UNINT);
+			continue;
+		}
+		void *event = gpu->completionEvent();
+		assert_wait_timeout(event != NULL ? event : (void *)&gpu->fPending, THREAD_UNINT, 1, NSEC_PER_MSEC);
+		IOLockUnlock(gpu->fSubmitLock);
+		thread_block(THREAD_CONTINUE_NULL);
+		IOLockLock(gpu->fSubmitLock);
+	}
+}
+
+void
+IOGPU::drainQueue(OSObject *owner, uint32_t queueID)
+{
+	for (int ms = 0; ms < 2000; ms++) {
+		bool left = false;
+
+		IOLockLock(fSubmitLock);
+		completeReached(false);
+		for (struct pending *p = fPending; p != NULL; p = p->next) {
+			left |= p->owner == owner && p->queueID == queueID;
+		}
+		if (!left) {
+			IOLockUnlock(fSubmitLock);
+			return;
+		}
+		IOLockUnlock(fSubmitLock);
+		IOSleep(1);
+	}
+	IOLockLock(fSubmitLock);
+	for (struct pending *p = fPending; p != NULL; p = p->next) {
+		if (p->owner == owner && p->queueID == queueID) {
+			p->hq = -1;
+		}
+	}
+	completeReached(false);
+	IOLockUnlock(fSubmitLock);
+	IOLog("IOGPU: a command queue went with work the GPU had not finished in 2 s\n");
 }
 
 /*
@@ -141,6 +274,41 @@ IOGPU::mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint64_t
 void
 IOGPU::unmapFromAddressSpace(int as, uint64_t va, uint64_t len)
 {
+}
+
+int
+IOGPU::newHardwareQueue(int as, uint8_t priority)
+{
+	return -1;
+}
+
+void
+IOGPU::freeHardwareQueue(int hq)
+{
+}
+
+uint64_t
+IOGPU::submitToHardwareQueue(int hq, uint64_t stream, uint32_t length)
+{
+	return 0;
+}
+
+uint64_t
+IOGPU::hardwareQueueReached(int hq)
+{
+	return 0;
+}
+
+bool
+IOGPU::hardwareQueueFaulted(int hq, uint64_t seqno)
+{
+	return false;
+}
+
+void *
+IOGPU::completionEvent(void)
+{
+	return NULL;
 }
 
 IOReturn
@@ -226,7 +394,17 @@ class IOGPUDeviceUserClient : public IOUserClient
 	void releaseResource(struct resource *r);
 	IOReturn deleteResource(uint32_t id);
 
+	/* command queues (selector 6): the id is the index + 1 */
+	enum { kMaxQueues = 64, kMaxNotificationQueues = 64 };
+	struct queue { bool used; int hq; uint32_t nq; } fQueues[kMaxQueues];
+	struct nqueue { IOSharedDataQueue *queue; IOMemoryMap *map; mach_port_t port; } fNQueues[kMaxNotificationQueues];
+	bool addressSpace(void);
+	void deleteQueue(uint32_t id);
+	void destroyNotificationQueue(uint32_t id);
+	IOReturn submit(uint32_t queueID, const uint8_t *args, uint32_t argsSize, uint32_t count);
+
 	static const IOExternalTrap sTraps[14];
+	IOReturn t_submit_command_buffer(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
 	IOReturn t_unsupported(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
 	IOReturn t_delete_resource(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
 	IOReturn t_finish_resource_event(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
@@ -249,6 +427,12 @@ class IOGPUDeviceUserClient : public IOUserClient
 	static IOReturn s_perform_mapping(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_new_resource(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_delete_resource(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_new_command_queue(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_delete_command_queue(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_create_notificationqueue(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_destroy_notificationqueue(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_set_notification_queue(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_submit_command_buffers(OSObject *target, void *reference, IOExternalMethodArguments *args);
 
 public:
 	bool setUp(IOGPU *gpu, task_t task, void *securityID, uint32_t options);
@@ -257,6 +441,8 @@ public:
 	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
 	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
 	virtual IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(IOGPUDeviceUserClient, IOUserClient);
@@ -273,16 +459,16 @@ const IOExternalMethodDispatch IOGPUDeviceUserClient::sMethods[56] = {
 	M(s_get_current_trace_filter, 0, 0, 0, 8),      /*  3 */
 	M(s_get_device_info, 0, 0, 0, 0x20),            /*  4 */
 	M(s_get_next_gid_group, 0, 0, 0, 0x10),         /*  5 */
-	U(0, V, 0, 0x10),                               /*  6 new_command_queue */
-	U(1, 0, 0, 0),                                  /*  7 delete_command_queue */
+	M(s_new_command_queue, 0, 0x408, 0, 0x10),      /*  6 */
+	M(s_delete_command_queue, 1, 0, 0, 0),          /*  7 */
 	M(s_new_resource, 0, V, 0, V),                  /*  8 */
 	M(s_delete_resource, 1, 0, 0, 0),               /*  9 */
 	U(2, 0, 0, 0),                                  /* 10 finish_object_event */
 	U(2, 0, 1, 0),                                  /* 11 set_resource_purgeable */
 	M(s_create_shmem, 2, 0, 0, 0x10),               /* 12 */
 	M(s_destroy_shmem, 1, 0, 0, 0),                 /* 13 */
-	U(2, 0, 0, 0x10),                               /* 14 create_notificationqueue */
-	U(1, 0, 0, 0),                                  /* 15 destroy_notificationqueue */
+	M(s_create_notificationqueue, 2, 0, 0, 0x10),   /* 14 */
+	M(s_destroy_notificationqueue, 1, 0, 0, 0),     /* 15 */
 	M(s_get_shared_info, 0, 0, 0, 8),               /* 16 */
 	U(0, 0, 0, 4),                                  /* 17 create_mtlfence */
 	U(1, 0, 0, 0),                                  /* 18 destroy_mtlfence */
@@ -291,8 +477,8 @@ const IOExternalMethodDispatch IOGPUDeviceUserClient::sMethods[56] = {
 	M(s_get_memory_data, 0, 0, 0, 0x30),            /* 21 */
 	U(0, 0, 0, V),                                  /* 22 unsupported (Apple's too) */
 	M(s_get_allocated_size, 0, 0, 1, 0),            /* 23 */
-	U(2, 0, 0, 0),                                  /* 24 set_notification_queue */
-	U(4, V, 1, 0),                                  /* 25 submit_command_buffers */
+	M(s_set_notification_queue, 2, 0, 0, 0),        /* 24 */
+	M(s_submit_command_buffers, 4, V, 1, 0),        /* 25 */
 	U(1, 0xc, 1, 0),                                /* 26 set_priority_and_background */
 	U(1, 4, 0, 0),                                  /* 27 set_quality_of_service */
 	U(0, 0, 2, 0),                                  /* 28 create_mtllateevalevent */
@@ -375,6 +561,15 @@ IOGPUDeviceUserClient::setUp(IOGPU *gpu, task_t task, void *securityID, uint32_t
 void
 IOGPUDeviceUserClient::releaseAll(void)
 {
+	for (uint32_t i = 1; i <= kMaxQueues; i++) {
+		deleteQueue(i);
+	}
+	for (uint32_t i = 1; i <= kMaxNotificationQueues; i++) {
+		destroyNotificationQueue(i);
+	}
+	if (fLock != NULL) {
+		IOLockLock(fLock);
+	}
 	for (uint32_t i = 0; i < fResourceCount; i++) {
 		if (fResources[i] != NULL) {
 			releaseResource(fResources[i]);
@@ -399,16 +594,15 @@ IOGPUDeviceUserClient::releaseAll(void)
 		OSSafeReleaseNULL(fShmem[i].memory);
 	}
 	OSSafeReleaseNULL(fStampMap);
+	if (fLock != NULL) {
+		IOLockUnlock(fLock);
+	}
 }
 
 IOReturn
 IOGPUDeviceUserClient::clientClose(void)
 {
-	if (fLock != NULL) {
-		IOLockLock(fLock);
-		releaseAll();
-		IOLockUnlock(fLock);
-	}
+	releaseAll();           /* (it takes the locks it needs: deleting a queue waits for the GPU, unlocked) */
 	terminate();
 	return kIOReturnSuccess;
 }
@@ -875,11 +1069,8 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 	}
 
 	IOLockLock(me->fLock);
-	if (ret == kIOReturnSuccess && me->fAS < 0) {
-		me->fAS = me->fGPU->newAddressSpace();
-		if (me->fAS < 0) {
-			ret = kIOReturnNoResources;
-		}
+	if (ret == kIOReturnSuccess && !me->addressSpace()) {
+		ret = kIOReturnNoResources;
 	}
 	if (ret == kIOReturnSuccess && !me->fGPU->mapIntoAddressSpace(me->fAS, r->gpuBase, r->memory, 0, r->gpuLength,
 	    gpuFlags)) {
@@ -956,7 +1147,7 @@ IOGPUDeviceUserClient::s_delete_resource(OSObject *target, void *reference, IOEx
 
 #define T(fn) { NULL, (IOTrap)&IOGPUDeviceUserClient::fn }
 const IOExternalTrap IOGPUDeviceUserClient::sTraps[14] = {
-	T(t_unsupported),               /*  0 submit_command_buffer */
+	T(t_submit_command_buffer),     /*  0 */
 	T(t_delete_resource),           /*  1 */
 	T(t_finish_resource_event),     /*  2 */
 	T(t_set_resource_purgeable),    /*  3 */
@@ -1032,4 +1223,290 @@ IOGPUDeviceUserClient::t_set_resource_purgeable(void *p1, void *p2, void *p3, vo
 		return kIOReturnBadArgument;
 	}
 	return kIOReturnSuccess;
+}
+
+/* ---- command queues, notification queues, submission ---- */
+
+/* (fLock held) the client's GPU address space, made on first use */
+bool
+IOGPUDeviceUserClient::addressSpace(void)
+{
+	if (fAS < 0) {
+		fAS = fGPU->newAddressSpace();
+	}
+	return fAS >= 0;
+}
+
+/*
+ * Selector 6: the process's path (0x400 bytes), +0x400 QoS level, +0x404 "OpenGL queue". Answer (queue id, global
+ * trace id). A hardware queue of its own in the client's address space.
+ */
+IOReturn
+IOGPUDeviceUserClient::s_new_command_queue(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	uint64_t *out = (uint64_t *)args->structureOutput;
+	IOReturn ret = kIOReturnNoResources;
+	uint32_t i;
+
+	bzero(out, args->structureOutputSize);
+	IOLockLock(me->fLock);
+	for (i = 0; i < kMaxQueues && me->fQueues[i].used; i++) {
+	}
+	if (i < kMaxQueues && me->addressSpace()) {
+		int hq = me->fGPU->newHardwareQueue(me->fAS, 2);
+
+		if (hq >= 0) {
+			me->fQueues[i].used = true;
+			me->fQueues[i].hq = hq;
+			me->fQueues[i].nq = 0;
+			out[0] = i + 1;
+			out[1] = IOGPU::nextObjectIDs(1);
+			ret = kIOReturnSuccess;
+		}
+	}
+	IOLockUnlock(me->fLock);
+	return ret;
+}
+
+void
+IOGPUDeviceUserClient::deleteQueue(uint32_t id)
+{
+	int hq;
+
+	if (id < 1 || id > kMaxQueues || fLock == NULL || fGPU == NULL) {
+		return;
+	}
+	IOLockLock(fLock);
+	if (!fQueues[id - 1].used) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	hq = fQueues[id - 1].hq;
+	fQueues[id - 1].used = false;
+	IOLockUnlock(fLock);
+	fGPU->drainQueue(this, id);
+	fGPU->freeHardwareQueue(hq);
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_delete_command_queue(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	((IOGPUDeviceUserClient *)target)->deleteQueue((uint32_t)args->scalarInput[0]);
+	return kIOReturnSuccess;
+}
+
+/* Selector 14: (entries, entry size) -> (the queue's memory in the task, id): xnu's IOSharedDataQueue, as Apple's */
+IOReturn
+IOGPUDeviceUserClient::s_create_notificationqueue(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	uint64_t entries = args->scalarInput[0], size = args->scalarInput[1];
+	struct { uint64_t address; uint32_t id, pad; } *out = (decltype(out))args->structureOutput;
+	IOSharedDataQueue *q;
+	IOMemoryDescriptor *md;
+	IOMemoryMap *map;
+	uint32_t i;
+
+	bzero(out, args->structureOutputSize);
+	if (entries < 1 || entries > 0x2000 || size < 1 || size > sizeof(IOGPU::notification)) {
+		return kIOReturnBadArgument;
+	}
+	q = IOSharedDataQueue::withEntries((UInt32)entries, (UInt32)size);
+	md = q != NULL ? q->getMemoryDescriptor() : NULL;
+	map = md != NULL ? md->createMappingInTask(me->fTask, 0, kIOMapAnywhere) : NULL;
+	OSSafeReleaseNULL(md);
+	if (map == NULL) {
+		OSSafeReleaseNULL(q);
+		return kIOReturnNoMemory;
+	}
+	me->fGPU->lockSubmissions();
+	for (i = 0; i < kMaxNotificationQueues && me->fNQueues[i].queue != NULL; i++) {
+	}
+	if (i < kMaxNotificationQueues) {
+		me->fNQueues[i].queue = q;
+		me->fNQueues[i].map = map;
+		me->fNQueues[i].port = MACH_PORT_NULL;
+	}
+	me->fGPU->unlockSubmissions();
+	if (i == kMaxNotificationQueues) {
+		map->release();
+		q->release();
+		return kIOReturnNoResources;
+	}
+	out->address = map->getAddress();
+	out->id = i + 1;
+	return kIOReturnSuccess;
+}
+
+void
+IOGPUDeviceUserClient::destroyNotificationQueue(uint32_t id)
+{
+	struct nqueue n;
+
+	if (id < 1 || id > kMaxNotificationQueues || fGPU == NULL) {
+		return;
+	}
+	fGPU->lockSubmissions();
+	n = fNQueues[id - 1];
+	bzero(&fNQueues[id - 1], sizeof(fNQueues[0]));
+	if (n.queue != NULL) {
+		n.queue->setNotificationPort(MACH_PORT_NULL);  /* (submissions still out hold the queue, not the port) */
+	}
+	fGPU->unlockSubmissions();
+	if (n.port != MACH_PORT_NULL) {
+		releaseNotificationPort(n.port);
+	}
+	OSSafeReleaseNULL(n.map);
+	OSSafeReleaseNULL(n.queue);
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_destroy_notificationqueue(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	((IOGPUDeviceUserClient *)target)->destroyNotificationQueue((uint32_t)args->scalarInput[0]);
+	return kIOReturnSuccess;
+}
+
+/* IOConnectSetNotificationPort(connection, 0, port, notification queue id): once a queue */
+IOReturn
+IOGPUDeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
+{
+	IOReturn ret = kIOReturnBadArgument;
+
+	if (type != 0 || refCon < 1 || refCon > kMaxNotificationQueues) {
+		return kIOReturnBadArgument;
+	}
+	fGPU->lockSubmissions();
+	if (fNQueues[refCon - 1].queue != NULL && fNQueues[refCon - 1].port == MACH_PORT_NULL) {
+		fNQueues[refCon - 1].port = port;
+		fNQueues[refCon - 1].queue->setNotificationPort(port);
+		ret = kIOReturnSuccess;
+	}
+	fGPU->unlockSubmissions();
+	return ret;
+}
+
+IOReturn
+IOGPUDeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon)
+{
+	return registerNotificationPort(port, type, (io_user_reference_t)refCon);
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_set_notification_queue(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	uint64_t qid = args->scalarInput[0], nq = args->scalarInput[1];
+	IOReturn ret = kIOReturnBadArgument;
+
+	IOLockLock(me->fLock);
+	if (qid >= 1 && qid <= kMaxQueues && me->fQueues[qid - 1].used && nq >= 1 && nq <= kMaxNotificationQueues) {
+		me->fQueues[qid - 1].nq = (uint32_t)nq;
+		ret = kIOReturnSuccess;
+	}
+	IOLockUnlock(me->fLock);
+	return ret;
+}
+
+/*
+ * One command buffer's arguments: IOGPU's common 0x30 bytes, then ours.
+ *   +0x00 kernel-command shmem, +0x04 segment list, +0x08 sideband, +0x10 "scheduled" token, +0x18 "completed"
+ *   token, +0x20 debug shmem; +0x30 the vendor's: the GPU address and length of the stream to run (none: no GPU work).
+ * The kernel commands and the segment list (residency, events) are not read yet.
+ */
+struct IOGPUCommandBufferArgs {
+	uint32_t kernelCommandsShmem, segmentListShmem, sidebandShmem, pad0c;
+	uint64_t scheduledToken, completedToken;
+	uint32_t debugShmem, pad24;
+	uint64_t pad28;
+	uint64_t stream;                /* +0x30 */
+	uint32_t streamLength;          /* +0x38 */
+	uint32_t streamFlags;           /* +0x3c */
+};
+
+IOReturn
+IOGPUDeviceUserClient::submit(uint32_t queueID, const uint8_t *args, uint32_t argsSize, uint32_t count)
+{
+	struct queue q;
+	IOSharedDataQueue *nq = NULL;
+	static int said;
+
+	if (argsSize < 0x30 || argsSize > sizeof(IOGPUCommandBufferArgs)) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(fLock);
+	q = queueID >= 1 && queueID <= kMaxQueues ? fQueues[queueID - 1] : (struct queue){ false, -1, 0 };
+	IOLockUnlock(fLock);
+	if (!q.used || q.nq == 0) {
+		return kIOReturnBadArgument;
+	}
+	fGPU->lockSubmissions();
+	nq = fNQueues[q.nq - 1].queue;
+	if (nq != NULL) {
+		nq->retain();
+	}
+	fGPU->unlockSubmissions();
+	if (nq == NULL) {
+		return kIOReturnBadArgument;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		IOGPUCommandBufferArgs a;
+		uint64_t start = IOGPU::nowNs(), seqno = 0;
+
+		bzero(&a, sizeof(a));
+		memcpy(&a, args + (size_t)i * argsSize, argsSize);
+		if (a.streamLength != 0) {
+			seqno = fGPU->submitToHardwareQueue(q.hq, a.stream, a.streamLength);
+			if (seqno == 0 && said++ < 8) {
+				IOLog("IOGPU: a stream (0x%llx, %u bytes) was refused by the GPU's queue\n", a.stream, a.streamLength);
+			}
+		}
+		fGPU->lockSubmissions();
+		IOGPU::notify(nq, a.scheduledToken, start, start, 0);
+		if (a.streamLength == 0) {
+			IOGPU::notify(nq, a.completedToken, start, IOGPU::nowNs(), 0);   /* nothing for the GPU to do */
+		} else if (seqno == 0) {
+			IOGPU::notify(nq, a.completedToken, start, IOGPU::nowNs(), 0xa); /* InvalidInput */
+		} else {
+			fGPU->addPending(this, queueID, q.hq, seqno, a.completedToken, start, nq);
+		}
+		fGPU->unlockSubmissions();
+	}
+	nq->release();
+	return kIOReturnSuccess;
+}
+
+/* Selector 25: (queue, flags (0), count, argument size), count * size bytes of arguments */
+IOReturn
+IOGPUDeviceUserClient::s_submit_command_buffers(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	uint64_t count = args->scalarInput[2], size = args->scalarInput[3];
+
+	args->scalarOutput[0] = 0;
+	if (count == 0 || count > 256 || size == 0 || count * size != args->structureInputSize) {
+		return kIOReturnBadArgument;
+	}
+	return me->submit((uint32_t)args->scalarInput[0], (const uint8_t *)args->structureInput, (uint32_t)size,
+	           (uint32_t)count);
+}
+
+/* Trap 0: (queue, argument size, arguments, where a u32 status goes): one command buffer, IOGPU.framework's fast path */
+IOReturn
+IOGPUDeviceUserClient::t_submit_command_buffer(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6)
+{
+	uint8_t args[sizeof(IOGPUCommandBufferArgs)];
+	uint32_t size = (uint32_t)(uintptr_t)p2, status;
+	IOReturn ret;
+
+	if (size < 0x30 || size > sizeof(args) || copyin((user_addr_t)(uintptr_t)p3, args, size) != 0) {
+		return kIOReturnBadArgument;
+	}
+	ret = submit((uint32_t)(uintptr_t)p1, args, size, 1);
+	status = 0;
+	if (p4 != NULL) {
+		copyout(&status, (user_addr_t)(uintptr_t)p4, sizeof(status));
+	}
+	return ret;
 }
