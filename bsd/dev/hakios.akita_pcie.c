@@ -752,9 +752,14 @@ pcie_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	phy2 = (volatile uint8_t *)ml_io_map(PCIE2_PHY, 0x2000);
 	udbg2 = (volatile uint8_t *)ml_io_map(PCIE2_UDBG, 0x1000);
 	pmu_update(PMU_PCIE1_PHY, 1, 1);
-	printf("pcie: 3: isolation off (PMU 0x%08x); ELBI: LTSSM 0x%02x, soft reset 0x%x, D state %u; root port %08x\n",
-	    pmu_read(PMU_PCIE1_PHY), rd(elbi, ELBI_LINKUP) & 0x3f, rd(elbi, ELBI_SOFT_RESET), rd(elbi, ELBI_PM_DSTATE) & 3,
-	    rd(dbi, CFG_ID));
+	/*
+	 * (11-26) the DBI is NOT read here: the controller's core clock comes from the PHY, which is powered down or in the
+	 * bootloader's state now -- a DBI read before the PHY locks is the likely source of the SError ~1 boot in 20
+	 * (fragile-mem-zones 11-21 08:43: the panic came right after this line, which read the root port's id). Android's
+	 * first DBI access is after the PHY's configuration (setup_rc).
+	 */
+	printf("pcie: 3: isolation off (PMU 0x%08x); ELBI: LTSSM 0x%02x, soft reset 0x%x, D state %u\n",
+	    pmu_read(PMU_PCIE1_PHY), rd(elbi, ELBI_LINKUP) & 0x3f, rd(elbi, ELBI_SOFT_RESET), rd(elbi, ELBI_PM_DSTATE) & 3);
 	phy_power_down();
 	phy2_disable();
 	wr(socr, 0x0, 0x15);

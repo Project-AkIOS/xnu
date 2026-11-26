@@ -25,6 +25,13 @@
  * structures on the other side (Apple80211GetWithIOCTL, _getScanData, _addScanResultToList,
  * _performAssociation, _dispatchAsyncAssocEvent, _dispatchLinkChangedEvent).
  *
+ * (11-26) Darwin userland 27 (24B156) grew two of them, read the same way out of its
+ * IO80211.framework: the scan request (Apple80211ScanAsync, _getScanData) by the scan's UUID and
+ * an oldest time at its end, and a scan's result (_dispatchAsyncScanEvent, _addScanResultToList,
+ * Apple80211GetWithIOCTL for CURRENT_NETWORK) by twice the room for elements and some words
+ * after them. What both had before stayed where it was. The request types' names come from its
+ * own table (convertApple80211IOCTLToString).
+ *
  * A join: ASSOCIATE (20) carries the network's name, perhaps its access point, and the
  * passphrase as typed (the framework does not make the key of it), and is answered at once;
  * when the station has joined or failed, event 9 says so, and ASSOCIATE_RESULT (21) gives the
@@ -73,7 +80,9 @@ type_name(int32_t type)
 		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
 		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
-		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
+		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 115, "POWER_DEBUG_INFO" }, { 207, "CHANNELS_INFO" },
+		{ 254, "HW_SUPPORTED_CHANNELS" }, { 365, "DISPLAY_STATE" }, { 390, "BEACON_SCAN_CACHE_REQ" }, { 473, "MIMO_CONFIG" },
+		{ 481, "HEARTBEAT" }, { 483, "EXTERNAL_POWER_STATE" }, { 485, "APP_STATE" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -114,7 +123,13 @@ struct apple80211_channels_info {
 	uint8_t unknown_3[3600];
 } __attribute__((packed));
 
-/* SCAN_REQ (10): 5456 bytes */
+/*
+ * SCAN_REQ (10): 5528 bytes (Darwin userland 27; 16.5 sent the first 5456 of them, and the
+ * same fields are where they were). The UUID is the one the framework made for the scan, as text
+ * (uuid_unparse), and comes back in each of its results; the oldest time is the framework's
+ * SCAN_MIN_TIMESTAMP, in a unit not known yet (11-26).
+ */
+#define SCAN_REQUEST_SIZE_16        5456
 struct apple80211_scan_request {
 	uint32_t version, bss_type;
 	uint8_t bssid[6], unused_0[2];
@@ -127,13 +142,28 @@ struct apple80211_scan_request {
 	uint32_t channel_count;
 	struct apple80211_channel channels[400];
 	uint64_t flags;
-	uint32_t unused_2;
+	int32_t rssi_threshold;                 /* the weakest worth hearing; INT32_MIN: no such */
 	uint32_t name_count;                    /* networks asked for by name, each in 56 bytes */
 	uint8_t names[10][56];
-	uint32_t short_ssid, unused_3;
+	uint32_t short_ssid;
+	char uuid[64];
+	uint32_t unused_3;
+	uint64_t min_timestamp;
 };
 
-/* SCAN_RESULT (11) and CURRENT_NETWORK (103): 1164 bytes */
+/*
+ * SCAN_RESULT (11) and CURRENT_NETWORK (103): 2280 bytes (Darwin userland 27; 16.5 had 1164, with
+ * room for 1024 bytes of elements and nothing after them). The framework hands in the room for
+ * elements (2048) and the scan's UUID, and reads no version. Flags: 0x1 heard in a probe
+ * response, 0x4 in a FILS discovery frame, 0x8 the name is a short SSID, 0x10 an OWE network of
+ * several names. After the elements (11-26): TIMESTAMP (a unit not known yet; 0 here),
+ * RSN_PRIORITY, a word not read into the dictionary, PHY_MODE, MRSNO, MLO and EMLSR.
+ */
+#define PHY_11A                 0x2u
+#define PHY_11B                 0x4u
+#define PHY_11G                 0x8u
+#define PHY_11N                 0x10u
+#define PHY_11AC                0x80u
 struct apple80211_scan_result {
 	uint32_t version;
 	struct apple80211_channel channel;
@@ -147,7 +177,14 @@ struct apple80211_scan_result {
 	uint32_t age_ms;
 	uint8_t flags, unused_2;
 	uint16_t elements_length;               /* comes in as the room there is */
-	uint8_t elements[1024];
+	uint8_t elements[2048];
+	char uuid[64];                          /* comes in as the scan's */
+	uint32_t unused_3;
+	uint64_t timestamp;
+	uint8_t rsn_priority, unused_4[3];
+	uint32_t unknown_0;
+	uint32_t phy_mode;                      /* PHY_* */
+	uint8_t mrsno, mlo, emlsr, unused_5;
 };
 
 /* ASSOCIATE (20): 592 bytes; of what follows the key (the RSN element wifid built, flags) nothing is used */
@@ -184,12 +221,19 @@ _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct a
 _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as Darwin userland 16.5 has it");
 _Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
     offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as Darwin userland 16.5 has it");
-_Static_assert(sizeof(struct apple80211_scan_request) == 5456 && offsetof(struct apple80211_scan_request, channels) == 0x48 &&
-    offsetof(struct apple80211_scan_request, flags) == 0x1308 && offsetof(struct apple80211_scan_request, names) == 0x1318,
-    "the scan request as Darwin userland 16.5 has it");
-_Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
-    offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
-    "a scan's result as Darwin userland 16.5 has it");
+_Static_assert(sizeof(struct apple80211_scan_request) == 5528 && offsetof(struct apple80211_scan_request, scan_type) == 0x34 &&
+    offsetof(struct apple80211_scan_request, dwell_ms) == 0x3c && offsetof(struct apple80211_scan_request, channel_count) == 0x44 &&
+    offsetof(struct apple80211_scan_request, channels) == 0x48 && offsetof(struct apple80211_scan_request, flags) == 0x1308 &&
+    offsetof(struct apple80211_scan_request, rssi_threshold) == 0x1310 && offsetof(struct apple80211_scan_request, names) == 0x1318 &&
+    offsetof(struct apple80211_scan_request, short_ssid) == 0x1548 && offsetof(struct apple80211_scan_request, uuid) == 0x154c &&
+    offsetof(struct apple80211_scan_request, min_timestamp) == 0x1590, "the scan request as Darwin userland 27 has it");
+_Static_assert(sizeof(struct apple80211_scan_result) == 2280 && offsetof(struct apple80211_scan_result, bssid) == 0x1c &&
+    offsetof(struct apple80211_scan_result, rates) == 0x24 && offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
+    offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements_length) == 0x8a &&
+    offsetof(struct apple80211_scan_result, elements) == 0x8c && offsetof(struct apple80211_scan_result, uuid) == 0x88c &&
+    offsetof(struct apple80211_scan_result, timestamp) == 0x8d0 && offsetof(struct apple80211_scan_result, rsn_priority) == 0x8d8 &&
+    offsetof(struct apple80211_scan_result, phy_mode) == 0x8e0 && offsetof(struct apple80211_scan_result, mrsno) == 0x8e4,
+    "a scan's result as Darwin userland 27 has it");
 
 /* Apple80211's events (APPLE80211_M_...) */
 enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
@@ -246,17 +290,27 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 {
 	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
 	unsigned room = sizeof(result->elements);
+	char uuid[sizeof(result->uuid)] = "";
 	int error;
 
 	if (result == NULL) {
 		return ENOMEM;
 	}
-	if (request->req_len >= sizeof(*result) && copyin(request->req_data, result, offsetof(struct apple80211_scan_result,
-	    elements)) == 0 && result->elements_length < room) {
+	/* (the room the caller said, and what its buffer has room for: a caller of 16.5's size has 1024) */
+	if (request->req_len < sizeof(*result)) {
+		room = request->req_len > offsetof(struct apple80211_scan_result, elements) ? request->req_len -
+		    (unsigned)offsetof(struct apple80211_scan_result, elements) : 0;
+	} else if (request->req_data != USER_ADDR_NULL) {
+		(void)copyin(request->req_data + offsetof(struct apple80211_scan_result, uuid), uuid, sizeof(uuid));
+	}
+	if (request->req_len >= offsetof(struct apple80211_scan_result, elements) && request->req_data != USER_ADDR_NULL &&
+	    copyin(request->req_data, result, offsetof(struct apple80211_scan_result, elements)) == 0 && result->elements_length < room) {
 		room = result->elements_length;
 	}
 	bzero(result, sizeof(*result));
 	result->version = 1;
+	memcpy(result->uuid, uuid, sizeof(result->uuid));
+	result->uuid[sizeof(result->uuid) - 1] = '\0';
 	channel_fill(&result->channel, bss->frequency, 0);
 	result->rssi = bss->rssi;
 	result->beacon_interval = bss->beacon_interval;
@@ -267,6 +321,18 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 	result->age_ms = bss->age_ms;
 	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
 	memcpy(result->elements, bss->elements, result->elements_length);
+	/* (11-26) the kinds it speaks: by band and rates, then HT (element 45) and VHT (element 191) */
+	result->phy_mode = bss->frequency >= 4000 ? PHY_11A : PHY_11B;
+	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
+	    at += 2 + bss->elements[at + 1]) {
+		for (unsigned i = 0; bss->frequency < 4000 && (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1];
+		    i++) {
+			if ((bss->elements[at + 2 + i] & 0x7f) > 22) {  /* (above 11 Mbit/s: OFDM) */
+				result->phy_mode |= PHY_11G;
+			}
+		}
+		result->phy_mode |= bss->elements[at] == 45 ? PHY_11N : bss->elements[at] == 191 ? PHY_11AC : 0;
+	}
 	/* the rates it says it has (elements 1 and 50: units of 500 kbit/s, the top bit marks the ones everybody must have) */
 	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
 	    at += 2 + bss->elements[at + 1]) {
@@ -285,9 +351,9 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 		if (said < 60) {
 			said++;
 			printf("apple80211: a network given: \"%.*s\" channel %u flags 0x%x, %d dBm, age %u ms, capability 0x%04x, elements %u of "
-			    "%u (room %u, the request %u bytes), %u rates\n", (int)result->ssid_length, result->ssid, result->channel.channel,
-			    result->channel.flags, result->rssi, result->age_ms, result->capability, result->elements_length, bss->elements_length,
-			    room, request->req_len, result->rate_count);
+			    "%u (room %u, the request %u bytes), %u rates, phy %#x\n", (int)result->ssid_length, result->ssid,
+			    result->channel.channel, result->channel.flags, result->rssi, result->age_ms, result->capability,
+			    result->elements_length, bss->elements_length, room, request->req_len, result->rate_count, result->phy_mode);
 			for (unsigned at = 0; at + 2 <= result->elements_length && at + 2 + result->elements[at + 1] <= result->elements_length;
 			    at += 2 + result->elements[at + 1]) {
 				if (result->elements[at] == 48) {       /* the RSN element: version, group, pairwise and key management suites */
@@ -499,15 +565,16 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	unsigned unknown = 0;
 	int error;
 
-	if (request->req_len != sizeof(*asked)) {
+	/* (Darwin userland 27's size, or 16.5's: the fields read here are where they were) */
+	if (request->req_len != sizeof(*asked) && request->req_len != SCAN_REQUEST_SIZE_16) {
 		return EINVAL;
 	}
 	if (!hakios_sta_present()) {
 		return EBUSY;                   /* (the radio is still being brought up: the framework tries again) */
 	}
-	asked = kalloc_data(sizeof(*asked), Z_WAITOK);
+	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
-	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, sizeof(*asked))) != 0) {
+	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, request->req_len)) != 0) {
 		error = asked == NULL || what == NULL ? ENOMEM : error;
 		goto out;
 	}
