@@ -1131,8 +1131,14 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 			ret = kIOReturnNoMemory;
 			break;
 		}
-		/* mapped into the task only to give it a GPU address there (no processor address is answered) */
-		r->map = r->memory->createMappingInTask(me->fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+		/*
+		 * Mapped into the task only to give it a GPU address there (no processor address is answered), with the
+		 * memory's own cache mode: a write-combined mapping changes the PAGES' attribute (pmap), so the display's and
+		 * IOSurface's cached views of the surface went uncached too -- reading a frame cost ~150 ms (11-26). A scan-out
+		 * slot's memory is the device's, write-combined already.
+		 */
+		r->map = r->memory->createMappingInTask(me->fTask, 0, kIOMapAnywhere |
+		    (surface->scanoutSlot > 0 ? kIOMapWriteCombineCache : 0));
 		if (r->map == NULL) {
 			ret = kIOReturnNoMemory;
 			break;

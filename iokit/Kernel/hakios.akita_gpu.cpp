@@ -291,9 +291,32 @@ HakiosGPU::mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint
 void
 HakiosGPU::unmapFromAddressSpace(int as, uint64_t va, uint64_t len)
 {
+	static uint64_t count, held, since;
+	uint64_t t0, t1;
+
 	IOLockLock(gLock);
+	t0 = mach_absolute_time();
 	akita_mali_vm_unmap(as, va, len);
 	akita_mali_vm_flush(as);        /* at once: the memory is given back after this */
+	t1 = mach_absolute_time();
+	/* (11-26: what giving resources back costs the GPU's lock, once a minute while it happens) */
+	count++;
+	held += t1 - t0;
+	if (since == 0) {
+		since = t1;
+	}
+	{
+		uint64_t ns, heldNs;
+
+		absolutetime_to_nanoseconds(t1 - since, &ns);
+		if (ns >= 60 * NSEC_PER_SEC) {
+			absolutetime_to_nanoseconds(held, &heldNs);
+			IOLog("IOGPU: %llu resources unmapped in %llu ms, the GPU's lock held %llu us for them\n", count,
+			    ns / NSEC_PER_MSEC, heldNs / NSEC_PER_USEC);
+			count = held = 0;
+			since = t1;
+		}
+	}
 	IOLockUnlock(gLock);
 }
 
