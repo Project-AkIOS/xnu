@@ -204,7 +204,7 @@ public:
 	virtual void clientGone(OSObject *client, int as) APPLE_KEXT_OVERRIDE;
 
 	/* the IOGPU clients' tiler heaps (vendor selectors 56/57), for freeing what a client leaves */
-	enum { kMaxIOGPUHeaps = 32 };
+	enum { kMaxIOGPUHeaps = 48 };
 	struct { OSObject *client; int heap; } fHeaps[kMaxIOGPUHeaps];
 };
 OSDefineMetaClassAndStructors(HakiosGPU, IOGPU);

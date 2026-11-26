@@ -1055,7 +1055,9 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 		}
 		/*
 		 * The GPU does not snoop the processors' caches (coherency "none"): the processors' view is write-combined
-		 * whatever was asked, so what they write is in memory when the GPU reads it.
+		 * whatever was asked, so what they write is in memory when the GPU reads it. The GPU's own view is cached (its
+		 * caches are cleaned and invalidated around every submission, as for panthor's buffers): a non-cacheable
+		 * mapping left every shader-drawn frame black (11-26) while clears and copies worked.
 		 */
 		md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
 		    (kIOWriteCombineCache << kIOMemoryBufferCacheShift), size, page_size);
@@ -1074,7 +1076,6 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 		}
 		r->gpuBase = r->map->getAddress();
 		r->gpuLength = size;
-		gpuFlags |= kIOGPUMapUncached;
 		if (!(a.flags & kIOGPUFlagPrivate)) {
 			out->cpuAddress = r->gpuBase;
 		}
@@ -1138,9 +1139,17 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 		}
 		r->gpuBase = r->map->getAddress();
 		r->gpuLength = size;
-		gpuFlags |= kIOGPUMapUncached;
 		offset = surface->info.offset + (surface->info.planeCount > 0 ? surface->planes[plane].offset : 0);
 		out->residentSize = size;
+		{
+			static int shown;
+
+			if (shown++ < 24) {
+				IOLog("IOGPU: surface %u (%ux%u, scan-out slot %d) as a resource: %llu bytes at 0x%llx, data at +0x%llx\n",
+				    (uint32_t)a.a38, surface->info.width, surface->info.height, surface->scanoutSlot, size, r->gpuBase,
+				    offset);
+			}
+		}
 		break;
 	}
 	default:
@@ -1186,6 +1195,11 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 		}
 	}
 	if (ret != kIOReturnSuccess) {
+		static int failed;
+
+		if (failed++ < 24) {
+			IOLog("IOGPU: a resource of kind 0x%x (%llu bytes, a38 0x%llx) refused: 0x%x\n", a.kind, a.size, a.a38, ret);
+		}
 		me->releaseResource(r);
 		IOLockUnlock(me->fLock);
 		bzero(out, args->structureOutputSize);
