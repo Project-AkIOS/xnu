@@ -45,6 +45,7 @@ bool akita_mali_ready(void);
 int akita_mali_vm_new(void);
 void akita_mali_vm_free(int vm);
 bool akita_mali_vm_map(int vm, uint64_t va, uint64_t phys, uint32_t flags);
+void akita_mali_vm_note_map(int vm, uint64_t va, uint64_t size);
 void akita_mali_vm_unmap(int vm, uint64_t va, uint64_t size);
 void akita_mali_vm_flush(int vm);
 void akita_mali_vm_flush_later(int vm);
@@ -342,6 +343,8 @@ HakiosGPU::mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint
 	}
 	if (!ok) {
 		akita_mali_vm_unmap(as, va, len);
+	} else {
+		akita_mali_vm_note_map(as, va, len);
 	}
 	akita_mali_vm_flush_later(as);  /* (new pages are reached only by work submitted after them) */
 	IOLockUnlock(gLock);

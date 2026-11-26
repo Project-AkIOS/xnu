@@ -1138,7 +1138,9 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 			break;
 		}
 		md = IOMemoryDescriptor::withAddressRange(start, end - start, kIODirectionInOut, me->fTask);
-		if (md == NULL || md->prepare() != kIOReturnSuccess) {
+		if (md == NULL || (ret = md->prepare()) != kIOReturnSuccess) {
+			IOLog("IOGPU: client memory 0x%llx..0x%llx: %s 0x%x\n", start, end, md == NULL ? "no descriptor" :
+			    "wiring it failed", ret);
 			OSSafeReleaseNULL(md);
 			ret = kIOReturnNoMemory;
 			break;
@@ -1218,10 +1220,12 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 	}
 	if (ret == kIOReturnSuccess && !me->fGPU->mapIntoAddressSpace(me->fAS, r->gpuBase, r->memory, 0, r->gpuLength,
 	    gpuFlags)) {
+		IOLog("IOGPU: kind 0x%x at 0x%llx+%llu: the GPU's map refused it\n", a.kind, r->gpuBase, r->gpuLength);
 		r->gpuLength = 0;               /* (nothing left mapped to undo) */
 		ret = kIOReturnNoMemory;
 	}
 	if (ret == kIOReturnSuccess && !me->sharedSlot(&r->sharedSlot, &shared)) {
+		IOLog("IOGPU: kind 0x%x: no shared slot left\n", a.kind);
 		ret = kIOReturnNoMemory;
 	}
 	if (ret == kIOReturnSuccess) {

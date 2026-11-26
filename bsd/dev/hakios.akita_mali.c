@@ -1818,9 +1818,24 @@ akita_mali_vm_map(int vm, uint64_t va, uint64_t phys, uint32_t flags)
 }
 
 /* (11-23) the last unmaps, for a page fault to say whether its address was given back (and when) or never mapped */
-#define UNMAP_RING 64
+#define UNMAP_RING 1024   /* (11-26: 64 lasted well under a second while CoreAnimation gave buffers back) */
 static struct { int vm; uint64_t va, size, when; } unmap_ring[UNMAP_RING];
 static unsigned int unmap_next;
+/* (11-26) and the last ranges mapped, for a fault to say whether its address was ever mapped and what lay nearest */
+static struct { int vm; uint64_t va, size, when; } map_ring[UNMAP_RING];
+static unsigned int map_next;
+
+void akita_mali_vm_note_map(int vm, uint64_t va, uint64_t size);
+void
+akita_mali_vm_note_map(int vm, uint64_t va, uint64_t size)
+{
+	unsigned int i = map_next++ % UNMAP_RING;
+
+	map_ring[i].vm = vm;
+	map_ring[i].va = va;
+	map_ring[i].size = size;
+	map_ring[i].when = mach_absolute_time();
+}
 
 void akita_mali_vm_unmap(int vm, uint64_t va, uint64_t size);
 void
@@ -2720,6 +2735,38 @@ mmu_faults(void)
 			}
 			if (said == 0) {
 				printf("mali:   none of the last %u unmaps covered it: never mapped, or long ago\n", UNMAP_RING);
+			}
+			/* (11-26) the maps that covered it, else the nearest mapped range below and above it */
+			{
+				unsigned int covered = 0, below = ~0u, above = ~0u;
+
+				for (unsigned int k = 1; k <= UNMAP_RING && k <= map_next; k++) {
+					unsigned int i = (map_next - k) % UNMAP_RING;
+
+					if (map_ring[i].vm != (int)vm) {
+						continue;
+					}
+					if (at >= map_ring[i].va && at < map_ring[i].va + map_ring[i].size) {
+						if (covered++ < 2) {
+							uint64_t ns;
+
+							absolutetime_to_nanoseconds(now - map_ring[i].when, &ns);
+							printf("mali:   it was mapped %llu us ago: 0x%llx, %llu bytes (the %u-th last map)\n",
+							    ns / 1000, map_ring[i].va, map_ring[i].size, k);
+						}
+					} else if (map_ring[i].va + map_ring[i].size <= at) {
+						if (below == ~0u || map_ring[i].va + map_ring[i].size > map_ring[below].va + map_ring[below].size) {
+							below = i;
+						}
+					} else if (above == ~0u || map_ring[i].va < map_ring[above].va) {
+						above = i;
+					}
+				}
+				if (covered == 0) {
+					printf("mali:   none of the last %u maps covered it; nearest below 0x%llx+%llu, above 0x%llx+%llu\n",
+					    UNMAP_RING, below == ~0u ? 0 : map_ring[below].va, below == ~0u ? 0 : map_ring[below].size,
+					    above == ~0u ? 0 : map_ring[above].va, above == ~0u ? 0 : map_ring[above].size);
+				}
 			}
 		}
 		faults("a GPU page fault");
