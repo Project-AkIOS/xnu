@@ -2245,7 +2245,8 @@ IOMobileFramebuffer::present(const uint8_t * swap, struct swap_events * events)
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
 	if (gTouchLat) {
-		hakios_tl("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
+		hakios_tl("tl: s %u at %llu surface %u layers %#x\n", swapWord(swap, SWAP_ID), micros(now),
+		    swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_LAYERS_SET));
 	}
 	/* (11-10, a look for a fence: the swap's words this driver does not read, when not zero -- the first swaps, then one in 500) */
 	{
