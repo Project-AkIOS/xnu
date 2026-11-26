@@ -24,10 +24,10 @@
 
 /*
  * AkIOS: IOHIDEvent from IOHIDFamily-2238.100.59, cut down to what the kernel's event services need: making an
- * event (keyboard so far), children, the sender, and writing it out in the layout iOS 27 reads (IOHIDEventData.h).
+ * event (keyboard and digitizer so far), children, the sender, and writing it out in the layout iOS 27 reads (IOHIDEventData.h).
  * Left out: the constructors of the other event types (their data layouts are in Apple's generated headers, which
- * are not open source -- each comes back with its layout checked, as keyboard was), the fixed/double/data field
- * accessors that only those need, and the DriverKit parts. What is kept is in Apple's order.
+ * are not open source -- each comes back with its layout checked, as keyboard and digitizer were), the fixed and
+ * data field accessors that only those need, and the DriverKit parts. What is kept is in Apple's order.
  */
 
 #ifndef _IOKIT_IOHIDEVENT_H
@@ -78,6 +78,10 @@ public:
 	static IOHIDEvent *     keyboardEvent(UInt64 timeStamp, UInt32 usagePage, UInt32 usage, Boolean down,
 	    UInt8 pressCount, Boolean longPress, UInt8 clickSpeed, IOOptionBits options = 0);
 
+	static IOHIDEvent *     digitizerEvent(UInt64 timeStamp, UInt32 transducerID, IOHIDDigitizerTransducerType type,
+	    bool inRange, UInt32 buttonState, IOFixed x, IOFixed y, IOFixed z = 0, IOFixed tipPressure = 0,
+	    IOFixed auxPressure = 0, IOFixed twist = 0, IOOptionBits options = 0);
+
 	virtual void            appendChild(IOHIDEvent *childEvent);
 	OSArray*                getChildren();
 
@@ -105,6 +109,9 @@ public:
 	virtual void            setSenderID(uint64_t senderID);
 
 	virtual uint64_t        getLatency(uint32_t scaleFactor);
+
+	virtual IOHIDDouble     getDoubleValue(IOHIDEventField key, IOOptionBits options);
+	virtual void            setDoubleValue(IOHIDEventField key, IOHIDDouble value, IOOptionBits options);
 
 	virtual UInt64          getTimeStampOfType(IOHIDEventTimestampType type);
 	virtual void            setTimeStampOfType(UInt64 timeStamp, IOHIDEventTimestampType type);

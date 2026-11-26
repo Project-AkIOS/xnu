@@ -169,10 +169,13 @@ touch_feel_add(uint32_t type, uint32_t finger, uint64_t now)
 /* a device's governor told of each touch (the Pixel 8a's DVFS raises the GPU's clock for a while), or NULL */
 void (*hakios_touch_interaction)(void);
 
+/* the kernel's touch screen service (iokit/Kernel/AkitaTouchScreen.cpp, boot-arg hid_touch=1): each touch sample too */
+extern void akios_hid_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time);
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
-	struct hakios_touch *t;
+	struct hakios_touch *t, copy;
 
 	lck_mtx_lock(&touch_lock);
 	if (touch_tail - touch_head == TOUCH_QUEUE) {
@@ -202,7 +205,12 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 		}
 		tap_queue[tap_tail++ % TOUCH_QUEUE] = *t;
 	}
+	copy = *t;
 	lck_mtx_unlock(&touch_lock);
+	if (copy.type >= HAKIOS_TOUCH_DOWN && copy.type <= HAKIOS_TOUCH_UP) {
+		/* (a no-op until AkitaTouchScreen is up, i.e. without hid_touch=1) */
+		akios_hid_touch_post(copy.type, copy.finger, copy.x, copy.y, copy.time);
+	}
 	wakeup(&touch_queue);
 	if (tap_readers > 0) {
 		wakeup(&tap_queue);

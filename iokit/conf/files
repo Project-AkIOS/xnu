@@ -87,6 +87,7 @@ iokit/Kernel/akios_shared_event.cpp		optional iokitcpp
 iokit/Kernel/MiniIOMedia.cpp			optional iokitcpp
 iokit/Kernel/AkitaUFSStorage.cpp		optional iokitcpp
 iokit/Kernel/AkitaButtons.cpp			optional iokitcpp
+iokit/Kernel/AkitaTouchScreen.cpp		optional iokitcpp
 # AkIOS (11-26): Apple's HID event service classes (IOHIDFamily, APSL), for event services made in the kernel
 iokit/Kernel/IOHIDFamily/IOHIDEvent.cpp				optional iokitcpp
 iokit/Kernel/IOHIDFamily/IOHIDEventService.cpp			optional iokitcpp

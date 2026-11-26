@@ -42,6 +42,16 @@
  *    bits 1-2 click speed, bits 6-8 sticky key phase, bits 9-10 sticky key toggle), pressCount u8 at 0x1c.
  *  - IOHIDEventGetIntegerValueWithOptions (0x18f0fd1b0): kIOHIDEventFieldIsBuiltIn is bit 4 of the data's options
  *    (kIOHIDEventOptionIsBuiltIn).
+ *  - Digitizer (type 11): the reader's minimum is 0xa0. Digitizer is one of the reader's "legacy" types, but the
+ *    conversion (__IOHIDEventPopulateCurrentEventData) only runs for callers that ask for it; the queue's reader,
+ *    IOHIDEventCreateWithBytesInternal, passes 0 and copies the data as it is -- so the kernel writes the current
+ *    layout, the one IOKit.framework itself makes. From IOHIDEventCreateDigitizerEvent (0x18f12ab68),
+ *    IOHIDEventCreateDigitizerFingerEventWithQuality (0x18f12aa28), IOHIDEventGetDoubleValueWithOptions' digitizer
+ *    cases (jump table 0x18f102d6c), __IOHIDEventTypeDescriptorDigitizer (0x18f192244) and IOHIDEventAppendEvent
+ *    (0x18f0fb82c): see IOHIDDigitizerEventData below. Range, Touch and DisplayIntegrated are bits 16, 17 and 19 of
+ *    the data's options; Collection is bit 1 (kIOHIDEventOptionIsCollection). When a digitizer child is appended to a
+ *    digitizer parent, IOKit ORs the child's eventMask into the parent's childEventMask (and it does so again when it
+ *    rebuilds an event from the queue's bytes).
  *
  * Apple's kernel IOHIDEvent::readBytes (IOHIDEvent.cpp) writes exactly this: a header per event and the data after
  * it, which is what our port does.
@@ -78,6 +88,64 @@ typedef struct _IOHIDKeyboardEventData {
 	uint8_t         pressCount;             /* 0x1c */
 	uint8_t         keyboardReserved[3];
 } IOHIDKeyboardEventData;
+
+/*
+ * Digitizer event data, 0xa0 bytes, as iOS 27's IOKit.framework lays it out (offsets verified, see above; the field
+ * numbers are those of kIOHIDEventFieldDigitizer*).
+ */
+typedef struct _IOHIDDigitizerEventData {
+	IOHIDEVENT_BASE;                        /* 0x00; options: Range bit 16, Touch bit 17, DisplayIntegrated bit 19 */
+	struct {
+		double  x;                      /* 0x10  field 0, 0..1 on a display-integrated digitizer */
+		double  y;                      /* 0x18  field 1 */
+		double  z;                      /* 0x20  field 2 */
+	} position;
+	uint32_t        transducerIndex;        /* 0x28  field 5 */
+	uint32_t        transducerType;         /* 0x2c  field 4: kIOHIDDigitizerTransducerType* */
+	uint32_t        identity;               /* 0x30  field 6 */
+	uint32_t        eventMask;              /* 0x34  field 7: kIOHIDDigitizerEvent* */
+	uint32_t        childEventMask;         /* 0x38  field 24 */
+	uint32_t        buttonMask;             /* 0x3c  field 3 */
+	double          pressure;               /* 0x40  field 10 */
+	double          auxPressure;            /* 0x48  field 11 */
+	double          twist;                  /* 0x50  field 12 */
+	uint32_t        orientationType;        /* 0x58  field 31: kIOHIDDigitizerOrientationType* */
+	uint32_t        orientationReserved;    /* 0x5c */
+	union {
+		struct {
+			double  x;              /* 0x60  field 13 */
+			double  y;              /* 0x68  field 14 */
+		} tilt;
+		struct {
+			double  quality;        /* 0x60  field 17 */
+			double  density;        /* 0x68  field 18 */
+			double  irregularity;   /* 0x70  field 19 */
+			double  majorRadius;    /* 0x78  field 20 */
+			double  minorRadius;    /* 0x80  field 21 */
+			double  accuracy;       /* 0x88  field 26 */
+		} quality;
+	} orientation;
+	uint32_t        generationCount;        /* 0x90  field 27 */
+	uint32_t        willUpdateMask;         /* 0x94  field 28 */
+	uint32_t        didUpdateMask;          /* 0x98  field 29 */
+	uint32_t        digitizerReserved;      /* 0x9c */
+} IOHIDDigitizerEventData;
+
+/* the transducer bits of a digitizer event's options (IOHIDFamily's IOHIDEventData.h) */
+enum {
+	kIOHIDTransducerRange               = 0x00010000,
+	kIOHIDTransducerTouch               = 0x00020000,
+	kIOHIDTransducerInvert              = 0x00040000,
+	kIOHIDTransducerDisplayIntegrated   = 0x00080000
+};
+
+_Static_assert(sizeof(IOHIDDigitizerEventData) == 0xa0, "digitizer event data: iOS 27 wants 0xa0 bytes");
+_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, transducerIndex) == 0x28, "digitizer index at 0x28");
+_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, eventMask) == 0x34, "digitizer eventMask at 0x34");
+_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, pressure) == 0x40, "digitizer pressure at 0x40");
+_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, orientationType) == 0x58, "digitizer orientation at 0x58");
+_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, orientation.quality.minorRadius) == 0x80, "minorRadius");
+_Static_assert(__builtin_offsetof(IOHIDDigitizerEventData, generationCount) == 0x90, "generationCount at 0x90");
 
 _Static_assert(sizeof(struct IOHIDEventData) == 0x10, "IOHIDEventData: iOS 27 reads 0x10 bytes of base");
 _Static_assert(sizeof(IOHIDKeyboardEventData) == 0x20, "keyboard event data: iOS 27 wants 0x20 bytes");
@@ -119,6 +187,8 @@ IOHIDEventGetDataSize(IOHIDEventType type)
 	switch (type) {
 	case kIOHIDEventTypeKeyboard:
 		return sizeof(IOHIDKeyboardEventData);
+	case kIOHIDEventTypeDigitizer:
+		return sizeof(IOHIDDigitizerEventData);
 	default:
 		return 0;
 	}

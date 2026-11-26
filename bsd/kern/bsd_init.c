@@ -1045,6 +1045,11 @@ extern void hakios_boot_step_log(const char *prefix, const char *message);
 
 			akios_hid_buttons_init();    /* AkitaButtons, the keys as an IOHIDEventService; boot-arg hid_buttons=1 (11-26) */
 		}
+		{
+			extern void akios_hid_touch_init(void);
+
+			akios_hid_touch_init();      /* AkitaTouchScreen, the touch screen as an IOHIDEventService; boot-arg hid_touch=1 */
+		}
 		hakios_audio_init();           /* /dev/hakios-audio */
 		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
 #if APFS

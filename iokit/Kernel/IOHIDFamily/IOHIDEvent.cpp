@@ -24,8 +24,8 @@
 
 /*
  * AkIOS: IOHIDEvent.cpp from IOHIDFamily-2238.100.59 (see IOHIDEvent.h for what is left out). The serialization --
- * getLength, readBytes, createBytes, withBytes -- is Apple's, line for line; the integer field accessors, which Apple
- * builds from generated macros, are written out for the fields of the types we have.
+ * getLength, readBytes, createBytes, withBytes -- is Apple's, line for line; the integer and double field accessors,
+ * which Apple builds from generated macros, are written out for the fields of the types we have.
  */
 
 #include <IOKit/IOLib.h>
@@ -242,6 +242,62 @@ IOHIDEvent::keyboardEvent(UInt64 timeStamp, UInt32 usagePage, UInt32 usage, Bool
 	return me;
 }
 
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// IOHIDEvent::digitizerEvent
+//
+// Apple's: positions and pressures in 16.16 fixed point, stored as doubles; a finger gets identity 2 and the quality
+// orientation with 5.0 radii, anything else 3.0 radii. AkIOS: the radii of the polar orientation, which shares the
+// union in Apple's struct, are not set (our struct has only the tilt and quality views).
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+IOHIDEvent *
+IOHIDEvent::digitizerEvent(UInt64 timeStamp, UInt32 transducerID, IOHIDDigitizerTransducerType type, bool inRange,
+    UInt32 buttonState, IOFixed x, IOFixed y, IOFixed z, IOFixed tipPressure, IOFixed auxPressure, IOFixed twist,
+    IOOptionBits options)
+{
+	IOHIDEvent *me = OSTypeAlloc(IOHIDEvent);
+
+	if (me && !me->initWithTypeTimeStamp(kIOHIDEventTypeDigitizer, timeStamp, options | kIOHIDEventOptionIsAbsolute)) {
+		me->release();
+		return NULL;
+	}
+	if (!me) {
+		return NULL;
+	}
+
+	IOHIDDigitizerEventData *event = (IOHIDDigitizerEventData *)me->_data;
+
+	if (inRange) {
+		event->options |= kIOHIDTransducerRange;
+	}
+
+	event->eventMask        = 0;       // todo:
+	event->transducerIndex  = transducerID; // Multitouch uses this as a path ID
+	event->transducerType   = type;
+	event->buttonMask       = buttonState;
+	event->position.x       = x / 65536.0;
+	event->position.y       = y / 65536.0;
+	event->position.z       = z / 65536.0;
+	event->pressure         = tipPressure / 65536.0;
+	event->auxPressure      = auxPressure / 65536.0;
+	event->twist            = twist / 65536.0;
+
+	// Let's assume no tip pressure means finger
+	switch (event->transducerType) {
+	case kIOHIDDigitizerTransducerTypeFinger:
+		event->identity = 2;        // Multitouch interprets this as 'finger', hard code to 2 or index finger
+		event->orientationType = kIOHIDDigitizerOrientationTypeQuality;
+		event->orientation.quality.majorRadius = 5.0;
+		event->orientation.quality.minorRadius = 5.0;
+		break;
+	default:
+		event->orientation.quality.majorRadius = 3.0;
+		event->orientation.quality.minorRadius = 3.0;
+		break;
+	}
+
+	return me;
+}
+
 //==============================================================================
 // IOHIDEvent::appendChild
 //==============================================================================
@@ -257,6 +313,15 @@ IOHIDEvent::appendChild(IOHIDEvent *childEvent)
 		_data->options |= kIOHIDEventOptionIsCollection;
 	} else {
 		_children->setObject(childEvent);
+	}
+
+	/*
+	 * AkIOS: as iOS 27's IOHIDEventAppendEvent (0x18f0fb82c) does: a digitizer under a digitizer adds its eventMask to
+	 * the parent's childEventMask (the reader of the queue does it again when it appends the children it rebuilds).
+	 */
+	if (_data->type == kIOHIDEventTypeDigitizer && childEvent->_data->type == kIOHIDEventTypeDigitizer &&
+	    _data->size >= sizeof(IOHIDDigitizerEventData) && childEvent->_data->size >= sizeof(IOHIDDigitizerEventData)) {
+		((IOHIDDigitizerEventData *)_data)->childEventMask |= ((IOHIDDigitizerEventData *)childEvent->_data)->eventMask;
 	}
 }
 
@@ -307,6 +372,48 @@ IOHIDEvent::getIntegerValue(IOHIDEventField key, IOOptionBits options)
 			return (ev->_data->options & kIOHIDEventOptionIsBuiltIn) ? 1 : 0;
 		}
 		return 0;
+	}
+	if (fieldEvType == kIOHIDEventTypeDigitizer) {
+		IOHIDDigitizerEventData * digitizer = (IOHIDDigitizerEventData *)ev->_data;
+
+		switch (key) {
+		case kIOHIDEventFieldDigitizerX:
+			return (SInt32)digitizer->position.x;
+		case kIOHIDEventFieldDigitizerY:
+			return (SInt32)digitizer->position.y;
+		case kIOHIDEventFieldDigitizerZ:
+			return (SInt32)digitizer->position.z;
+		case kIOHIDEventFieldDigitizerButtonMask:
+			return (SInt32)digitizer->buttonMask;
+		case kIOHIDEventFieldDigitizerType:
+			return (SInt32)digitizer->transducerType;
+		case kIOHIDEventFieldDigitizerIndex:
+			return (SInt32)digitizer->transducerIndex;
+		case kIOHIDEventFieldDigitizerIdentity:
+			return (SInt32)digitizer->identity;
+		case kIOHIDEventFieldDigitizerEventMask:
+			return (SInt32)digitizer->eventMask;
+		case kIOHIDEventFieldDigitizerChildEventMask:
+			return (SInt32)digitizer->childEventMask;
+		case kIOHIDEventFieldDigitizerRange:
+			return (digitizer->options & kIOHIDTransducerRange) ? 1 : 0;
+		case kIOHIDEventFieldDigitizerTouch:
+			return (digitizer->options & kIOHIDTransducerTouch) ? 1 : 0;
+		case kIOHIDEventFieldDigitizerCollection:
+			return (digitizer->options & kIOHIDEventOptionIsCollection) ? 1 : 0;
+		case kIOHIDEventFieldDigitizerIsDisplayIntegrated:
+			return (digitizer->options & kIOHIDTransducerDisplayIntegrated) ? 1 : 0;
+		case kIOHIDEventFieldDigitizerOrientationType:
+			return (SInt32)digitizer->orientationType;
+		case kIOHIDEventFieldDigitizerGenerationCount:
+			return (SInt32)digitizer->generationCount;
+		case kIOHIDEventFieldDigitizerWillUpdateMask:
+			return (SInt32)digitizer->willUpdateMask;
+		case kIOHIDEventFieldDigitizerDidUpdateMask:
+			return (SInt32)digitizer->didUpdateMask;
+		default:
+			return 0;
+		}
 	}
 	if (fieldEvType == kIOHIDEventTypeKeyboard) {
 		IOHIDKeyboardEventData * keyboard = (IOHIDKeyboardEventData *)ev->_data;
@@ -359,6 +466,65 @@ IOHIDEvent::setIntegerValue(IOHIDEventField key, SInt32 value, IOOptionBits opti
 		}
 		return;
 	}
+	if (fieldEvType == kIOHIDEventTypeDigitizer) {
+		IOHIDDigitizerEventData * digitizer = (IOHIDDigitizerEventData *)ev->_data;
+		uint32_t bit = 0;
+
+		switch (key) {
+		case kIOHIDEventFieldDigitizerButtonMask:
+			digitizer->buttonMask = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerType:
+			digitizer->transducerType = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerIndex:
+			digitizer->transducerIndex = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerIdentity:
+			digitizer->identity = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerEventMask:
+			digitizer->eventMask = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerChildEventMask:
+			digitizer->childEventMask = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerRange:
+			bit = kIOHIDTransducerRange;
+			break;
+		case kIOHIDEventFieldDigitizerTouch:
+			bit = kIOHIDTransducerTouch;
+			break;
+		case kIOHIDEventFieldDigitizerCollection:
+			bit = kIOHIDEventOptionIsCollection;
+			break;
+		case kIOHIDEventFieldDigitizerIsDisplayIntegrated:
+			bit = kIOHIDTransducerDisplayIntegrated;
+			break;
+		case kIOHIDEventFieldDigitizerOrientationType:
+			digitizer->orientationType = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerGenerationCount:
+			digitizer->generationCount = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerWillUpdateMask:
+			digitizer->willUpdateMask = (uint32_t)value;
+			break;
+		case kIOHIDEventFieldDigitizerDidUpdateMask:
+			digitizer->didUpdateMask = (uint32_t)value;
+			break;
+		default:
+			break;
+		}
+		if (bit != 0) {
+			if (value) {
+				digitizer->options |= bit;
+			} else {
+				digitizer->options &= ~bit;
+			}
+		}
+		return;
+	}
 	if (fieldEvType == kIOHIDEventTypeKeyboard) {
 		IOHIDKeyboardEventData * keyboard = (IOHIDKeyboardEventData *)ev->_data;
 
@@ -384,6 +550,89 @@ IOHIDEvent::setIntegerValue(IOHIDEventField key, SInt32 value, IOOptionBits opti
 		default:
 			break;
 		}
+	}
+}
+
+//==============================================================================
+// IOHIDEvent::getDoubleValue / setDoubleValue
+//
+// The digitizer's double fields, at the offsets iOS 27's IOHIDEventGetDoubleValueWithOptions reads them from; the
+// orientation fields only in the orientation type they belong to (as there: tilt for 0, quality for 2).
+//==============================================================================
+static double *
+digitizerDouble(IOHIDDigitizerEventData * digitizer, IOHIDEventField key)
+{
+	switch (key) {
+	case kIOHIDEventFieldDigitizerX:
+		return &digitizer->position.x;
+	case kIOHIDEventFieldDigitizerY:
+		return &digitizer->position.y;
+	case kIOHIDEventFieldDigitizerZ:
+		return &digitizer->position.z;
+	case kIOHIDEventFieldDigitizerPressure:
+		return &digitizer->pressure;
+	case kIOHIDEventFieldDigitizerAuxiliaryPressure:
+		return &digitizer->auxPressure;
+	case kIOHIDEventFieldDigitizerTwist:
+		return &digitizer->twist;
+	default:
+		break;
+	}
+	if (digitizer->orientationType == kIOHIDDigitizerOrientationTypeTilt) {
+		switch (key) {
+		case kIOHIDEventFieldDigitizerTiltX:
+			return &digitizer->orientation.tilt.x;
+		case kIOHIDEventFieldDigitizerTiltY:
+			return &digitizer->orientation.tilt.y;
+		default:
+			break;
+		}
+	} else if (digitizer->orientationType == kIOHIDDigitizerOrientationTypeQuality) {
+		switch (key) {
+		case kIOHIDEventFieldDigitizerQuality:
+			return &digitizer->orientation.quality.quality;
+		case kIOHIDEventFieldDigitizerDensity:
+			return &digitizer->orientation.quality.density;
+		case kIOHIDEventFieldDigitizerIrregularity:
+			return &digitizer->orientation.quality.irregularity;
+		case kIOHIDEventFieldDigitizerMajorRadius:
+			return &digitizer->orientation.quality.majorRadius;
+		case kIOHIDEventFieldDigitizerMinorRadius:
+			return &digitizer->orientation.quality.minorRadius;
+		case kIOHIDEventFieldDigitizerQualityRadiiAccuracy:
+			return &digitizer->orientation.quality.accuracy;
+		default:
+			break;
+		}
+	}
+	return NULL;
+}
+
+IOHIDDouble
+IOHIDEvent::getDoubleValue(IOHIDEventField key, IOOptionBits options)
+{
+	IOHIDEvent * ev = getEvent(IOHIDEventFieldEventType(key), options);
+	double * field;
+
+	if (!ev || IOHIDEventFieldEventType(key) != kIOHIDEventTypeDigitizer) {
+		return 0;
+	}
+	field = digitizerDouble((IOHIDDigitizerEventData *)ev->_data, key);
+	return field ? *field : 0;
+}
+
+void
+IOHIDEvent::setDoubleValue(IOHIDEventField key, IOHIDDouble value, IOOptionBits options)
+{
+	IOHIDEvent * ev = getEvent(IOHIDEventFieldEventType(key), options);
+	double * field;
+
+	if (!ev || IOHIDEventFieldEventType(key) != kIOHIDEventTypeDigitizer) {
+		return;
+	}
+	field = digitizerDouble((IOHIDDigitizerEventData *)ev->_data, key);
+	if (field) {
+		*field = value;
 	}
 }
 

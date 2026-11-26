@@ -46,6 +46,7 @@
 
 extern "C" void akios_hid_buttons_init(void);
 extern "C" void akios_hid_buttons_post(uint32_t usagePage, uint32_t usage, int down);
+extern "C" int akios_hid_buttons_up(void);
 
 /* HID usage tables (IOHIDUsageTables.h), the ones used here */
 #define kHIDPage_Telephony              0x0B
@@ -292,4 +293,11 @@ akios_hid_buttons_post(uint32_t usagePage, uint32_t usage, int down)
 	if (buttons != NULL) {
 		buttons->press(usagePage, usage, down != 0);
 	}
+}
+
+/* Whether the service is up (AkitaTouchScreen's tap to wake presses the lock button through it). */
+int
+akios_hid_buttons_up(void)
+{
+	return __atomic_load_n(&gAkitaButtons, __ATOMIC_ACQUIRE) != NULL;
 }
