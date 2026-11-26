@@ -40,11 +40,16 @@ IOAcceleratorES::publishMetalPlugin(const char *name, const char *className)
 	if (!PE_parse_boot_argn("metal", &metal, sizeof(metal)) || metal == 0) {
 		return;
 	}
+	static char cls[96];
+
 	strlcpy(plugin, name, sizeof(plugin));
 	PE_parse_boot_arg_str("metal_plugin", plugin, sizeof(plugin));
+	/* metal_class=NAME: the plug-in's device class (another plug-in has another class: AkiosMetal's AkiosMaliDevice) */
+	strlcpy(cls, className, sizeof(cls));
+	PE_parse_boot_arg_str("metal_class", cls, sizeof(cls));
 	setProperty("MetalPluginName", plugin);
-	setProperty("MetalPluginClassName", className);
-	IOLog("%s: metal=1: Metal's plug-in is %s (%s)\n", getName(), plugin, className);
+	setProperty("MetalPluginClassName", cls);
+	IOLog("%s: metal=1: Metal's plug-in is %s (%s)\n", getName(), plugin, cls);
 }
 
 /* ---- IOGPU ---- */
