@@ -240,6 +240,69 @@ screen_send(struct mux_conn *c, const void *data, uint32_t n)
 	return c->open && send_data(c, (const uint8_t *)data, n);
 }
 
+/*
+ * Port 9 (11-26): the surface in layer 0 of the newest swap, as port 6's PPM -- what CoreAnimation last handed the
+ * display, to compare with what the panel shows.
+ */
+extern int akios_fb_newest_surface(const uint8_t **pixels, uint32_t *sid, uint32_t *width, uint32_t *height,
+    uint32_t *row_bytes, void **token);
+extern void akios_fb_surface_done(void *token);
+
+static void
+surface_thread(void *parameter, __unused wait_result_t result)
+{
+	struct mux_conn *c = parameter;
+	static char line[160];
+	const uint8_t *pixels;
+	uint32_t sid, w, h, rb, n;
+	void *token;
+
+	if (akios_fb_newest_surface(&pixels, &sid, &w, &h, &rb, &token) != 0) {
+		n = (uint32_t)snprintf(line, sizeof(line), "no surface: no swap yet, or not one 4-byte plane\n");
+		screen_send(c, line, n);
+	} else {
+		uint64_t bytes = (uint64_t)w * h * 3;
+		uint8_t *copy = kalloc_data(bytes, Z_WAITOK);
+
+		if (copy != NULL) {
+			uint8_t *to = copy;
+
+			for (uint32_t y = 0; y < h; y++) {
+				const uint8_t *row = pixels + (uint64_t)y * rb;
+
+				for (uint32_t x = 0; x < w; x++) {
+					*to++ = row[4 * x + 2];
+					*to++ = row[4 * x + 1];
+					*to++ = row[4 * x + 0];
+				}
+			}
+		}
+		akios_fb_surface_done(token);
+		n = (uint32_t)snprintf(line, sizeof(line), "P6\n# surface %u size %ux%u stride %u\n%u %u\n255\n", sid, w, h, rb,
+		    w, h);
+		screen_send(c, line, n);
+		for (uint64_t at = 0; copy != NULL && at < bytes && c->open;) {
+			uint32_t part = (uint32_t)(bytes - at < MAX_DATA ? bytes - at : MAX_DATA);
+
+			if (!screen_send(c, copy + at, part)) {
+				break;
+			}
+			at += part;
+		}
+		if (copy != NULL) {
+			kfree_data(copy, bytes);
+		}
+	}
+	delay_for_interval(200, NSEC_PER_MSEC);
+	lck_mtx_lock(mux_lock);
+	if (c->open) {
+		send_tcp(c, TH_FIN | TH_ACK, c->tx_seq, c->rx_next, NULL, 0, false);
+		send_tcp(c, TH_RST, c->tx_seq + 1, c->rx_next, NULL, 0, false);
+	}
+	conn_free(c);
+	lck_mtx_unlock(mux_lock);
+}
+
 static void
 screen_thread(void *parameter, __unused wait_result_t result)
 {
@@ -623,7 +686,7 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
 		return;
 	}
-	if (phone_port == 1 || phone_port == 5 || phone_port == 6 || phone_port == 7 || phone_port == 8) {
+	if (phone_port == 1 || phone_port == 5 || phone_port == 6 || phone_port == 7 || phone_port == 8 || phone_port == 9) {
 		lck_mtx_lock(mux_lock);
 		for (unsigned i = 0; i < CONNS && !c; i++) {
 			if (!conns[i].used) {
@@ -645,10 +708,10 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		}
 		printf("akita usbmux: host port %u: the %s\n", host_port,
 		    phone_port == 1 ? "console log" : phone_port == 5 ? "kernel message buffer" : phone_port == 7 ? "screen recording" :
-		    phone_port == 8 ? "sound recording" : "screen");
+		    phone_port == 8 ? "sound recording" : phone_port == 9 ? "newest swap's surface" : "screen");
 		send_tcp(c, TH_SYN | TH_ACK, 0, seq + 1, NULL, 0, false);
 		if (kernel_thread_start(phone_port == 1 ? klog_thread : phone_port == 5 ? dmesg_thread : phone_port == 7 ? rec_thread :
-		    phone_port == 8 ? sound_thread : screen_thread, c,
+		    phone_port == 8 ? sound_thread : phone_port == 9 ? surface_thread : screen_thread, c,
 		    &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		}

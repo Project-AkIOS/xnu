@@ -2264,6 +2264,40 @@ IOMobileFramebuffer::swapWait(uint32_t id, uint32_t flags)
 	return kIOReturnSuccess;
 }
 
+/*
+ * (11-26) the surface in layer 0 of the newest swap, and its pixels for the host (hakios.akita_usbmux.c's port 9): what
+ * CoreAnimation last handed over, to set beside what the panel shows (port 6).
+ */
+static uint32_t gNewestSwapSurface;
+
+extern "C" int
+akios_fb_newest_surface(const uint8_t **pixels, uint32_t *sid, uint32_t *width, uint32_t *height, uint32_t *rowBytes,
+    void **token)
+{
+	MiniIOSurface *surface = MiniIOSurfaceCopy(gNewestSwapSurface);
+
+	if (surface == NULL) {
+		return -1;
+	}
+	if (surface->info.bytesPerElement != 4 || surface->info.planeCount > 1) {
+		MiniIOSurfaceDrop(surface);
+		return -1;
+	}
+	*pixels = surface->pixels();
+	*sid = surface->sid;
+	*width = (uint32_t) surface->info.width;
+	*height = (uint32_t) surface->info.height;
+	*rowBytes = (uint32_t) surface->info.bytesPerRow;
+	*token = surface;
+	return 0;
+}
+
+extern "C" void
+akios_fb_surface_done(void *token)
+{
+	MiniIOSurfaceDrop((MiniIOSurface *) token);
+}
+
 /* SwapEnd: the swap is handed to the thread that puts frames on the panel, as soon as that has no other waiting. */
 void
 IOMobileFramebuffer::present(const uint8_t * swap, struct swap_events * events)
@@ -2282,6 +2316,7 @@ IOMobileFramebuffer::present(const uint8_t * swap, struct swap_events * events)
 	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz() * 5 / 4, &period);
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
+	gNewestSwapSurface = swapWord(swap, SWAP_SURFACE(0));
 	if (gTouchLat) {
 		hakios_tl("tl: s %u at %llu surface %u layers %#x\n", swapWord(swap, SWAP_ID), micros(now),
 		    swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_LAYERS_SET));

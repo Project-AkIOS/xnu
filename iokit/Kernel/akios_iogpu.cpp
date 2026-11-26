@@ -477,11 +477,20 @@ class IOGPUDeviceUserClient : public IOUserClient
 	void releaseAll(void);
 
 	/* resources (selector 8): the id is the index + 1 */
+	struct surfaceMap {
+		MiniIOSurface *surface;         /* held; NULL: a free entry */
+		IOMemoryDescriptor *memory;
+		IOMemoryMap *map;
+		uint64_t gpuBase, gpuLength;
+		uint32_t refs;                  /* resources using it */
+		uint64_t idleAfter;             /* with refs 0: the submission number the GPU must be past */
+	};
 	struct resource {
 		uint32_t kind;
 		IOMemoryDescriptor *memory;     /* what the GPU maps (a client buffer's: prepared) */
 		IOMemoryMap *map;               /* in the task (kind 0, 0x82): its address is also the GPU's */
 		MiniIOSurface *surface;         /* kind 0x82: held */
+		struct surfaceMap *shared;      /* kind 0x82: the surface's mapping in this client, shared by its resources */
 		uint64_t gpuBase, gpuLength;    /* the GPU mapping (page-aligned) */
 		uint32_t sharedSlot;            /* in the client-shared blocks */
 		bool prepared;
@@ -489,6 +498,18 @@ class IOGPUDeviceUserClient : public IOUserClient
 		uint64_t deferredUntil;         /* freed once every submission of the client numbered below this is done */
 	};
 	struct resource *fDeferred;     /* deleted while the GPU may still use them */
+	/*
+	 * SURFACE MAPPINGS (11-26): an IOSurface is mapped into a client's task and GPU address space once and stays there
+	 * while the surface lives, whatever its resources do -- as on Apple's GPUs, where every texture over a surface sees
+	 * it at the same address. Mapped afresh per texture, CoreAnimation's next texture over a surface still drew from
+	 * the address of a texture over it that it had let go (IOGPU.framework keeps what a surface was): the GPU faulted
+	 * there and lost the submission -- frames dropped, the panel stuck on the one before.
+	 * A mapping goes once no resource uses it, nobody but this cache holds its surface, and the GPU is past it.
+	 */
+	enum { kMaxSurfaceMaps = 96 };
+	struct surfaceMap fSurfaceMaps[kMaxSurfaceMaps];
+	struct surfaceMap *surfaceMapFor(MiniIOSurface *surface, uint64_t size, IOReturn *ret);
+	void sweepSurfaceMaps(bool all);
 	uint64_t fSubmissions;          /* this client's submissions so far (numbers 1, 2, ...; under the submission lock) */
 	void freeDeferred(bool all);
 	struct resource **fResources;
@@ -696,6 +717,7 @@ IOGPUDeviceUserClient::releaseAll(void)
 			fResources[i] = NULL;
 		}
 	}
+	sweepSurfaceMaps(true);
 	if (fResources != NULL) {
 		IOFree(fResources, fResourceCount * sizeof(fResources[0]));
 		fResources = NULL;
@@ -1040,6 +1062,15 @@ IOGPUDeviceUserClient::freeSharedSlot(uint32_t slot)
 void
 IOGPUDeviceUserClient::releaseResource(struct resource *r)
 {
+	if (r->shared != NULL) {
+		/* (fLock held) the surface's mapping stays; once unused, the GPU must get past what was submitted so far */
+		if (--r->shared->refs == 0) {
+			fGPU->lockSubmissions();
+			r->shared->idleAfter = fSubmissions + 1;
+			fGPU->unlockSubmissions();
+		}
+		r->gpuLength = 0;
+	}
 	/* the GPU's view first (updated before this returns), then the memory */
 	if (r->gpuLength != 0 && fAS >= 0) {
 		fGPU->unmapFromAddressSpace(fAS, r->gpuBase, r->gpuLength);
@@ -1138,6 +1169,15 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 			break;
 		}
 		md = IOMemoryDescriptor::withAddressRange(start, end - start, kIODirectionInOut, me->fTask);
+		if (md != NULL && md->prepare() != kIOReturnSuccess) {
+			/*
+			 * (11-26) memory the task may only read (QuartzCore's buffers over read-only shared memory: protection 1,
+			 * at most 1): wired for reading, and read-only for the GPU too
+			 */
+			md->release();
+			md = IOMemoryDescriptor::withAddressRange(start, end - start, kIODirectionOut, me->fTask);
+			gpuFlags |= kIOGPUMapReadOnly;
+		}
 		if (md == NULL || (ret = md->prepare()) != kIOReturnSuccess) {
 			IOLog("IOGPU: client memory 0x%llx..0x%llx: %s 0x%x\n", start, end, md == NULL ? "no descriptor" :
 			    "wiring it failed", ret);
@@ -1173,6 +1213,20 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 			break;
 		}
 		size = round_page_64(surface->info.allocSize);
+		IOLockLock(me->fLock);
+		r->shared = me->surfaceMapFor(surface, size, &ret);
+		if (r->shared != NULL) {
+			r->shared->refs++;
+			r->gpuBase = r->shared->gpuBase;
+			r->gpuLength = r->shared->gpuLength;
+		}
+		IOLockUnlock(me->fLock);
+		if (r->shared != NULL || ret != kIOReturnSuccess) {
+			offset = surface->info.offset + (surface->info.planeCount > 0 ? surface->planes[plane].offset : 0);
+			out->residentSize = size;
+			break;
+		}
+		/* (no entry free: a mapping of its own, as before) */
 		r->memory = surface->scanoutSlot > 0 ? IOSubMemoryDescriptor::withSubRange(surface->client, 0, size,
 		    kIODirectionInOut) : IOSubMemoryDescriptor::withSubRange(surface->memory, PAGE_SIZE, size, kIODirectionInOut);
 		if (r->memory == NULL) {
@@ -1218,8 +1272,8 @@ IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExter
 	if (ret == kIOReturnSuccess && !me->addressSpace()) {
 		ret = kIOReturnNoResources;
 	}
-	if (ret == kIOReturnSuccess && !me->fGPU->mapIntoAddressSpace(me->fAS, r->gpuBase, r->memory, 0, r->gpuLength,
-	    gpuFlags)) {
+	if (ret == kIOReturnSuccess && r->shared == NULL && !me->fGPU->mapIntoAddressSpace(me->fAS, r->gpuBase, r->memory, 0,
+	    r->gpuLength, gpuFlags)) {
 		IOLog("IOGPU: kind 0x%x at 0x%llx+%llu: the GPU's map refused it\n", a.kind, r->gpuBase, r->gpuLength);
 		r->gpuLength = 0;               /* (nothing left mapped to undo) */
 		ret = kIOReturnNoMemory;
@@ -1301,7 +1355,104 @@ IOGPUDeviceUserClient::freeDeferred(bool all)
 		done = r->nextDeferred;
 		releaseResource(r);
 	}
+	if (!all) {
+		sweepSurfaceMaps(false);
+	}
 	IOLockUnlock(fLock);
+}
+
+/* (fLock held) the surface's mapping in this client, made if need be; NULL with *ret success: no entry free */
+struct IOGPUDeviceUserClient::surfaceMap *
+IOGPUDeviceUserClient::surfaceMapFor(MiniIOSurface *surface, uint64_t size, IOReturn *ret)
+{
+	struct surfaceMap *e = NULL;
+
+	*ret = kIOReturnSuccess;
+	for (uint32_t i = 0; i < kMaxSurfaceMaps; i++) {
+		if (fSurfaceMaps[i].surface == surface && fSurfaceMaps[i].gpuLength >= size) {
+			return &fSurfaceMaps[i];
+		}
+	}
+	if (!addressSpace()) {
+		*ret = kIOReturnNoResources;
+		return NULL;
+	}
+	for (int pass = 0; pass < 2 && e == NULL; pass++) {
+		if (pass == 1) {
+			sweepSurfaceMaps(false);
+		}
+		for (uint32_t i = 0; i < kMaxSurfaceMaps && e == NULL; i++) {
+			if (fSurfaceMaps[i].surface == NULL) {
+				e = &fSurfaceMaps[i];
+			}
+		}
+	}
+	if (e == NULL) {
+		static int said;
+
+		if (said++ < 4) {
+			IOLog("IOGPU: all %u surface mappings in use: surface %u mapped on its own\n", kMaxSurfaceMaps, surface->sid);
+		}
+		return NULL;
+	}
+	e->memory = surface->scanoutSlot > 0 ? IOSubMemoryDescriptor::withSubRange(surface->client, 0, size,
+	    kIODirectionInOut) : IOSubMemoryDescriptor::withSubRange(surface->memory, PAGE_SIZE, size, kIODirectionInOut);
+	if (e->memory == NULL) {
+		*ret = kIOReturnNoMemory;
+		return NULL;
+	}
+	/* (in the task only for a GPU address there, with the memory's own cache mode: see the resource's notes) */
+	e->map = e->memory->createMappingInTask(fTask, 0, kIOMapAnywhere |
+	    (surface->scanoutSlot > 0 ? kIOMapWriteCombineCache : 0));
+	if (e->map == NULL || !fGPU->mapIntoAddressSpace(fAS, e->map->getAddress(), e->memory, 0, size, 0)) {
+		IOLog("IOGPU: surface %u: no mapping for the GPU\n", surface->sid);
+		OSSafeReleaseNULL(e->map);
+		OSSafeReleaseNULL(e->memory);
+		*ret = kIOReturnNoMemory;
+		return NULL;
+	}
+	surface->retain();
+	MiniIOSurface *held = MiniIOSurfaceCopy(surface->sid);   /* (a holder, as the resource's own) */
+	surface->release();
+	if (held != surface) {
+		MiniIOSurfaceDrop(held);
+		fGPU->unmapFromAddressSpace(fAS, e->map->getAddress(), size);
+		OSSafeReleaseNULL(e->map);
+		OSSafeReleaseNULL(e->memory);
+		*ret = kIOReturnNotFound;
+		return NULL;
+	}
+	e->surface = held;
+	e->gpuBase = e->map->getAddress();
+	e->gpuLength = size;
+	e->refs = 0;
+	e->idleAfter = 0;
+	return e;
+}
+
+/* (fLock held) mappings no resource uses, whose surface only this cache holds, that the GPU is past; all: every one */
+void
+IOGPUDeviceUserClient::sweepSurfaceMaps(bool all)
+{
+	uint64_t oldest = all ? ~0ULL : fGPU->oldestPendingNumber(this);
+
+	for (uint32_t i = 0; i < kMaxSurfaceMaps; i++) {
+		struct surfaceMap *e = &fSurfaceMaps[i];
+
+		if (e->surface == NULL) {
+			continue;
+		}
+		if (!all && (e->refs != 0 || e->surface->holders > 1 || e->idleAfter > oldest)) {
+			continue;
+		}
+		if (e->gpuLength != 0 && fAS >= 0) {
+			fGPU->unmapFromAddressSpace(fAS, e->gpuBase, e->gpuLength);
+		}
+		OSSafeReleaseNULL(e->map);
+		OSSafeReleaseNULL(e->memory);
+		MiniIOSurfaceDrop(e->surface);
+		bzero(e, sizeof(*e));
+	}
 }
 
 IOReturn
