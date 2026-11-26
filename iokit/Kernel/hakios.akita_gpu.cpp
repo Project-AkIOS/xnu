@@ -189,6 +189,7 @@ public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	virtual const char *gpuName(void) APPLE_KEXT_OVERRIDE { return "Mali-G715"; }
 	virtual void populateAccelConfig(IOGPUConfig *config) APPLE_KEXT_OVERRIDE;
+	void publishDescription(void);
 	virtual int newAddressSpace(void) APPLE_KEXT_OVERRIDE;
 	virtual void freeAddressSpace(int as) APPLE_KEXT_OVERRIDE;
 	virtual bool mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint64_t offset, uint64_t len,
@@ -218,9 +219,68 @@ HakiosGPU::start(IOService *provider)
 	setProperty(kIOUserClientClassKey, "HakiosGPUUserClient");
 	setProperty("DRMDriver", "panthor");
 	setName("HakiosGPU");
+	publishDescription();
 	publishMetalPlugin("HakiosMetal", "HakiosMetalDevice");
 	registerService();
 	return true;
+}
+
+/*
+ * The GPU's description as properties of the service, for the Metal plug-in on IOGPU (which has no panthor DEV_QUERY):
+ * the Mali's identity and feature registers, the command stream interface's sizes and the timestamp's frequency --
+ * the fields of panthor's gpu_info / csif_info, read once the GPU is up.
+ */
+void
+HakiosGPU::publishDescription(void)
+{
+	static uint32_t regs[256], csif[5];
+	struct { const char *key; uint64_t value; } p[] = {
+		{ "gpu-id", 0 }, { "csf-id", 0 }, { "l2-features", 0 }, { "core-features", 0 }, { "tiler-features", 0 },
+		{ "mem-features", 0 }, { "mmu-features", 0 }, { "as-present", 0 }, { "max-threads", 0 },
+		{ "thread-max-workgroup-size", 0 }, { "thread-max-barrier-size", 0 }, { "thread-features", 0 },
+		{ "coherency-features", 0 }, { "shader-present", 0 }, { "tiler-present", 0 }, { "l2-present", 0 },
+		{ "gpu-features", 0 }, { "core-count", 0 }, { "csg-slot-count", 0 }, { "cs-slot-count", 0 },
+		{ "cs-reg-count", 0 }, { "scoreboard-slot-count", 0 }, { "unpreserved-cs-reg-count", 0 },
+		{ "timestamp-frequency", 24576000 },
+	};
+	uint32_t texture[4];
+	OSData *data;
+
+	IOLockLock(gLock);
+	akita_mali_info(regs, csif);
+	IOLockUnlock(gLock);
+	p[0].value = regs[0];
+	p[1].value = regs[0x1c / 4];
+	p[2].value = regs[0x04 / 4];
+	p[3].value = regs[0x08 / 4];
+	p[4].value = regs[0x0c / 4];
+	p[5].value = regs[0x10 / 4];
+	p[6].value = regs[0x14 / 4];
+	p[7].value = regs[0x18 / 4];
+	p[8].value = regs[0xa0 / 4];
+	p[9].value = regs[0xa4 / 4];
+	p[10].value = regs[0xa8 / 4];
+	p[11].value = regs[0xac / 4];
+	p[12].value = regs[0x300 / 4];
+	p[13].value = regs[0x100 / 4] | (uint64_t)regs[0x104 / 4] << 32;
+	p[14].value = regs[0x110 / 4] | (uint64_t)regs[0x114 / 4] << 32;
+	p[15].value = regs[0x120 / 4] | (uint64_t)regs[0x124 / 4] << 32;
+	p[16].value = regs[0x60 / 4] | (uint64_t)regs[0x64 / 4] << 32;
+	p[17].value = (uint64_t)__builtin_popcountll(p[13].value);
+	for (int i = 0; i < 5; i++) {
+		p[18 + i].value = csif[i];
+	}
+	for (unsigned i = 0; i < sizeof(p) / sizeof(p[0]); i++) {
+		setProperty(p[i].key, p[i].value, 64);
+	}
+	for (int i = 0; i < 4; i++) {
+		texture[i] = regs[0xb0 / 4 + i];
+	}
+	data = OSData::withBytes(texture, sizeof(texture));
+	if (data != NULL) {
+		setProperty("texture-features", data);
+		data->release();
+	}
 }
 
 /* the GPU shares the 8 GB of system memory: half of it for the GPU at most, a quarter in one buffer */
