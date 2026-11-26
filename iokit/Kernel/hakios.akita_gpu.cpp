@@ -189,6 +189,11 @@ public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	virtual const char *gpuName(void) APPLE_KEXT_OVERRIDE { return "Mali-G715"; }
 	virtual void populateAccelConfig(IOGPUConfig *config) APPLE_KEXT_OVERRIDE;
+	virtual int newAddressSpace(void) APPLE_KEXT_OVERRIDE;
+	virtual void freeAddressSpace(int as) APPLE_KEXT_OVERRIDE;
+	virtual bool mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint64_t offset, uint64_t len,
+	    uint32_t flags) APPLE_KEXT_OVERRIDE;
+	virtual void unmapFromAddressSpace(int as, uint64_t va, uint64_t len) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(HakiosGPU, IOGPU);
 
@@ -216,6 +221,68 @@ HakiosGPU::populateAccelConfig(IOGPUConfig *config)
 	config->textureRam = config->videoRam = memory / 2;
 	config->sharedMemorySize = memory / 2;
 	config->maxResourceSize = (memory / 4) & ~(uint64_t)PAGE_MASK;
+}
+
+/* an IOGPU client's address space: a Mali VM (the same tables panthor's clients get) */
+int
+HakiosGPU::newAddressSpace(void)
+{
+	int vm;
+
+	IOLockLock(gLock);
+	vm = akita_mali_ready() ? akita_mali_vm_new() : -1;
+	IOLockUnlock(gLock);
+	return vm;
+}
+
+void
+HakiosGPU::freeAddressSpace(int as)
+{
+	IOLockLock(gLock);
+	akita_mali_vm_free(as);
+	IOLockUnlock(gLock);
+}
+
+bool
+HakiosGPU::mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint64_t offset, uint64_t len, uint32_t flags)
+{
+	bool ok = true;
+
+	if ((va | offset | len) & 0xfff) {
+		return false;
+	}
+	IOLockLock(gLock);
+	/* a physically contiguous piece at a time (as vmBind) */
+	for (uint64_t off = 0; ok && off < len;) {
+		IOByteCount piece = 0;
+		addr64_t phys = md->getPhysicalSegment(offset + off, &piece, kIOMemoryMapperNone);
+
+		if (phys == 0 || piece < 0x1000) {
+			ok = false;
+			break;
+		}
+		for (uint64_t p = 0; p + 0x1000 <= piece && off < len; p += 0x1000, off += 0x1000) {
+			if (!akita_mali_vm_map(as, va + off, phys + p, flags & 5)) {
+				ok = false;
+				break;
+			}
+		}
+	}
+	if (!ok) {
+		akita_mali_vm_unmap(as, va, len);
+	}
+	akita_mali_vm_flush_later(as);  /* (new pages are reached only by work submitted after them) */
+	IOLockUnlock(gLock);
+	return ok;
+}
+
+void
+HakiosGPU::unmapFromAddressSpace(int as, uint64_t va, uint64_t len)
+{
+	IOLockLock(gLock);
+	akita_mali_vm_unmap(as, va, len);
+	akita_mali_vm_flush(as);        /* at once: the memory is given back after this */
+	IOLockUnlock(gLock);
 }
 
 void

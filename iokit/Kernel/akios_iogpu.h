@@ -49,6 +49,9 @@ struct IOGPUConfig {
  */
 #define kIOGPUEventChannels     16u
 
+#define kIOGPUMapReadOnly       1u
+#define kIOGPUMapUncached       4u
+
 class IOGPU : public IOAcceleratorES
 {
 	OSDeclareDefaultStructors(IOGPU);
@@ -65,10 +68,23 @@ public:
 
 	/* the vendor's part */
 	virtual void populateAccelConfig(IOGPUConfig *config);
+	uint64_t maxResourceSize(void);
 	virtual const char *gpuName(void);
 	/* IOServiceOpen types that are not IOGPU's own (the vendor's private client); IOService's default by default */
 	virtual IOReturn newVendorUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
 	    IOUserClient **handler);
+
+	/*
+	 * A client's GPU address space (Apple's IOGPUTask). GPU addresses are the task's own: a resource sits at the same
+	 * address for the processors and the GPU. -1: none to give.
+	 */
+	virtual int newAddressSpace(void);
+	virtual void freeAddressSpace(int as);
+	/* len bytes of md from offset at va; flags kIOGPUMapReadOnly | kIOGPUMapUncached */
+	virtual bool mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint64_t offset, uint64_t len,
+	    uint32_t flags);
+	/* the pages gone from the GPU's tables, and the GPU's view updated before this returns (the memory may go next) */
+	virtual void unmapFromAddressSpace(int as, uint64_t va, uint64_t len);
 
 	IOBufferMemoryDescriptor *stampMemory(void) { return fStamps; }
 	uint32_t stampOffset(unsigned channel) { return channel * sizeof(uint32_t); }

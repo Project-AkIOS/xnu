@@ -8,10 +8,15 @@
  * are in the table, so a caller with the wrong sizes is refused by IOUserClient as it would be by Apple's kernel.
  */
 #include "akios_iogpu.h"
+#include "MiniIOSurface.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
 #include <pexpert/pexpert.h>
 
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
@@ -101,10 +106,41 @@ IOGPU::populateAccelConfig(IOGPUConfig *config)
 	bzero(config, sizeof(*config));
 }
 
+uint64_t
+IOGPU::maxResourceSize(void)
+{
+	IOGPUConfig config;
+
+	populateAccelConfig(&config);
+	return config.maxResourceSize;
+}
+
 const char *
 IOGPU::gpuName(void)
 {
 	return getName();
+}
+
+int
+IOGPU::newAddressSpace(void)
+{
+	return -1;
+}
+
+void
+IOGPU::freeAddressSpace(int as)
+{
+}
+
+bool
+IOGPU::mapIntoAddressSpace(int as, uint64_t va, IOMemoryDescriptor *md, uint64_t offset, uint64_t len, uint32_t flags)
+{
+	return false;
+}
+
+void
+IOGPU::unmapFromAddressSpace(int as, uint64_t va, uint64_t len)
+{
 }
 
 IOReturn
@@ -164,6 +200,38 @@ class IOGPUDeviceUserClient : public IOUserClient
 	struct shmem { IOBufferMemoryDescriptor *memory; IOMemoryMap *map; } fShmem[kMaxShmem];
 	void releaseAll(void);
 
+	/* resources (selector 8): the id is the index + 1 */
+	struct resource {
+		uint32_t kind;
+		IOMemoryDescriptor *memory;     /* what the GPU maps (a client buffer's: prepared) */
+		IOMemoryMap *map;               /* in the task (kind 0, 0x82): its address is also the GPU's */
+		MiniIOSurface *surface;         /* kind 0x82: held */
+		uint64_t gpuBase, gpuLength;    /* the GPU mapping (page-aligned) */
+		uint32_t sharedSlot;            /* in the client-shared blocks */
+		bool prepared;
+	};
+	struct resource **fResources;
+	uint32_t fResourceCount;        /* entries in fResources */
+	int fAS;                        /* the GPU address space (-1: not made yet) */
+
+	/*
+	 * Client-shared slots: two IOGPUEvents (0x80 bytes) a resource, 0x100 a block, each block one buffer mapped
+	 * read-only into the task. Slot 0 is the device's (selector 4's allocated size, never written: Apple's stays 0).
+	 */
+	enum { kSharedSlotSize = 0x80, kSlotsPerBlock = 0x100, kMaxSharedBlocks = 64 };
+	struct { IOBufferMemoryDescriptor *memory; IOMemoryMap *map; } fShared[kMaxSharedBlocks];
+	uint8_t fSlotUsed[kMaxSharedBlocks * kSlotsPerBlock / 8];
+	bool sharedSlot(uint32_t *slot, uint64_t *address);
+	void freeSharedSlot(uint32_t slot);
+	void releaseResource(struct resource *r);
+	IOReturn deleteResource(uint32_t id);
+
+	static const IOExternalTrap sTraps[14];
+	IOReturn t_unsupported(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
+	IOReturn t_delete_resource(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
+	IOReturn t_finish_resource_event(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
+	IOReturn t_set_resource_purgeable(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
+
 	static const IOExternalMethodDispatch sMethods[56];
 
 	static IOReturn s_unsupported(OSObject *target, void *reference, IOExternalMethodArguments *args);
@@ -179,6 +247,8 @@ class IOGPUDeviceUserClient : public IOUserClient
 	static IOReturn s_create_shmem(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_destroy_shmem(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_perform_mapping(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_new_resource(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_delete_resource(OSObject *target, void *reference, IOExternalMethodArguments *args);
 
 public:
 	bool setUp(IOGPU *gpu, task_t task, void *securityID, uint32_t options);
@@ -186,6 +256,7 @@ public:
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
 	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+	virtual IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(IOGPUDeviceUserClient, IOUserClient);
@@ -204,8 +275,8 @@ const IOExternalMethodDispatch IOGPUDeviceUserClient::sMethods[56] = {
 	M(s_get_next_gid_group, 0, 0, 0, 0x10),         /*  5 */
 	U(0, V, 0, 0x10),                               /*  6 new_command_queue */
 	U(1, 0, 0, 0),                                  /*  7 delete_command_queue */
-	U(0, V, 0, V),                                  /*  8 new_resource */
-	U(1, 0, 0, 0),                                  /*  9 delete_resource */
+	M(s_new_resource, 0, V, 0, V),                  /*  8 */
+	M(s_delete_resource, 1, 0, 0, 0),               /*  9 */
 	U(2, 0, 0, 0),                                  /* 10 finish_object_event */
 	U(2, 0, 1, 0),                                  /* 11 set_resource_purgeable */
 	M(s_create_shmem, 2, 0, 0, 0x10),               /* 12 */
@@ -278,6 +349,8 @@ IOGPUDeviceUserClient::setUp(IOGPU *gpu, task_t task, void *securityID, uint32_t
 	fGPU = gpu;
 	fTask = task;
 	fOptions = options;
+	fAS = -1;
+	fSlotUsed[0] = 1;               /* slot 0: the device's */
 	fLock = IOLockAlloc();
 	/*
 	 * As IOGPUDeviceUserClient::deviceUserClientStart: the stamp page goes into the task now, read-only (kIOMapUnique |
@@ -302,6 +375,25 @@ IOGPUDeviceUserClient::setUp(IOGPU *gpu, task_t task, void *securityID, uint32_t
 void
 IOGPUDeviceUserClient::releaseAll(void)
 {
+	for (uint32_t i = 0; i < fResourceCount; i++) {
+		if (fResources[i] != NULL) {
+			releaseResource(fResources[i]);
+			fResources[i] = NULL;
+		}
+	}
+	if (fResources != NULL) {
+		IOFree(fResources, fResourceCount * sizeof(fResources[0]));
+		fResources = NULL;
+		fResourceCount = 0;
+	}
+	if (fAS >= 0) {
+		fGPU->freeAddressSpace(fAS);
+		fAS = -1;
+	}
+	for (unsigned b = 0; b < kMaxSharedBlocks; b++) {
+		OSSafeReleaseNULL(fShared[b].map);
+		OSSafeReleaseNULL(fShared[b].memory);
+	}
 	for (unsigned i = 0; i < kMaxShmem; i++) {
 		OSSafeReleaseNULL(fShmem[i].map);
 		OSSafeReleaseNULL(fShmem[i].memory);
@@ -536,4 +628,408 @@ IOReturn
 IOGPUDeviceUserClient::s_perform_mapping(OSObject *target, void *reference, IOExternalMethodArguments *args)
 {
 	return kIOReturnAborted;
+}
+
+/* ---- resources ---- */
+
+/* selector 8's argument header (0x58 bytes; the vendor's tail follows) */
+struct IOGPUNewResourceArgs {
+	uint32_t kind;                  /* 0 system memory, 0x80 the client's memory, 0x82 an IOSurface, 0x40 sparse */
+	uint32_t cacheMode;             /* 0x400: write-combined */
+	uint16_t width, height, depthOrSlices, pad0e;
+	uint8_t faces, mipLevels, pad12, pixelInfo;
+	uint32_t flags;                 /* 0x40 zero-fill, 0x2000 private (no processor mapping), 0x10/0x20 GPU read/write */
+	uint64_t protectionOptions;
+	uint64_t gpuAddress, gpuLength; /* a fixed GPU address asked for */
+	uint32_t alignment;
+	uint32_t gpuTagHi;
+	uint64_t a38;                   /* 0x80: the client's pointer; 0x82: surface id (low), plane (high) */
+	uint64_t a40;                   /* 0x82: the field */
+	uint64_t size;                  /* bytes to back */
+	uint32_t a50, pad54;
+};
+
+/* its answer (0x58 bytes, then resourcePrivSize: 0 here) */
+struct IOGPUNewResourceOut {
+	uint64_t gpuAddress;            /* +0x00 */
+	uint64_t cpuAddress;            /* +0x08: the buffer's contents (kind 0) */
+	uint64_t clientShared;          /* +0x10: the resource's two IOGPUEvents in the task; never 0 */
+	uint64_t metadata;              /* +0x18 */
+	uint32_t flags;                 /* +0x20: bit 0, the client zero-fills */
+	uint32_t resourceID;            /* +0x24 */
+	uint64_t residentSize;          /* +0x28 */
+	uint64_t word30;                /* +0x30 */
+	uint64_t allocationID[2];       /* +0x38 */
+	uint64_t protectionOptions;     /* +0x48 */
+	uint64_t gpuBase;               /* +0x50: the GPU address minus the offset inside the allocation */
+};
+
+#define kIOGPUResourceSysMem    0x00
+#define kIOGPUResourceClient    0x80
+#define kIOGPUResourceSurface   0x82
+#define kIOGPUFlagZeroFill      0x40
+#define kIOGPUFlagPrivate       0x2000
+#define kIOGPUFlagGPURead       0x10
+#define kIOGPUFlagGPUWrite      0x20
+
+bool
+IOGPUDeviceUserClient::sharedSlot(uint32_t *slot, uint64_t *address)
+{
+	for (uint32_t i = 1; i < kMaxSharedBlocks * kSlotsPerBlock; i++) {
+		unsigned b = i / kSlotsPerBlock;
+
+		if (fSlotUsed[i / 8] & (1u << (i % 8))) {
+			continue;
+		}
+		if (fShared[b].memory == NULL) {
+			IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+			    kIODirectionInOut | kIOMemoryKernelUserShared, kSlotsPerBlock * kSharedSlotSize, page_size);
+
+			if (md == NULL) {
+				return false;
+			}
+			bzero(md->getBytesNoCopy(), md->getLength());
+			fShared[b].map = md->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+			if (fShared[b].map == NULL) {
+				md->release();
+				return false;
+			}
+			fShared[b].memory = md;
+		}
+		/* a zeroed slot: both events "complete" (validMask 0) until submissions write them */
+		bzero((uint8_t *)fShared[b].memory->getBytesNoCopy() + (i % kSlotsPerBlock) * kSharedSlotSize, kSharedSlotSize);
+		fSlotUsed[i / 8] |= (uint8_t)(1u << (i % 8));
+		*slot = i;
+		*address = fShared[b].map->getAddress() + (i % kSlotsPerBlock) * kSharedSlotSize;
+		return true;
+	}
+	return false;
+}
+
+void
+IOGPUDeviceUserClient::freeSharedSlot(uint32_t slot)
+{
+	if (slot != 0 && slot < kMaxSharedBlocks * kSlotsPerBlock) {
+		fSlotUsed[slot / 8] &= (uint8_t)~(1u << (slot % 8));
+	}
+}
+
+void
+IOGPUDeviceUserClient::releaseResource(struct resource *r)
+{
+	/* the GPU's view first (updated before this returns), then the memory */
+	if (r->gpuLength != 0 && fAS >= 0) {
+		fGPU->unmapFromAddressSpace(fAS, r->gpuBase, r->gpuLength);
+	}
+	OSSafeReleaseNULL(r->map);
+	if (r->memory != NULL && r->prepared) {
+		r->memory->complete();
+	}
+	OSSafeReleaseNULL(r->memory);
+	if (r->surface != NULL) {
+		MiniIOSurfaceDrop(r->surface);
+	}
+	freeSharedSlot(r->sharedSlot);
+	IOFree(r, sizeof(*r));
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_new_resource(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	IOGPUNewResourceArgs a;
+	IOGPUNewResourceOut *out = (IOGPUNewResourceOut *)args->structureOutput;
+	struct resource *r;
+	uint64_t shared = 0, offset = 0;
+	uint32_t gpuFlags = 0, id;
+	IOReturn ret = kIOReturnSuccess;
+	static int said;
+
+	if (args->structureInputSize < sizeof(a) || args->structureOutputSize < sizeof(*out)) {
+		return kIOReturnBadArgument;
+	}
+	memcpy(&a, args->structureInput, sizeof(a));
+	bzero(out, args->structureOutputSize);
+	if (a.gpuAddress != 0 || a.gpuTagHi != 0) {
+		/* (GPU addresses are the task's here: one given by the caller is not, yet) */
+		if (said++ < 8) {
+			IOLog("IOGPU: a resource at a fixed GPU address 0x%llx (tag 0x%x) was asked for: not yet\n", a.gpuAddress,
+			    a.gpuTagHi);
+		}
+		return kIOReturnUnsupported;
+	}
+	if ((a.flags & (kIOGPUFlagGPURead | kIOGPUFlagGPUWrite)) == kIOGPUFlagGPURead) {
+		gpuFlags |= kIOGPUMapReadOnly;
+	}
+	r = (struct resource *)IOMallocZero(sizeof(*r));
+	if (r == NULL) {
+		return kIOReturnNoMemory;
+	}
+	r->kind = a.kind;
+
+	switch (a.kind) {
+	case kIOGPUResourceSysMem: {
+		IOBufferMemoryDescriptor *md;
+		uint64_t size = round_page_64(a.size);
+
+		if (a.size == 0 || a.size > me->fGPU->maxResourceSize()) {
+			ret = kIOReturnNoSpace;
+			break;
+		}
+		/*
+		 * The GPU does not snoop the processors' caches (coherency "none"): the processors' view is write-combined
+		 * whatever was asked, so what they write is in memory when the GPU reads it.
+		 */
+		md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+		    (kIOWriteCombineCache << kIOMemoryBufferCacheShift), size, page_size);
+		if (md == NULL) {
+			ret = kIOReturnNoMemory;
+			break;
+		}
+		if (a.flags & kIOGPUFlagZeroFill) {
+			bzero(md->getBytesNoCopy(), size);
+		}
+		r->memory = md;
+		r->map = md->createMappingInTask(me->fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+		if (r->map == NULL) {
+			ret = kIOReturnNoMemory;
+			break;
+		}
+		r->gpuBase = r->map->getAddress();
+		r->gpuLength = size;
+		gpuFlags |= kIOGPUMapUncached;
+		if (!(a.flags & kIOGPUFlagPrivate)) {
+			out->cpuAddress = r->gpuBase;
+		}
+		out->residentSize = size;
+		break;
+	}
+	case kIOGPUResourceClient: {
+		/* the client's own pages, at their own addresses (processor-cached: kept clean at submission, later) */
+		uint64_t start = trunc_page_64(a.a38), end = round_page_64(a.a38 + a.size);
+		IOMemoryDescriptor *md;
+
+		if (a.size == 0 || end <= start) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		md = IOMemoryDescriptor::withAddressRange(start, end - start, kIODirectionInOut, me->fTask);
+		if (md == NULL || md->prepare() != kIOReturnSuccess) {
+			OSSafeReleaseNULL(md);
+			ret = kIOReturnNoMemory;
+			break;
+		}
+		r->memory = md;
+		r->prepared = true;
+		r->gpuBase = start;
+		r->gpuLength = end - start;
+		offset = a.a38 - start;
+		out->cpuAddress = a.a38;
+		out->residentSize = end - start;
+		break;
+	}
+	case kIOGPUResourceSurface: {
+		MiniIOSurface *surface = MiniIOSurfaceCopy((uint32_t)a.a38);
+		uint32_t plane = (uint32_t)(a.a38 >> 32);
+		uint64_t size;
+
+		if (surface == NULL) {
+			ret = kIOReturnNotFound;
+			break;
+		}
+		r->surface = surface;
+		if (plane >= MAX(surface->info.planeCount, 1u) || plane >= MINISURF_MAX_PLANES) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		if (surface->client != NULL && surface->scanoutSlot <= 0) {
+			ret = kIOReturnUnsupported;     /* (a surface around a client's memory: as panthor's surfaceBuffer) */
+			break;
+		}
+		size = round_page_64(surface->info.allocSize);
+		r->memory = surface->scanoutSlot > 0 ? IOSubMemoryDescriptor::withSubRange(surface->client, 0, size,
+		    kIODirectionInOut) : IOSubMemoryDescriptor::withSubRange(surface->memory, PAGE_SIZE, size, kIODirectionInOut);
+		if (r->memory == NULL) {
+			ret = kIOReturnNoMemory;
+			break;
+		}
+		/* mapped into the task only to give it a GPU address there (no processor address is answered) */
+		r->map = r->memory->createMappingInTask(me->fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+		if (r->map == NULL) {
+			ret = kIOReturnNoMemory;
+			break;
+		}
+		r->gpuBase = r->map->getAddress();
+		r->gpuLength = size;
+		gpuFlags |= kIOGPUMapUncached;
+		offset = surface->info.offset + (surface->info.planeCount > 0 ? surface->planes[plane].offset : 0);
+		out->residentSize = size;
+		break;
+	}
+	default:
+		if (said++ < 8) {
+			IOLog("IOGPU: a resource of kind 0x%x was asked for: not yet\n", a.kind);
+		}
+		ret = kIOReturnUnsupported;
+		break;
+	}
+
+	IOLockLock(me->fLock);
+	if (ret == kIOReturnSuccess && me->fAS < 0) {
+		me->fAS = me->fGPU->newAddressSpace();
+		if (me->fAS < 0) {
+			ret = kIOReturnNoResources;
+		}
+	}
+	if (ret == kIOReturnSuccess && !me->fGPU->mapIntoAddressSpace(me->fAS, r->gpuBase, r->memory, 0, r->gpuLength,
+	    gpuFlags)) {
+		r->gpuLength = 0;               /* (nothing left mapped to undo) */
+		ret = kIOReturnNoMemory;
+	}
+	if (ret == kIOReturnSuccess && !me->sharedSlot(&r->sharedSlot, &shared)) {
+		ret = kIOReturnNoMemory;
+	}
+	if (ret == kIOReturnSuccess) {
+		for (id = 0; id < me->fResourceCount && me->fResources[id] != NULL; id++) {
+		}
+		if (id == me->fResourceCount) {
+			uint32_t count = me->fResourceCount ? me->fResourceCount * 2 : 256;
+			struct resource **grown = (struct resource **)IOMallocZero(count * sizeof(grown[0]));
+
+			if (grown == NULL || count > (1u << 20)) {
+				if (grown != NULL) {
+					IOFree(grown, count * sizeof(grown[0]));
+				}
+				ret = kIOReturnNoResources;
+			} else {
+				if (me->fResources != NULL) {
+					memcpy(grown, me->fResources, me->fResourceCount * sizeof(grown[0]));
+					IOFree(me->fResources, me->fResourceCount * sizeof(grown[0]));
+				}
+				me->fResources = grown;
+				me->fResourceCount = count;
+			}
+		}
+	}
+	if (ret != kIOReturnSuccess) {
+		me->releaseResource(r);
+		IOLockUnlock(me->fLock);
+		bzero(out, args->structureOutputSize);
+		return ret;
+	}
+	me->fResources[id] = r;
+	IOLockUnlock(me->fLock);
+
+	out->gpuAddress = r->gpuBase + offset;
+	out->gpuBase = r->gpuBase;
+	out->clientShared = shared;
+	out->resourceID = id + 1;
+	out->protectionOptions = a.protectionOptions;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOGPUDeviceUserClient::deleteResource(uint32_t id)
+{
+	struct resource *r = NULL;
+
+	IOLockLock(fLock);
+	if (id >= 1 && id <= fResourceCount) {
+		r = fResources[id - 1];
+		fResources[id - 1] = NULL;
+	}
+	if (r != NULL) {
+		releaseResource(r);
+	}
+	IOLockUnlock(fLock);
+	/* (never kIOReturnBusy: IOGPU.framework asserts "Resource freed while busy" on it) */
+	return r != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_delete_resource(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	return ((IOGPUDeviceUserClient *)target)->deleteResource((uint32_t)args->scalarInput[0]);
+}
+
+/* ---- traps (IOConnectTrapN): IOGPU.framework's fast paths ---- */
+
+#define T(fn) { NULL, (IOTrap)&IOGPUDeviceUserClient::fn }
+const IOExternalTrap IOGPUDeviceUserClient::sTraps[14] = {
+	T(t_unsupported),               /*  0 submit_command_buffer */
+	T(t_delete_resource),           /*  1 */
+	T(t_finish_resource_event),     /*  2 */
+	T(t_set_resource_purgeable),    /*  3 */
+	T(t_unsupported),               /*  4 group_add_resources */
+	T(t_unsupported),               /*  5 group_remove_resources */
+	T(t_unsupported),               /*  6 group_update_resources */
+	T(t_unsupported),               /*  7 queue_set_resource_groups */
+	T(t_unsupported),               /*  8 set_display_params */
+	T(t_unsupported),               /*  9 signal_shared_event */
+	T(t_unsupported),               /* 10 wait_shared_event */
+	T(t_unsupported),               /* 11 signal_mtl_event */
+	T(t_unsupported),               /* 12 wait_mtl_event */
+	T(t_unsupported),               /* 13 check_background_app_role */
+};
+#undef T
+
+IOExternalTrap *
+IOGPUDeviceUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 index)
+{
+	if (index >= sizeof(sTraps) / sizeof(sTraps[0])) {
+		return NULL;
+	}
+	*targetP = this;
+	return (IOExternalTrap *)&sTraps[index];
+}
+
+IOReturn
+IOGPUDeviceUserClient::t_unsupported(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6)
+{
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+IOGPUDeviceUserClient::t_delete_resource(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6)
+{
+	return deleteResource((uint32_t)(uintptr_t)p1);
+}
+
+/*
+ * (id, event index): wait until the GPU is done with the resource. No GPU work goes through IOGPU yet, so a resource
+ * is never busy: its events stay "complete".
+ */
+IOReturn
+IOGPUDeviceUserClient::t_finish_resource_event(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6)
+{
+	uint32_t id = (uint32_t)(uintptr_t)p1;
+	bool known;
+
+	IOLockLock(fLock);
+	known = id >= 1 && id <= fResourceCount && fResources[id - 1] != NULL;
+	IOLockUnlock(fLock);
+	return known ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+/*
+ * (id, state, where the old state goes): IOGPU's states 1 non-volatile, 2 volatile, 3 empty, 4 keep. Nothing is
+ * purged here yet: every resource stays non-volatile, and that is the old state answered.
+ */
+IOReturn
+IOGPUDeviceUserClient::t_set_resource_purgeable(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6)
+{
+	uint32_t id = (uint32_t)(uintptr_t)p1;
+	uint64_t old = 1;
+	bool known;
+
+	IOLockLock(fLock);
+	known = id >= 1 && id <= fResourceCount && fResources[id - 1] != NULL;
+	IOLockUnlock(fLock);
+	if (!known) {
+		return kIOReturnBadArgument;
+	}
+	if (p3 != NULL && copyout(&old, (user_addr_t)(uintptr_t)p3, sizeof(old)) != 0) {
+		return kIOReturnBadArgument;
+	}
+	return kIOReturnSuccess;
 }
