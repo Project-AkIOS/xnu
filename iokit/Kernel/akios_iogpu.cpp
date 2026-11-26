@@ -99,9 +99,14 @@ IOGPU::notify(IOSharedDataQueue *nq, uint64_t token, uint64_t startNs, uint64_t 
 	}
 }
 
+extern "C" void akios_surface_busy(uint32_t sid, int32_t delta);   /* hakios.akita_gpu.cpp */
+
 static void
 releasePending(struct IOGPU::pending *p)
 {
+	for (uint32_t i = 0; i < p->busySurfaces; i++) {
+		akios_surface_busy(p->busySurface[i], -1);
+	}
 	for (uint32_t i = 0; i < p->waits; i++) {
 		OSSafeReleaseNULL(p->wait[i].event);
 	}
@@ -511,6 +516,7 @@ class IOGPUDeviceUserClient : public IOUserClient
 	void destroyNotificationQueue(uint32_t id);
 	IOReturn submit(uint32_t queueID, const uint8_t *args, uint32_t argsSize, uint32_t count);
 	void kernelCommands(const struct IOGPUCommandBufferArgs *a, struct IOGPU::pending *p);
+	void resourceSegments(const uint8_t *list, uint32_t size, struct IOGPU::pending *p);
 
 	static const IOExternalTrap sTraps[14];
 	IOReturn t_submit_command_buffer(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
@@ -1607,6 +1613,49 @@ struct IOGPUCommandBufferArgs {
 };
 
 /*
+ * (fLock held) A resource segment list: {u64 tag; u32 segments; u32 size | bit31}, then per segment a 0x20-byte header
+ * (+0x1c: its entry count) and 64-byte entries {u32 resourceID[6]; u32 sizeKB[6]; u16 usage[6]; u16 pad; u16 count}. The usage
+ * bits are the vendor's (AkiosMetal: bit 0 read, bit 1 write). Every IOSurface resource written is marked busy for the
+ * display (akios_surface_busy) from now until the command buffer completes -- how the display learns, as on an iPhone,
+ * when the GPU has drawn a frame it is asked to show.
+ */
+void
+IOGPUDeviceUserClient::resourceSegments(const uint8_t *list, uint32_t size, struct IOGPU::pending *p)
+{
+	uint32_t segments = *(const uint32_t *)(list + 8), off = 0x10;
+
+	for (uint32_t sgm = 0; sgm < segments && off + 0x20 <= size; sgm++) {
+		uint32_t entries = *(const uint32_t *)(list + off + 0x1c);
+
+		off += 0x20;
+		for (uint32_t e = 0; e < entries && off + 64 <= size; e++, off += 64) {
+			const uint32_t *ids = (const uint32_t *)(list + off);
+			const uint16_t *usage = (const uint16_t *)(list + off + 0x30);
+			uint16_t count = *(const uint16_t *)(list + off + 0x3e);   /* (+0x3c: padding) */
+
+			for (uint32_t k = 0; k < count && k < 6; k++) {
+				struct resource *r;
+				uint32_t sid;
+				bool known = false;
+
+				if (!(usage[k] & 2) || ids[k] < 1 || ids[k] > fResourceCount || (r = fResources[ids[k] - 1]) == NULL ||
+				    r->surface == NULL) {
+					continue;
+				}
+				sid = r->surface->sid;
+				for (uint32_t b = 0; b < p->busySurfaces; b++) {
+					known |= p->busySurface[b] == sid;
+				}
+				if (!known && p->busySurfaces < sizeof(p->busySurface) / sizeof(p->busySurface[0])) {
+					p->busySurface[p->busySurfaces++] = sid;
+					akios_surface_busy(sid, 1);
+				}
+			}
+		}
+	}
+}
+
+/*
  * A command buffer's kernel commands, as its segment list names them (records: control word at +0xc; bit 30 with
  * kind 1 a list of byte ranges of the kernel-command shmem, kind 2 the end; bit 30 clear a resource segment list of
  * low30 bytes; bit 31 the last). Each command is {u32 type, u32 size, payload}. Kept: 3 (signal a shared event) and
@@ -1631,6 +1680,25 @@ IOGPUDeviceUserClient::kernelCommands(const struct IOGPUCommandBufferArgs *a, st
 	}
 	seg = (const uint8_t *)fShmem[a->segmentListShmem - 1].memory->getBytesNoCopy();
 	segLen = fShmem[a->segmentListShmem - 1].memory->getLength();
+	{
+		/* (11-26: the first segment lists with a resource record, dumped: their layout checked against the parser) */
+		static int dumped;
+
+		bool any = false;
+
+		for (uint32_t o = 0; o < 0x100 && o < segLen; o += 4) {
+			any |= *(const uint32_t *)(seg + o) != 0;
+		}
+		if (dumped < 3 && segLen >= 0x100 && any) {
+			dumped++;
+			for (uint32_t o = 0; o < 0x100; o += 0x20) {
+				const uint32_t *w = (const uint32_t *)(seg + o);
+
+				IOLog("IOGPU: segment list +%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n", o, w[0], w[1], w[2], w[3],
+				    w[4], w[5], w[6], w[7]);
+			}
+		}
+	}
 	kcmd = (const uint8_t *)fShmem[a->kernelCommandsShmem - 1].memory->getBytesNoCopy();
 	kcmdLen = fShmem[a->kernelCommandsShmem - 1].memory->getLength();
 
@@ -1641,7 +1709,8 @@ IOGPUDeviceUserClient::kernelCommands(const struct IOGPUCommandBufferArgs *a, st
 			if (kind < 0x10 || kind > segLen - off) {
 				break;
 			}
-			off += kind;                            /* (resources: residency, later) */
+			resourceSegments(seg + off, kind, p);   /* (the surfaces it writes: busy until it completes) */
+			off += kind;
 		} else if (kind == 1) {
 			uint32_t n = *(const uint32_t *)(seg + off + 8);
 

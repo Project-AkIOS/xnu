@@ -897,6 +897,22 @@ busyChange(uint32_t sid, int32_t delta)
 	}
 }
 
+/*
+ * IOGPU's submissions (akios_iogpu.cpp) mark the IOSurfaces they write as the panthor client's kHakiosSurfaceBusy
+ * did: busy from the submission until the GPU has passed it -- what MiniIOSurfaceDrawn (the display) waits for.
+ */
+extern "C" void akios_surface_busy(uint32_t sid, int32_t delta);
+extern "C" void
+akios_surface_busy(uint32_t sid, int32_t delta)
+{
+	if (gLock == NULL || sid == 0) {
+		return;
+	}
+	IOLockLock(gLock);
+	busyChange(sid, delta);
+	IOLockUnlock(gLock);
+}
+
 static bool
 busyNow(uint32_t sid)
 {

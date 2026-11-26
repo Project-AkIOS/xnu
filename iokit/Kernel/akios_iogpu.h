@@ -82,6 +82,8 @@ public:
 		uint64_t number;                /* the client's submission number (deferred frees wait for it) */
 		IOSharedDataQueue *nq;          /* held */
 		uint32_t waits, signals;
+		uint32_t busySurfaces;          /* IOSurfaces it writes, marked busy until it completes */
+		uint32_t busySurface[16];
 		struct eventOp wait[kMaxEventOps], signal[kMaxEventOps];
 	};
 protected:

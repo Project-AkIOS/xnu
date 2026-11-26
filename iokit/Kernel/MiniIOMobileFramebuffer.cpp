@@ -139,6 +139,30 @@ swapEventsFrom27(const uint8_t * req, task_t task, struct swap_events * ev)
 		ev->glass = IOSurfaceSharedEvent::fromPortName(task, *(const uint32_t *) (req + SWAP27_GLASS_PORT));
 		ev->glassValue = *(const uint64_t *) (req + SWAP27_GLASS_VALUE);
 	}
+	{
+		/* (11-26: whether the window server sends fences with its swaps at all, the first ones said) */
+		static uint32_t swaps, withPorts, said;
+		uint32_t ports = 0, found = 0;
+
+		swaps++;
+		for (unsigned l = 0; l < 4; l++) {
+			ports += *(const uint32_t *) (req + SWAP27_WAIT_PORT(l)) != 0;
+			ports += *(const uint32_t *) (req + SWAP27_SIGNAL_PORT(l)) != 0;
+			found += ev->wait[l] != NULL;
+			found += ev->signal[l] != NULL;
+		}
+		ports += *(const uint32_t *) (req + SWAP27_GLASS_PORT) != 0;
+		found += ev->glass != NULL;
+		withPorts += ports != 0;
+		if ((ports != 0 && said < 6) || swaps == 300) {
+			said++;
+			IOLog("MiniIOMobileFramebuffer: swap fences: %u of %u swaps carried ports; this one %u port(s), %u resolved "
+			    "to shared events (wait %#x/%llu signal %#x/%llu glass %#x/%llu)\n", withPorts, swaps, ports, found,
+			    *(const uint32_t *) (req + SWAP27_WAIT_PORT(0)), *(const uint64_t *) (req + SWAP27_WAIT_VALUE(0)),
+			    *(const uint32_t *) (req + SWAP27_SIGNAL_PORT(0)), *(const uint64_t *) (req + SWAP27_SIGNAL_VALUE(0)),
+			    *(const uint32_t *) (req + SWAP27_GLASS_PORT), *(const uint64_t *) (req + SWAP27_GLASS_VALUE));
+		}
+	}
 }
 
 /* the GPU's signals for the frame, SWAP_GPU_MS at most for all of them; false if one was not reached */
@@ -3420,6 +3444,21 @@ publishAccelerator(IOService * provider)
 		IOLog("MiniIOMobileFramebuffer: the accelerator is %s's\n", gpu->getName());
 		gpu->release();
 		return;
+	}
+	/*
+	 * ... and none when a GPU driver is still coming (11-26): on the AkIOS boot chain the display starts some seconds
+	 * before the Mali (mali_keep=1). A window server that started meanwhile found only the stand-in, got no Metal
+	 * device from an IOGPU-based plug-in and drew with CoreAnimation's software renderer for good (whose
+	 * asynchronous layers assert at the first unlock). Without a stand-in it waits for the accelerator, as on an
+	 * iPhone, where AGX's appears when its driver is up.
+	 */
+	{
+		uint32_t gpuComing = 0;
+
+		if (PE_parse_boot_argn("mali_keep", &gpuComing, sizeof(gpuComing)) && gpuComing != 0) {
+			IOLog("MiniIOMobileFramebuffer: no stand-in accelerator: the GPU's driver publishes the accelerator\n");
+			return;
+		}
 	}
 	accelerator = OSTypeAlloc(IOAcceleratorES);
 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
