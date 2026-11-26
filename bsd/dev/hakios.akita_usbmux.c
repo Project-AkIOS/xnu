@@ -52,6 +52,9 @@ bool akita_usb_send(const void *header, uint32_t header_len, const void *data, u
 #define TCP_HDR                 20
 #define MAX_PACKET              16384
 #define MAX_DATA                (MAX_PACKET - HDR - TCP_HDR)
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
 #define WINDOW                  (256 * 1024)
 #define CONNS                   16
 #define RX_MAX                  (256 * 1024)
@@ -62,12 +65,15 @@ struct mux_conn {
 	uint16_t host_port, phone_port;
 	uint32_t tx_seq;                /* ours */
 	uint32_t rx_next;               /* the host's next sequence number: our ack */
+	uint32_t tx_acked;              /* the host's ack of ours: what it has taken */
+	uint32_t tx_window;             /* the host's window in bytes: never more than this unacked (send_data) */
 	socket_t so;
 };
 
 static struct mux_conn conns[CONNS];
 static lck_grp_t *mux_grp;
 static lck_mtx_t *mux_lock;
+static uint32_t gSynWindow = WINDOW;      /* (the window of the SYN being answered: tcp_input -> tcp_syn) */
 static uint8_t *rx;                     /* bulk OUT, put together into whole packets */
 static uint32_t rx_len;
 static uint32_t said;
@@ -108,6 +114,45 @@ conn_free(struct mux_conn *c)
 }
 
 /* one connection's port, read until it closes: what it says goes to the host */
+/*
+ * Data to the host within its window (11-26): usbmuxd buffers what it has not handed to its client and advertises the
+ * room left; sending past it (a screenshot's 16 KiB into 448 bytes of room) made it tear the connection down -- and
+ * crash. Pieces of what fits; with no room, a wait for the host's next ack.
+ */
+static bool
+send_data(struct mux_conn *c, const uint8_t *data, uint32_t n)
+{
+	while (n > 0) {
+		uint32_t piece = 0, seq;
+
+		lck_mtx_lock(mux_lock);
+		for (;;) {
+			uint32_t inflight = c->tx_seq - c->tx_acked;
+			uint64_t deadline;
+
+			if (!c->open) {
+				lck_mtx_unlock(mux_lock);
+				return false;
+			}
+			if (c->tx_window > inflight) {
+				piece = MIN(n, c->tx_window - inflight);
+				break;
+			}
+			clock_interval_to_deadline(50, NSEC_PER_MSEC, &deadline);
+			lck_mtx_sleep_deadline(mux_lock, LCK_SLEEP_DEFAULT, (event_t)&c->tx_acked, THREAD_UNINT, deadline);
+		}
+		seq = c->tx_seq;
+		c->tx_seq += piece;
+		lck_mtx_unlock(mux_lock);
+		if (!send_tcp(c, TH_ACK, seq, c->rx_next, data, piece, true)) {
+			return false;
+		}
+		data += piece;
+		n -= piece;
+	}
+	return true;
+}
+
 static void
 conn_thread(void *parameter, __unused wait_result_t result)
 {
@@ -125,15 +170,8 @@ conn_thread(void *parameter, __unused wait_result_t result)
 		if (sock_receive(so, &msg, 0, &got) != 0 || got == 0) {
 			break;
 		}
-		lck_mtx_lock(mux_lock);
-		if (!c->open) {
-			lck_mtx_unlock(mux_lock);
-			break;
-		}
-		seq = c->tx_seq;
-		c->tx_seq += (uint32_t)got;
-		lck_mtx_unlock(mux_lock);
-		if (!send_tcp(c, TH_ACK, seq, c->rx_next, buf, (uint32_t)got, true)) {
+		(void)seq;
+		if (!send_data(c, buf, (uint32_t)got)) {
 			break;
 		}
 	}
@@ -176,11 +214,8 @@ klog_thread(void *parameter, __unused wait_result_t result)
 			delay_for_interval(200, NSEC_PER_MSEC);
 			continue;
 		}
-		lck_mtx_lock(mux_lock);
-		seq = c->tx_seq;
-		c->tx_seq += (uint32_t)n;
-		lck_mtx_unlock(mux_lock);
-		if (!send_tcp(c, TH_ACK, seq, c->rx_next, chunk, (uint32_t)n, true)) {
+		(void)seq;
+		if (!send_data(c, (const uint8_t *)chunk, (uint32_t)n)) {
 			break;
 		}
 	}
@@ -202,13 +237,7 @@ extern int akita_display_snapshot(const uint8_t **pixels, uint64_t *phys, uint32
 static bool
 screen_send(struct mux_conn *c, const void *data, uint32_t n)
 {
-	uint32_t seq;
-
-	lck_mtx_lock(mux_lock);
-	seq = c->tx_seq;
-	c->tx_seq += n;
-	lck_mtx_unlock(mux_lock);
-	return c->open && send_tcp(c, TH_ACK, seq, c->rx_next, data, n, true);
+	return c->open && send_data(c, (const uint8_t *)data, n);
 }
 
 static void
@@ -605,6 +634,8 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 				c->phone_port = phone_port;
 				c->rx_next = seq + 1;
 				c->tx_seq = 1;
+	c->tx_acked = 1;
+	c->tx_window = gSynWindow;
 			}
 		}
 		lck_mtx_unlock(mux_lock);
@@ -685,6 +716,8 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 	c->open = true;
 	c->rx_next = seq + 1;
 	c->tx_seq = 1;
+	c->tx_acked = 1;
+	c->tx_window = gSynWindow;
 	lck_mtx_unlock(mux_lock);
 	if (said++ < 40) {
 		printf("akita usbmux: host port %u to port %u: connected\n", host_port, phone_port);
@@ -712,6 +745,7 @@ tcp_input(const uint8_t *t, uint32_t len)
 		return;
 	}
 	if (flags & TH_SYN) {
+		gSynWindow = (uint32_t)get16(t + 14) << 8;
 		tcp_syn(host_port, phone_port, seq);
 		return;
 	}
@@ -720,6 +754,16 @@ tcp_input(const uint8_t *t, uint32_t len)
 	if (!c || !c->open) {
 		lck_mtx_unlock(mux_lock);
 		return;
+	}
+	if (flags & TH_ACK) {
+		/* (11-26) what the host has taken, and how much more it will: send_data sends no more than that */
+		uint32_t ack = get32(t + 8);
+
+		if ((int32_t)(ack - c->tx_acked) > 0) {
+			c->tx_acked = ack;
+		}
+		c->tx_window = (uint32_t)get16(t + 14) << 8;
+		wakeup((caddr_t)&c->tx_acked);   /* (BSD wakeup: thread_wakeup on that event, as send_data sleeps) */
 	}
 	if (flags & (TH_RST | TH_FIN)) {
 		/* the reader closes it; shut down under the lock, before the reader can see it closed and free the socket */

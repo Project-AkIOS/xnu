@@ -738,7 +738,9 @@ public:
 	unsigned        fSwapFirst, fSwapsWaiting;
 	uint32_t        fSwapPresentedID, fSwapShownID;   /* (SwapWait: the last swap handed over, and the last on the panel) */
 	uint32_t        fSwapScannedID;         /* (fb_swapwait=3: the last swap the panel has begun to read, the one before let go of) */
-	uint64_t        fSwapScannedAt;         /* ... when (fb_swapwait=4: the newest swap counts as done after a while) */
+	uint64_t        fSwapScannedAt;         /* ... when (fb_swapwait=4: the newest swap retired by a copy after a while) */
+	uint32_t        fRetireAsked;           /* the newest swap a poll wants retired (the presenter copies it, retireByCopy) */
+	uint32_t        fRetiredID;             /* ... and the last so retired */
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
 	 * (boot-arg fb_beat=0: at once): frames then follow each other at an even pace whatever
@@ -804,6 +806,7 @@ public:
 	IOReturn swapPoll(uint32_t id, uint32_t flags);
 	void swapScanned(uint32_t id);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void retireByCopy(const uint8_t * swap);
 	void swapShown(uint32_t id);
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
 	bool fSettling;                 /* drawing the last frame again, filtered (fb_filter=2) */
@@ -2182,13 +2185,24 @@ IOMobileFramebuffer::swapPoll(uint32_t id, uint32_t flags)
 		 * ... BUT THE NEWEST SWAP (11-26): one nothing has come after can never be retired, and a client that waits
 		 * for it before it swaps again (backboardd once Setup came to the front after the hello screen's unlock: its
 		 * last swap polled ~20000 times, the panel frozen) would wait for good. It counts as done once the panel has
-		 * read it for SWAP_SETTLE_MS with no later swap presented; a draw into its surface while the panel still
-		 * reads it is held back by the GPU's submission gate (hakios.akita_gpu.cpp) as before.
+		 * read it for SWAP_SETTLE_MS with no later swap presented, and once the presenter has taken its surface off the
+		 * panel (below).
 		 */
 		nanoseconds_to_absolutetime(SWAP_SETTLE_MS * NSEC_PER_MSEC, &settled);
 		if (!done && fSwapScannedID == id && fSwapPresentedID == id && fSwapsWaiting == 0 &&
 		    mach_absolute_time() - fSwapScannedAt >= settled) {
-			done = true;
+			/*
+			 * (11-26, second form) Not "done" while the panel still reads its surface -- CoreAnimation drew the next
+			 * frame into it and the panel showed it half drawn (Setup's language list, the tester's flicker): the
+			 * presenter copies the frame into the framebuffer's own buffer, puts that on the panel and lets the
+			 * surface go (retireByCopy); done once it has.
+			 */
+			if (fRetiredID == id) {
+				done = true;
+			} else if (fRetireAsked != id) {
+				fRetireAsked = id;
+				IOLockWakeup(fSwapLock, fSwap, true);
+			}
 		}
 	}
 	gSwapPollsBusy += !done;
@@ -2360,6 +2374,20 @@ IOMobileFramebuffer::presenter(void)
 		while (fSwapsWaiting == 0) {
 			uint64_t deadline;
 
+			if (fRetireAsked != 0 && fRetireAsked != fRetiredID) {
+				uint32_t id = fRetireAsked;
+
+				IOLockUnlock(fSwapLock);
+				PRESENTER_PHASE(5);     /* the newest swap retired by a copy */
+				if (swapWord(swap, SWAP_ID) == id) {
+					retireByCopy(swap);
+				}
+				IOLockLock(fSwapLock);
+				fRetiredID = id;
+				IOLockWakeup(fSwapLock, &fSwapScannedID, false);
+				continue;
+			}
+
 			if (!unsettled) {
 				IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
 				continue;
@@ -2520,6 +2548,57 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fSettling = false;
 	fStatSettled++;
+}
+
+/*
+ * The newest swap's surfaces off the panel, for its maker to draw into again (fb_swapwait=4's polls): when the panel
+ * scans a surface out where it was drawn (zero copy), the frame is drawn once more from it into the framebuffer's own
+ * buffer, that is put on the panel, and the surface is let go of. A copied frame is in the framebuffer already.
+ */
+void
+IOMobileFramebuffer::retireByCopy(const uint8_t * swap)
+{
+	MiniIOSurface * surfaces[SWAP_LAYERS] = { NULL };
+	int32_t src[4], dst[4];
+	static uint32_t copies;
+
+	if (!gZC || gZCShown == 0 || !fGraphics) {
+		return;
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+
+		surfaces[layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		MiniIOSurface * s = surfaces[layer];
+
+		if (s == NULL || s->info.bytesPerElement != 4 ||
+		    !(s->info.planeCount == 0 || (s->info.planeCount == 1 && s->planes[0].offset == 0))) {
+			continue;
+		}
+		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
+		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
+		drawLayer(s, src, dst);
+	}
+	flipTo(fBase);
+	hakios_display_ops->scanout(gZCPhys[0], fRowBytes);
+	zcWaitScanned(gZCPhys[0]);
+	zcShown(0);
+	if (fZCHeld != NULL) {
+		MiniIOSurfaceDisplayUse(fZCHeld, -1);
+		MiniIOSurfaceDrop(fZCHeld);
+		fZCHeld = NULL;
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL) {
+			MiniIOSurfaceDrop(surfaces[layer]);
+		}
+	}
+	if (copies++ < 4 || copies % 500 == 0) {
+		IOLog("MiniIOMobileFramebuffer: swap %u retired by a copy into the framebuffer (%u so far)\n",
+		    swapWord(swap, SWAP_ID), copies);
+	}
 }
 
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
