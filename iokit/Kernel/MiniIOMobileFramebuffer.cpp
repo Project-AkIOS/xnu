@@ -35,6 +35,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 }
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include "akios_iogpu.h"
 
 #include "MiniIOSurface.h"
 
@@ -3247,47 +3248,28 @@ publishDisplayNode(void)
 }
 
 /*
- * The graphics accelerator. There is none, but CoreAnimation waits half a minute for a
- * service of this class to appear before it looks for a GPU at all (once per process). An
- * accelerator without the properties that name its Metal and OpenGL ES drivers is passed
- * over by both, which leaves CoreAnimation with its software renderer, as before.
+ * The graphics accelerator when no GPU driver published one (an IOGPU, akios_iogpu.cpp): CoreAnimation waits half a
+ * minute for a service of the class IOAcceleratorES to appear before it looks for a GPU at all (once per process).
+ * One without the properties that name its Metal and OpenGL ES drivers is passed over by both, which leaves
+ * CoreAnimation with its software renderer.
  */
-class IOAcceleratorES : public IOService
-{
-	OSDeclareDefaultStructors(IOAcceleratorES);
-};
-
-OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
-
 static void
 publishAccelerator(IOService * provider)
 {
-	IOAcceleratorES * accelerator = OSTypeAlloc(IOAcceleratorES);
+	OSDictionary * match = IOService::serviceMatching("IOGPU");
+	IOService * gpu = match != NULL ? IOService::copyMatchingService(match) : NULL;
+	IOAcceleratorES * accelerator;
 
+	OSSafeReleaseNULL(match);
+	if (gpu != NULL) {
+		IOLog("MiniIOMobileFramebuffer: the accelerator is %s's\n", gpu->getName());
+		gpu->release();
+		return;
+	}
+	accelerator = OSTypeAlloc(IOAcceleratorES);
 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
-		uint32_t metal = 0;
-
 		accelerator->setName("sgx");
-		/*
-		 * Boot-arg metal=1: say where Metal's device is (docs/metal-plan.md, step 1). Metal reads these two
-		 * properties, opens /System/Library/Extensions/<name>.bundle and takes the class (userland/src/HakiosMetal.m).
-		 * Never by default: with them a program that asks for Metal gets a device, and CoreAnimation would choose
-		 * Metal for the screen; until that device can draw, a screen drawn without it is the working one.
-		 */
-		if (PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0) {
-			/*
-			 * metal_plugin=NAME: another name for it. A system root without the link
-			 * /System/Library/Extensions/HakiosMetal.bundle -> /akita/lib/HakiosMetal.bundle (the Pixel 8a's,
-			 * installed on its flash before the link was in the image) is reached with
-			 * metal_plugin=../../../akita/lib/HakiosMetal: Metal makes the bundle's path of this name.
-			 */
-			static char name[96] = "HakiosMetal";
-
-			PE_parse_boot_arg_str("metal_plugin", name, sizeof(name));
-			accelerator->setProperty("MetalPluginName", name);
-			accelerator->setProperty("MetalPluginClassName", "HakiosMetalDevice");
-			IOLog("MiniIOMobileFramebuffer: metal=1: the accelerator names %s as its Metal plug-in\n", name);
-		}
+		accelerator->publishMetalPlugin("HakiosMetal", "HakiosMetalDevice");
 		accelerator->registerService();
 	}
 	OSSafeReleaseNULL(accelerator);

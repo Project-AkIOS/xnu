@@ -1,0 +1,539 @@
+/*
+ * AkIOS: IOAcceleratorES, IOGPU and IOGPUDeviceUserClient, as iOS's IOGPUFamily has them (akios_iogpu.h says why).
+ *
+ * What is answered so far: opening a device (type 1) and the questions IOGPUDeviceCreateWithOptions asks before it
+ * hands back a device -- the configuration (0), the name (1), the event machine with the stamp page (2), the trace
+ * filter (3), the device information (4), trace ids (5), the shared information (16), memory data (21) and the
+ * allocated size (23). Every other selector answers kIOReturnUnsupported until it is written; the shapes of all 56
+ * are in the table, so a caller with the wrong sizes is refused by IOUserClient as it would be by Apple's kernel.
+ */
+#include "akios_iogpu.h"
+#include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <pexpert/pexpert.h>
+
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+/* ---- IOAcceleratorES ---- */
+
+OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+
+void
+IOAcceleratorES::publishMetalPlugin(const char *name, const char *className)
+{
+	uint32_t metal = 0;
+	static char plugin[96];
+
+	/*
+	 * Never by default: with these properties a program that asks for Metal gets a device, and CoreAnimation chooses
+	 * Metal for the screen. metal_plugin=NAME: another name (Metal builds /System/Library/Extensions/NAME.bundle, so
+	 * ../../../akita/lib/X reaches a bundle in our image).
+	 */
+	if (!PE_parse_boot_argn("metal", &metal, sizeof(metal)) || metal == 0) {
+		return;
+	}
+	strlcpy(plugin, name, sizeof(plugin));
+	PE_parse_boot_arg_str("metal_plugin", plugin, sizeof(plugin));
+	setProperty("MetalPluginName", plugin);
+	setProperty("MetalPluginClassName", className);
+	IOLog("%s: metal=1: Metal's plug-in is %s (%s)\n", getName(), plugin, className);
+}
+
+/* ---- IOGPU ---- */
+
+OSDefineMetaClassAndStructors(IOGPU, IOAcceleratorES);
+
+bool
+IOGPU::start(IOService *provider)
+{
+	if (!IOAcceleratorES::start(provider)) {
+		return false;
+	}
+	fStamps = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
+	    page_size, page_size);
+	if (fStamps == NULL) {
+		return false;
+	}
+	bzero(fStamps->getBytesNoCopy(), page_size);
+	retireStandIns();
+	return true;
+}
+
+/*
+ * The display driver publishes a bare IOAcceleratorES when it starts before any GPU driver (CoreAnimation waits for
+ * one). Once a real GPU is here that stand-in goes: Metal makes a device of every accelerator that names a plug-in, and
+ * MTLCreateSystemDefaultDevice aborts unless there is exactly one.
+ */
+void
+IOGPU::retireStandIns(void)
+{
+	OSDictionary *match = IOService::serviceMatching("IOAcceleratorES");
+	OSIterator *it = match != NULL ? IOService::getMatchingServices(match) : NULL;
+	OSObject *o;
+
+	OSSafeReleaseNULL(match);
+	if (it == NULL) {
+		return;
+	}
+	while ((o = it->getNextObject()) != NULL) {
+		IOService *s = OSDynamicCast(IOService, o);
+
+		if (s != NULL && s != this && s->getMetaClass() == IOAcceleratorES::metaClass) {
+			IOLog("%s: the stand-in accelerator %s goes\n", getName(), s->getName());
+			s->terminate();
+		}
+	}
+	it->release();
+}
+
+void
+IOGPU::free(void)
+{
+	OSSafeReleaseNULL(fStamps);
+	IOAcceleratorES::free();
+}
+
+void
+IOGPU::populateAccelConfig(IOGPUConfig *config)
+{
+	bzero(config, sizeof(*config));
+}
+
+const char *
+IOGPU::gpuName(void)
+{
+	return getName();
+}
+
+IOReturn
+IOGPU::newVendorUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+    IOUserClient **handler)
+{
+	return IOService::newUserClient(owningTask, securityID, type, properties, handler);
+}
+
+/* IOGPUFamily's __globalObjectIDCounter: starts at 1 (IOGPU.framework asserts on an id group starting at 0) */
+static volatile SInt64 gObjectIDs = 1;
+
+uint64_t
+IOGPU::nextObjectIDs(uint64_t count)
+{
+	return (uint64_t)OSAddAtomic64((SInt64)count, &gObjectIDs);
+}
+
+class IOGPUDeviceUserClient;
+static IOGPUDeviceUserClient *newDeviceClient(IOGPU *gpu, task_t task, void *securityID, uint32_t options);
+
+IOReturn
+IOGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler)
+{
+	/* iOS's IOGPU::newUserClient: 1 the device, 0x21 the memory information; type >> 16 the device's options */
+	if ((type & 0xffff) == 1) {
+		IOGPUDeviceUserClient *client = newDeviceClient(this, owningTask, securityID, type >> 16);
+
+		if (client == NULL) {
+			return kIOReturnNoMemory;
+		}
+		*handler = (IOUserClient *)client;
+		return kIOReturnSuccess;
+	}
+	if ((type & 0xffff) == 0x21) {
+		return kIOReturnUnsupported;
+	}
+	return newVendorUserClient(owningTask, securityID, type, properties, handler);
+}
+
+/* ---- IOGPUDeviceUserClient ---- */
+
+class IOGPUDeviceUserClient : public IOUserClient
+{
+	OSDeclareDefaultStructors(IOGPUDeviceUserClient);
+
+	IOGPU *fGPU;
+	task_t fTask;
+	uint32_t fOptions;
+	IOMemoryMap *fStampMap;         /* the stamp page in the client's task, read-only, made at the open */
+	uint64_t fGlobalID;             /* this client's object id (selector 4) */
+	uint64_t fDeviceID;             /* its device's (selector 16) */
+	IOLock *fLock;
+
+	/* shared memory (selector 12): the id is the index + 1 */
+	enum { kMaxShmem = 256 };
+	struct shmem { IOBufferMemoryDescriptor *memory; IOMemoryMap *map; } fShmem[kMaxShmem];
+	void releaseAll(void);
+
+	static const IOExternalMethodDispatch sMethods[56];
+
+	static IOReturn s_unsupported(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_config(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_name(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_event_machine(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_current_trace_filter(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_device_info(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_next_gid_group(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_shared_info(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_memory_data(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_allocated_size(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_create_shmem(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_destroy_shmem(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_perform_mapping(OSObject *target, void *reference, IOExternalMethodArguments *args);
+
+public:
+	bool setUp(IOGPU *gpu, task_t task, void *securityID, uint32_t options);
+	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+	virtual void free(void) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
+	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(IOGPUDeviceUserClient, IOUserClient);
+
+#define V       kIOUCVariableStructureSize
+#define M(fn, si, ti, so, to) { (IOExternalMethodAction)&IOGPUDeviceUserClient::fn, si, ti, so, to }
+#define U(si, ti, so, to) M(s_unsupported, si, ti, so, to)
+
+/* iOS 27.2.1's sDeviceMethods: (function, scalars in, structure in, scalars out, structure out) */
+const IOExternalMethodDispatch IOGPUDeviceUserClient::sMethods[56] = {
+	M(s_get_config, 0, 0, 0, 0x40),                 /*  0 */
+	M(s_get_name, 0, 0, 0, 0x40),                   /*  1 */
+	M(s_get_event_machine, 0, 0, 0, 0x218),         /*  2 */
+	M(s_get_current_trace_filter, 0, 0, 0, 8),      /*  3 */
+	M(s_get_device_info, 0, 0, 0, 0x20),            /*  4 */
+	M(s_get_next_gid_group, 0, 0, 0, 0x10),         /*  5 */
+	U(0, V, 0, 0x10),                               /*  6 new_command_queue */
+	U(1, 0, 0, 0),                                  /*  7 delete_command_queue */
+	U(0, V, 0, V),                                  /*  8 new_resource */
+	U(1, 0, 0, 0),                                  /*  9 delete_resource */
+	U(2, 0, 0, 0),                                  /* 10 finish_object_event */
+	U(2, 0, 1, 0),                                  /* 11 set_resource_purgeable */
+	M(s_create_shmem, 2, 0, 0, 0x10),               /* 12 */
+	M(s_destroy_shmem, 1, 0, 0, 0),                 /* 13 */
+	U(2, 0, 0, 0x10),                               /* 14 create_notificationqueue */
+	U(1, 0, 0, 0),                                  /* 15 destroy_notificationqueue */
+	M(s_get_shared_info, 0, 0, 0, 8),               /* 16 */
+	U(0, 0, 0, 4),                                  /* 17 create_mtlfence */
+	U(1, 0, 0, 0),                                  /* 18 destroy_mtlfence */
+	U(1, 0, 0, 0x18),                               /* 19 create_mtlevent */
+	U(1, 0, 0, 0),                                  /* 20 destroy_mtlevent */
+	M(s_get_memory_data, 0, 0, 0, 0x30),            /* 21 */
+	U(0, 0, 0, V),                                  /* 22 unsupported (Apple's too) */
+	M(s_get_allocated_size, 0, 0, 1, 0),            /* 23 */
+	U(2, 0, 0, 0),                                  /* 24 set_notification_queue */
+	U(4, V, 1, 0),                                  /* 25 submit_command_buffers */
+	U(1, 0xc, 1, 0),                                /* 26 set_priority_and_background */
+	U(1, 4, 0, 0),                                  /* 27 set_quality_of_service */
+	U(0, 0, 2, 0),                                  /* 28 create_mtllateevalevent */
+	U(1, 0, 0, 0),                                  /* 29 destroy_mtllateevalevent */
+	U(2, 0, 0, 0),                                  /* 30 async_signal_mtlLateEvalevent */
+	U(1, 0, 2, 0),                                  /* 31 query_mtlLateEvalevent */
+	U(2, 0, 0, 0),                                  /* 32 set_display_params_for_gpu */
+	U(2, 0, 0, 0),                                  /* 33 set_app_gpu_role */
+	U(1, 0, 1, 0),                                  /* 34 get_app_gpu_role */
+	U(2, 0, 0, 0),                                  /* 35 set_resource_owner_identity */
+	U(3, 0, 1, 0),                                  /* 36 create_resource_iosurface */
+	U(1, 0, 0, 0),                                  /* 37 resource_detach_backing */
+	U(0, 0x18, 0, 0),                               /* 38 resource_replace_backing_bytes */
+	U(0, 0x18, 1, 0),                               /* 39 resource_replace_backing_ranges */
+	U(1, 0, 2, 0),                                  /* 40 create_vniodesc */
+	U(1, 0, 0, 0),                                  /* 41 destroy_vniodesc */
+	U(2, 0, 2, 0),                                  /* 42 create_io_command_queue */
+	U(1, 0, 0, 0),                                  /* 43 destroy_io_command_queue */
+	U(2, 0, 0, 0),                                  /* 44 set_io_notification_queue */
+	U(1, V, 0, 0),                                  /* 45 submit_io_commands */
+	U(1, 0, 2, 0),                                  /* 46 create_io_command_buffer */
+	U(2, 0, 0, 0),                                  /* 47 destroy_io_command_buffer */
+	U(2, 0, 0, 0),                                  /* 48 try_cancel_io_command_buffer */
+	U(1, 0, 0, 0),                                  /* 49 perform_io */
+	U(1, 0, 0, 0),                                  /* 50 io_command_buffer_complete */
+	U(3, 0, 0, 0),                                  /* 51 io_command_buffer_barrier_complete */
+	U(2, V, 0, 0),                                  /* 52 group_add_resources */
+	U(2, V, 0, 0),                                  /* 53 group_remove_resources */
+	U(2, 0, 1, 0),                                  /* 54 create_device_assertion */
+	M(s_perform_mapping, 0, 0, 0, 0),               /* 55 */
+};
+
+#undef U
+#undef M
+#undef V
+
+static IOGPUDeviceUserClient *
+newDeviceClient(IOGPU *gpu, task_t task, void *securityID, uint32_t options)
+{
+	IOGPUDeviceUserClient *client = OSTypeAlloc(IOGPUDeviceUserClient);
+
+	if (client != NULL && !client->setUp(gpu, task, securityID, options)) {
+		OSSafeReleaseNULL(client);
+	}
+	return client;
+}
+
+bool
+IOGPUDeviceUserClient::setUp(IOGPU *gpu, task_t task, void *securityID, uint32_t options)
+{
+	if (!initWithTask(task, securityID, 1, NULL)) {
+		return false;
+	}
+	fGPU = gpu;
+	fTask = task;
+	fOptions = options;
+	fLock = IOLockAlloc();
+	/*
+	 * As IOGPUDeviceUserClient::deviceUserClientStart: the stamp page goes into the task now, read-only (kIOMapUnique |
+	 * kIOMapReadOnly | kIOMapAnywhere, Apple's 0x04001001); no selector maps it and there is no memory type for it.
+	 */
+	fStampMap = gpu->stampMemory()->createMappingInTask(task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapUnique);
+	if (fLock == NULL || fStampMap == NULL) {
+		return false;
+	}
+	fGlobalID = IOGPU::nextObjectIDs(1);
+	fDeviceID = IOGPU::nextObjectIDs(1);
+	if (!attach(gpu)) {
+		return false;
+	}
+	if (!start(gpu)) {
+		detach(gpu);
+		return false;
+	}
+	return true;
+}
+
+void
+IOGPUDeviceUserClient::releaseAll(void)
+{
+	for (unsigned i = 0; i < kMaxShmem; i++) {
+		OSSafeReleaseNULL(fShmem[i].map);
+		OSSafeReleaseNULL(fShmem[i].memory);
+	}
+	OSSafeReleaseNULL(fStampMap);
+}
+
+IOReturn
+IOGPUDeviceUserClient::clientClose(void)
+{
+	if (fLock != NULL) {
+		IOLockLock(fLock);
+		releaseAll();
+		IOLockUnlock(fLock);
+	}
+	terminate();
+	return kIOReturnSuccess;
+}
+
+void
+IOGPUDeviceUserClient::free(void)
+{
+	releaseAll();
+	if (fLock != NULL) {
+		IOLockFree(fLock);
+		fLock = NULL;
+	}
+	IOUserClient::free();
+}
+
+IOReturn
+IOGPUDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
+{
+	if (selector >= sizeof(sMethods) / sizeof(sMethods[0])) {
+		return kIOReturnUnsupported;
+	}
+	if (args->asyncWakePort != MACH_PORT_NULL) {
+		return kIOReturnBadArgument;    /* Apple's refuses asynchronous calls too */
+	}
+	return IOUserClient::externalMethod(selector, args, (IOExternalMethodDispatch *)&sMethods[selector], this, NULL);
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_unsupported(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_get_config(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	IOGPUConfig config;
+
+	me->fGPU->populateAccelConfig(&config);
+	memcpy(args->structureOutput, &config, MIN(sizeof(config), args->structureOutputSize));
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_get_name(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+
+	bzero(args->structureOutput, args->structureOutputSize);
+	strlcpy((char *)args->structureOutput, me->fGPU->gpuName(), args->structureOutputSize);
+	return kIOReturnSuccess;
+}
+
+/*
+ * The event machine: where the stamp page is in the caller's task and where each channel's stamp is in it.
+ * IOGPU.framework tests an event (IOGPUEvent: up to 15 (stamp & ~0xff | channel) slots) against these words without
+ * asking the kernel.
+ */
+struct IOGPUEventMachineInfo {
+	uint64_t stampBase;             /* +0x000: the page, in the caller's task */
+	uint32_t clientSharedPrivSize;  /* +0x008: a vendor area after a resource's client-shared events (at +0x80) */
+	uint32_t word0c;                /* +0x00c */
+	uint32_t resourcePrivSize;      /* +0x010: the vendor's tail of a new resource's answer (after 0x58 bytes) */
+	int32_t numStamps;              /* +0x014 */
+	uint32_t stampOffset[128];      /* +0x018 */
+};
+
+IOReturn
+IOGPUDeviceUserClient::s_get_event_machine(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	IOGPUEventMachineInfo *info = (IOGPUEventMachineInfo *)args->structureOutput;
+
+	bzero(info, args->structureOutputSize);
+	info->stampBase = me->fStampMap->getAddress();
+	info->numStamps = kIOGPUEventChannels;
+	for (unsigned i = 0; i < kIOGPUEventChannels; i++) {
+		info->stampOffset[i] = me->fGPU->stampOffset(i);
+	}
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_get_current_trace_filter(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	bzero(args->structureOutput, args->structureOutputSize);
+	return kIOReturnSuccess;
+}
+
+/*
+ * Device information: (this client's object id, the graphics comm page in the task, client-shared block 0 (its first
+ * u64 the allocated size), the comm page's length). No comm page and no client-shared block here yet: zeros, which
+ * IOGPU.framework takes as "none" (selector 23 answers the allocated size instead).
+ */
+IOReturn
+IOGPUDeviceUserClient::s_get_device_info(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	uint64_t *out = (uint64_t *)args->structureOutput;
+
+	bzero(out, args->structureOutputSize);
+	out[0] = me->fGlobalID;
+	return kIOReturnSuccess;
+}
+
+/* a group of global object ids for the caller's command buffers and encoders: (first, end); first is never 0 */
+IOReturn
+IOGPUDeviceUserClient::s_get_next_gid_group(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	uint64_t *out = (uint64_t *)args->structureOutput;
+
+	out[0] = IOGPU::nextObjectIDs(0x1000000);
+	out[1] = out[0] + 0x1000000;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_get_shared_info(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+
+	*(uint64_t *)args->structureOutput = me->fDeviceID;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_get_memory_data(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	bzero(args->structureOutput, args->structureOutputSize);
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_get_allocated_size(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	args->scalarOutput[0] = 0;
+	return kIOReturnSuccess;
+}
+
+/*
+ * Shared memory for the command buffers (types: 0 segment list, 1 kernel commands, 2 debug buffer, 3 sideband; the
+ * type changes nothing here, as in Apple's base class): (size, type) in, (task address, size, id) out.
+ */
+struct IOGPUShmemInfo {
+	uint64_t address;
+	uint32_t size;
+	uint32_t shmemID;
+};
+
+IOReturn
+IOGPUDeviceUserClient::s_create_shmem(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	IOGPUShmemInfo *out = (IOGPUShmemInfo *)args->structureOutput;
+	uint64_t size = args->scalarInput[0];
+	IOBufferMemoryDescriptor *md;
+	IOMemoryMap *map;
+	unsigned i;
+
+	bzero(out, sizeof(*out));
+	if (size == 0 || size > 0x10000000) {
+		return kIOReturnNoSpace;
+	}
+	md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
+	    round_page(size), page_size);
+	if (md == NULL) {
+		return kIOReturnNoMemory;
+	}
+	bzero(md->getBytesNoCopy(), md->getLength());
+	map = md->createMappingInTask(me->fTask, 0, kIOMapAnywhere);
+	if (map == NULL) {
+		md->release();
+		return kIOReturnNoMemory;
+	}
+	IOLockLock(me->fLock);
+	for (i = 0; i < kMaxShmem && me->fShmem[i].memory != NULL; i++) {
+	}
+	if (i == kMaxShmem) {
+		IOLockUnlock(me->fLock);
+		map->release();
+		md->release();
+		return kIOReturnNoResources;
+	}
+	me->fShmem[i].memory = md;
+	me->fShmem[i].map = map;
+	IOLockUnlock(me->fLock);
+	out->address = map->getAddress();
+	out->size = (uint32_t)map->getLength();
+	out->shmemID = i + 1;
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_destroy_shmem(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	uint64_t id = args->scalarInput[0];
+	IOReturn ret = kIOReturnBadArgument;
+
+	IOLockLock(me->fLock);
+	if (id >= 1 && id <= kMaxShmem && me->fShmem[id - 1].memory != NULL) {
+		OSSafeReleaseNULL(me->fShmem[id - 1].map);
+		OSSafeReleaseNULL(me->fShmem[id - 1].memory);
+		ret = kIOReturnSuccess;
+	}
+	IOLockUnlock(me->fLock);
+	return ret;
+}
+
+/*
+ * Metal 4's mapping thread calls this in a loop and stops at kIOReturnAborted; any other immediate answer would make
+ * it spin. Nothing is mapped this way here yet.
+ */
+IOReturn
+IOGPUDeviceUserClient::s_perform_mapping(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	return kIOReturnAborted;
+}

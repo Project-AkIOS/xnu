@@ -27,6 +27,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include "MiniIOSurface.h"
+#include "akios_iogpu.h"
 #include <libkern/c++/OSObject.h>
 #include <pexpert/pexpert.h>
 #include <IOKit/IOKitKeys.h>
@@ -177,25 +178,44 @@ extern "C" uint32_t hakios_fb_shown_surface(void);
 extern "C" void hakios_fb_swap_state(uint32_t *presented, uint32_t *presented_surface, uint32_t *shown);
 extern "C" void *hakios_fb_shown_event(void);  /* MiniIOMobileFramebuffer.cpp: woken when the panel's surface changes */  /* MiniIOMobileFramebuffer.cpp */        /* (the surfaces being drawn: see MiniIOSurfaceDrawn) */
 
-class HakiosGPU : public IOService
+/*
+ * The Mali's IOGPU (akios_iogpu.cpp): IOServiceOpen type 1 is IOGPU.framework's device; type 0 stays panthor's
+ * interface (HakiosGPUUserClient) for the Metal bundle of today until it moves onto IOGPU.framework.
+ */
+class HakiosGPU : public IOGPU
 {
 	OSDeclareDefaultStructors(HakiosGPU);
 public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	virtual const char *gpuName(void) APPLE_KEXT_OVERRIDE { return "Mali-G715"; }
+	virtual void populateAccelConfig(IOGPUConfig *config) APPLE_KEXT_OVERRIDE;
 };
-OSDefineMetaClassAndStructors(HakiosGPU, IOService);
+OSDefineMetaClassAndStructors(HakiosGPU, IOGPU);
 
 bool
 HakiosGPU::start(IOService *provider)
 {
-	if (!IOService::start(provider)) {
+	if (!IOGPU::start(provider)) {
 		return false;
 	}
 	setProperty(kIOUserClientClassKey, "HakiosGPUUserClient");
 	setProperty("DRMDriver", "panthor");
 	setName("HakiosGPU");
+	publishMetalPlugin("HakiosMetal", "HakiosMetalDevice");
 	registerService();
 	return true;
+}
+
+/* the GPU shares the 8 GB of system memory: half of it for the GPU at most, a quarter in one buffer */
+void
+HakiosGPU::populateAccelConfig(IOGPUConfig *config)
+{
+	uint64_t memory = (uint64_t)max_mem;
+
+	IOGPU::populateAccelConfig(config);
+	config->textureRam = config->videoRam = memory / 2;
+	config->sharedMemorySize = memory / 2;
+	config->maxResourceSize = (memory / 4) & ~(uint64_t)PAGE_MASK;
 }
 
 void
