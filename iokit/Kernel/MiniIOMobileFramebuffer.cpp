@@ -105,6 +105,11 @@ enum {
 #define SWAP27_GLASS_PORT       0x2b8
 #define SWAP27_SIGNAL_PORT(l)   (0x2bc + 4 * (l))
 
+/* (11-26 diagnosis: where the presenter thread is, for SwapWait's log when backboardd spins on a swap not presented) */
+static volatile int gPresenterPhase;
+static volatile uint64_t gPresenterPhaseSince;
+#define PRESENTER_PHASE(n)      do { gPresenterPhase = (n); gPresenterPhaseSince = mach_absolute_time(); } while (0)
+
 struct swap_events {
 	IOSurfaceSharedEvent * wait[4];
 	uint64_t waitValue[4];
@@ -184,6 +189,7 @@ swapEventsDone(struct swap_events * ev)
 
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
+#define SWAP_SETTLE_MS          50                      /* the newest swap, read that long, counts as retired */
 #define SWAP_GPU_MS             500                     /* a frame the GPU has not drawn by then is shown as it is */
 #define SWAP_HELD_MS            700                     /* a swap that cannot be taken by then is not shown at all */
 
@@ -708,6 +714,7 @@ public:
 	unsigned        fSwapFirst, fSwapsWaiting;
 	uint32_t        fSwapPresentedID, fSwapShownID;   /* (SwapWait: the last swap handed over, and the last on the panel) */
 	uint32_t        fSwapScannedID;         /* (fb_swapwait=3: the last swap the panel has begun to read, the one before let go of) */
+	uint64_t        fSwapScannedAt;         /* ... when (fb_swapwait=4: the newest swap counts as done after a while) */
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
 	 * (boot-arg fb_beat=0: at once): frames then follow each other at an even pace whatever
@@ -2085,6 +2092,7 @@ IOMobileFramebuffer::swapScanned(uint32_t id)
 {
 	IOLockLock(fSwapLock);
 	fSwapScannedID = id;
+	fSwapScannedAt = mach_absolute_time();
 	IOLockWakeup(fSwapLock, &fSwapScannedID, false);
 	IOLockUnlock(fSwapLock);
 }
@@ -2143,7 +2151,21 @@ IOMobileFramebuffer::swapPoll(uint32_t id, uint32_t flags)
 	 * later, it finds no surface free and makes a THIRD (allocate_buffer has no cap) -- triple buffering.
 	 */
 	if (gSwapWaitOn == 4 && (flags & 0x80000000u)) {
+		uint64_t settled;
+
 		done = (int32_t) (fSwapScannedID - id) > 0;
+		/*
+		 * ... BUT THE NEWEST SWAP (11-26): one nothing has come after can never be retired, and a client that waits
+		 * for it before it swaps again (backboardd once Setup came to the front after the hello screen's unlock: its
+		 * last swap polled ~20000 times, the panel frozen) would wait for good. It counts as done once the panel has
+		 * read it for SWAP_SETTLE_MS with no later swap presented; a draw into its surface while the panel still
+		 * reads it is held back by the GPU's submission gate (hakios.akita_gpu.cpp) as before.
+		 */
+		nanoseconds_to_absolutetime(SWAP_SETTLE_MS * NSEC_PER_MSEC, &settled);
+		if (!done && fSwapScannedID == id && fSwapPresentedID == id && fSwapsWaiting == 0 &&
+		    mach_absolute_time() - fSwapScannedAt >= settled) {
+			done = true;
+		}
 	}
 	gSwapPollsBusy += !done;
 	IOLockUnlock(fSwapLock);
@@ -2179,7 +2201,20 @@ IOMobileFramebuffer::swapWait(uint32_t id, uint32_t flags)
 	if ((int32_t) (fSwapShownID - id) < 0 && (int32_t) (fSwapPresentedID - id) >= 0) {
 		gSwapWaitBlocked++;
 	} else if ((int32_t) (fSwapPresentedID - id) < 0) {
+		static uint32_t spin, spinID, said2;
+
 		gSwapWaitAhead++;
+		spin = id == spinID ? spin + 1 : 0;
+		spinID = id;
+		if (spin == 200 && said2 < 6) {
+			uint64_t ns;
+
+			said2++;
+			absolutetime_to_nanoseconds(mach_absolute_time() - gPresenterPhaseSince, &ns);
+			IOLog("MiniIOMobileFramebuffer: SwapWait(%u) asked 200 times, not presented (presented %u, shown %u, %u "
+			    "waiting): the presenter in phase %d for %llu ms\n", id, fSwapPresentedID, fSwapShownID, fSwapsWaiting,
+			    gPresenterPhase, ns / NSEC_PER_MSEC);
+		}
 	}
 	while ((int32_t) (fSwapShownID - id) < 0 && (int32_t) (fSwapPresentedID - id) >= 0) {
 		if (IOLockSleepDeadline(fSwapLock, &fSwapShownID, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
@@ -2295,6 +2330,7 @@ IOMobileFramebuffer::presenter(void)
 	nanoseconds_to_absolutetime(SETTLE_MS * NSEC_PER_MSEC, &settleTime);
 
 	for (;;) {
+		PRESENTER_PHASE(1);     /* waiting for a swap */
 		IOLockLock(fSwapLock);
 		while (fSwapsWaiting == 0) {
 			uint64_t deadline;
@@ -2354,6 +2390,7 @@ IOMobileFramebuffer::presenter(void)
 		bzero(&fSwapEvents[fSwapFirst], sizeof(events));
 		IOLockUnlock(fSwapLock);
 		/* the GPU's own word that it has drawn the frame, before the surfaces' guess (MiniIOSurfaceDrawn, in show) */
+		PRESENTER_PHASE(2);     /* the swap's GPU fences */
 		if (!swapEventsWait(&events, SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: its GPU fences not reached after %u ms; shown as it is\n",
 			    swapWord(swap, SWAP_ID), SWAP_GPU_MS);
@@ -2366,7 +2403,9 @@ IOMobileFramebuffer::presenter(void)
 			for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 				shownDrawn[layer] = surfaces[layer] != NULL ? surfaces[layer]->drawn : 0;
 			}
+			PRESENTER_PHASE(3);     /* show(): surfaces drawn, the beat, the panel */
 			show(swap, surfaces);
+			PRESENTER_PHASE(4);     /* after show() */
 			lastFrame = mach_absolute_time();
 			swapEventsGlass(&events);
 		}
@@ -2469,6 +2508,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	bool report;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		PRESENTER_PHASE(31);    /* show: the surfaces drawn (MiniIOSurfaceDrawn) */
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
@@ -2497,6 +2537,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			} else {
 				next += (aim - (next - began)) / 8;
 			}
+			PRESENTER_PHASE(32);    /* show: on the beat */
 			clock_delay_until(next);
 			fBeat = next;
 			fStatOnBeat++;
@@ -2551,11 +2592,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			MiniIOSurface * held = MiniIOSurfaceCopy(swapWord(swap, SWAP_SURFACE(0)));
 
 			MiniIOSurfaceDisplayUse(held, 1);
+			PRESENTER_PHASE(33);    /* show: zero-copy scan-out */
 			hakios_display_ops->scanout(gZCBase[s->scanoutSlot], s->info.bytesPerRow);
 			if (gSwapWaitOn == 2) {
 				swapShown(swapWord(swap, SWAP_ID));     /* (fb_swapwait=2: SwapWait answered once the switch is set up) */
 			}
 			/* the one shown before is let go of once the panel has left it (its next refresh), not before */
+			PRESENTER_PHASE(34);    /* show: waiting for the panel to read the slot */
 			zcWaitScanned(gZCBase[s->scanoutSlot]);
 			if (fRecBase != NULL) {
 				record(s);              /* (rec=N: as the panel begins to read it -- an unfinished frame is caught so) */
@@ -2643,6 +2686,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	flipTo(fBase);
 	if (gZC && gZCShown != 0) {
 		/* (a copied frame: the framebuffer's own buffer back on the panel; the surface held for the last let go of) */
+		PRESENTER_PHASE(35);    /* show: the composed frame to the panel */
 		hakios_display_ops->scanout(gZCPhys[0], fRowBytes);
 		zcWaitScanned(gZCPhys[0]);
 		zcShown(0);
