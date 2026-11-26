@@ -187,17 +187,25 @@ struct apple80211_scan_result {
 	uint8_t mrsno, mlo, emlsr, unused_5;
 };
 
-/* ASSOCIATE (20): 592 bytes; of what follows the key (the RSN element wifid built, flags) nothing is used */
+/*
+ * ASSOCIATE (20): 656 bytes (Darwin userland 27, _performAssociation; 16.5 had 592, with the
+ * authentication in two halfwords and so everything after it 4 bytes earlier). Of what follows
+ * the key nothing is used (11-26): the RSN element wifid built (a halfword of length at 0xd0, the
+ * element at 0xd2), flags, the PMK the framework made of a passphrase (its length at 0x1d8, the
+ * key at 0x1dc), a private MAC address (0x1fc), access points not to join (count 0x202, from
+ * 0x203), the colocated network's scope (0x240), RSSI limits and 6 GHz and EMLSR settings.
+ */
 struct apple80211_assoc {
 	uint32_t version;
-	uint16_t mode, auth_lower, auth_upper, unused_0;
+	uint16_t mode, unused_0;
+	uint32_t auth_lower, auth_upper;
 	uint32_t ssid_length;
 	uint8_t ssid[32];
 	uint8_t bssid[6], unused_1[2];
 	uint32_t key_version, key_length, key_cipher;   /* cipher 10: a passphrase as typed; 6: the key (from 64 hex digits) */
 	uint16_t key_flags, key_index;
 	uint8_t key[64];
-	uint8_t rest[0x250 - 0x88];
+	uint8_t rest[0x290 - 0x8c];
 };
 
 #define CIPHER_PMK              6
@@ -214,8 +222,10 @@ struct apple80211_link_changed {
 	uint8_t unused_3[4];
 };
 
-_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
-    "the association request as Darwin userland 16.5 has it");
+_Static_assert(sizeof(struct apple80211_assoc) == 656 && offsetof(struct apple80211_assoc, auth_lower) == 0x8 &&
+    offsetof(struct apple80211_assoc, ssid_length) == 0x10 && offsetof(struct apple80211_assoc, bssid) == 0x34 &&
+    offsetof(struct apple80211_assoc, key_length) == 0x40 && offsetof(struct apple80211_assoc, key_cipher) == 0x44 &&
+    offsetof(struct apple80211_assoc, key) == 0x4c, "the association request as Darwin userland 27 has it");
 _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
     "the link event as Darwin userland 16.5 reads it");
 _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as Darwin userland 16.5 has it");
@@ -274,14 +284,65 @@ channel_fill(struct apple80211_channel *channel, unsigned frequency, unsigned fl
 	    0 : CHANNEL_ACTIVE) | (flags & HAKIOS_STA_CHANNEL_RADAR ? CHANNEL_DFS : 0);
 }
 
+/* ---- the caller's buffer ------------------------------------------------------------------------------ */
+
+/*
+ * (11-26) A request comes two ways: as an ioctl, its buffer in the caller's memory, or through the
+ * user client (iokit/Kernel/hakios.wlan.cpp, IO80211APIUserClient), which has copied the buffer
+ * into the kernel already. Every request is handled inside one of these, the struct apple80211req
+ * first, so that what reads and writes the buffer can tell which it is from the request alone.
+ */
+struct call {
+	struct apple80211req req;
+	uint8_t *kernel_buffer;                 /* NULL: req_data is the caller's memory */
+	size_t capacity;                        /* the kernel buffer's size */
+};
+_Static_assert(offsetof(struct call, req) == 0, "a request is the start of its call");
+
+static bool
+has_buffer(const struct apple80211req *request)
+{
+	return request->req_data != USER_ADDR_NULL;
+}
+
+/* `length` bytes of the buffer from `offset` */
+static int
+req_read(const struct apple80211req *request, size_t offset, void *to, size_t length)
+{
+	const struct call *call = (const struct call *)request;
+
+	if (call->kernel_buffer == NULL) {
+		return copyin(request->req_data + offset, to, length);
+	}
+	if (offset > call->capacity || length > call->capacity - offset) {
+		return EINVAL;
+	}
+	memcpy(to, call->kernel_buffer + offset, length);
+	return 0;
+}
+
+static int
+req_write(const struct apple80211req *request, const void *from, size_t length)
+{
+	const struct call *call = (const struct call *)request;
+
+	if (call->kernel_buffer == NULL) {
+		return copyout(from, request->req_data, length);
+	}
+	if (length > call->capacity) {
+		return EINVAL;
+	}
+	memcpy(call->kernel_buffer, from, length);
+	return 0;
+}
+
 /* ---- what the caller is given back ------------------------------------------------------------------- */
 
 /* At most as many bytes as it has room for. */
 static int
 give(const struct apple80211req *request, const void *data, size_t length)
 {
-	return request->req_data == USER_ADDR_NULL ? 0 : copyout(data, request->req_data, length < request->req_len ? length :
-	       request->req_len);
+	return !has_buffer(request) ? 0 : req_write(request, data, length < request->req_len ? length : request->req_len);
 }
 
 /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
@@ -300,11 +361,11 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 	if (request->req_len < sizeof(*result)) {
 		room = request->req_len > offsetof(struct apple80211_scan_result, elements) ? request->req_len -
 		    (unsigned)offsetof(struct apple80211_scan_result, elements) : 0;
-	} else if (request->req_data != USER_ADDR_NULL) {
-		(void)copyin(request->req_data + offsetof(struct apple80211_scan_result, uuid), uuid, sizeof(uuid));
+	} else if (has_buffer(request)) {
+		(void)req_read(request, offsetof(struct apple80211_scan_result, uuid), uuid, sizeof(uuid));
 	}
-	if (request->req_len >= offsetof(struct apple80211_scan_result, elements) && request->req_data != USER_ADDR_NULL &&
-	    copyin(request->req_data, result, offsetof(struct apple80211_scan_result, elements)) == 0 && result->elements_length < room) {
+	if (request->req_len >= offsetof(struct apple80211_scan_result, elements) && has_buffer(request) &&
+	    req_read(request, 0, result, offsetof(struct apple80211_scan_result, elements)) == 0 && result->elements_length < room) {
 		room = result->elements_length;
 	}
 	bzero(result, sizeof(*result));
@@ -498,10 +559,17 @@ get(struct apple80211req *request)
 	}
 	hakios_sta_state(state);
 	switch (request->req_type) {
-	case 13:                                /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
-		request->req_val = state->phase == HAKIOS_STA_JOINED ? 4 : state->phase == HAKIOS_STA_JOINING ? 2 :
-		    state->phase == HAKIOS_STA_SCANNING ? 1 : 0;
+	case 13: {                              /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
+		/* (11-26: Darwin userland 27 reads it from 8 bytes, a version and the state; the value is kept as well) */
+		struct {
+			uint32_t version, state;
+		} answer = { .version = 1, .state = state->phase == HAKIOS_STA_JOINED ? 4 : state->phase == HAKIOS_STA_JOINING ? 2 :
+			     state->phase == HAKIOS_STA_SCANNING ? 1 : 0 };
+
+		request->req_val = (int32_t)answer.state;
+		error = give(request, &answer, sizeof(answer));
 		break;
+	}
 	case 1:                                 /* its name; the length goes back in the request */
 		if (state->phase != HAKIOS_STA_JOINED) {
 			error = ENXIO;
@@ -574,7 +642,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
-	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, request->req_len)) != 0) {
+	if (asked == NULL || what == NULL || (error = req_read(request, 0, asked, request->req_len)) != 0) {
 		error = asked == NULL || what == NULL ? ENOMEM : error;
 		goto out;
 	}
@@ -622,12 +690,12 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 	struct hakios_sta_join *what;
 	int error;
 
-	if (request->req_len < offsetof(struct apple80211_assoc, rest)) {
+	if (request->req_len != sizeof(*asked)) {     /* (16.5's 592 bytes put the fields elsewhere) */
 		return EINVAL;
 	}
 	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
-	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
+	if (asked == NULL || what == NULL || (error = req_read(request, 0, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
 		error = asked == NULL || what == NULL ? ENOMEM : error;
 		goto out;
 	}
@@ -685,7 +753,7 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 		} asked;
 		int error;
 
-		if (request->req_len < sizeof(asked) || (error = copyin(request->req_data, &asked, sizeof(asked))) != 0) {
+		if (request->req_len < sizeof(asked) || (error = req_read(request, 0, &asked, sizeof(asked))) != 0) {
 			return request->req_len < sizeof(asked) ? EINVAL : error;
 		}
 		snprintf(said, said_size, " (power: %s)", asked.state[0] ? "on" : "off");
@@ -813,31 +881,68 @@ hakios_apple80211_summary(void)
 	}
 }
 
-/* An Apple80211 request for the radio's interface, from the process that is running now. */
-errno_t
-hakios_apple80211_ioctl(u_long command, void *data)
+/* One request, either way it came; the request log says which. */
+static int
+answer(struct call *call, bool is_set, const char *how)
 {
 	static unsigned said;
-	struct apple80211req *request = data;
+	struct apple80211req *request = &call->req;
 	char who[32] = "?", what[200] = "";
-	bool is_set = command == SIOCSA80211;
 	int error;
 
-	if (command != SIOCSA80211 && command != SIOCGA80211) {
-		return EOPNOTSUPP;
-	}
 	proc_selfname(who, sizeof(who));
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
 	note(request, is_set, error);
 	/* (a request that is repeated for ever is said a few hundred times) */
 	if (said < 800) {
 		said++;
-		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
-		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
+		printf("apple80211: %s %s %d (%s)%s, value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+		    type_name(request->req_type), how, request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
 		    EOPNOTSUPP ? "REFUSED\n" : "");
 		if (error != 0 && error != EOPNOTSUPP) {
 			printf("error %d\n", error);
 		}
 	}
+	return error;
+}
+
+/* An Apple80211 request for the radio's interface, from the process that is running now. */
+errno_t
+hakios_apple80211_ioctl(u_long command, void *data)
+{
+	struct call call = { .req = *(struct apple80211req *)data };
+	int error;
+
+	if (command != SIOCSA80211 && command != SIOCGA80211) {
+		return EOPNOTSUPP;
+	}
+	error = answer(&call, command == SIOCSA80211, "");
+	*(struct apple80211req *)data = call.req;       /* (req_val and req_len go back) */
+	return error;
+}
+
+/*
+ * (11-26) The same through IO80211.framework's user client (iokit/Kernel/hakios.wlan.cpp): `req`
+ * is the request's struct apple80211req (40 bytes) with req_len set by the user client (what a get
+ * has room for, what a set carries), and its buffer is in the kernel already, `capacity` bytes of
+ * it; NULL for a request without one. req_val and req_len come back in `req`.
+ */
+int hakios_apple80211_request_kernel(bool is_set, void *req, void *buffer, size_t capacity);
+
+int
+hakios_apple80211_request_kernel(bool is_set, void *req, void *buffer, size_t capacity)
+{
+	struct call call = { .req = *(struct apple80211req *)req, .kernel_buffer = buffer, .capacity = capacity };
+	int error;
+
+	_Static_assert(sizeof(struct apple80211req) == 40, "the request as IO80211.framework has it");
+	if (buffer == NULL) {
+		call.req.req_data = USER_ADDR_NULL;
+		call.req.req_len = 0;
+	} else {
+		call.req.req_data = (user_addr_t)(uintptr_t)buffer;     /* (not followed: req_read and req_write use the buffer) */
+	}
+	error = answer(&call, is_set, " (by the user client)");
+	*(struct apple80211req *)req = call.req;
 	return error;
 }
