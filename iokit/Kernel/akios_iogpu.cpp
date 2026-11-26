@@ -510,6 +510,25 @@ class IOGPUDeviceUserClient : public IOUserClient
 	struct surfaceMap fSurfaceMaps[kMaxSurfaceMaps];
 	struct surfaceMap *surfaceMapFor(MiniIOSurface *surface, uint64_t size, IOReturn *ret);
 	void sweepSurfaceMaps(bool all);
+	/* (fLock held) whether a client-memory resource other than r, live or deleted but not yet freed, covers the page */
+	bool
+	clientPageCovered(struct resource *r, uint64_t page)
+	{
+		for (uint32_t i = 0; i < fResourceCount; i++) {
+			struct resource *o = fResources[i];
+
+			if (o != NULL && o != r && o->kind == 0x80u /* kIOGPUResourceClient */ && page >= o->gpuBase &&
+			    page < o->gpuBase + o->gpuLength) {
+				return true;
+			}
+		}
+		for (struct resource *o = fDeferred; o != NULL; o = o->nextDeferred) {
+			if (o != r && o->kind == 0x80u /* kIOGPUResourceClient */ && page >= o->gpuBase && page < o->gpuBase + o->gpuLength) {
+				return true;
+			}
+		}
+		return false;
+	}
 	uint64_t fSubmissions;          /* this client's submissions so far (numbers 1, 2, ...; under the submission lock) */
 	void freeDeferred(bool all);
 	struct resource **fResources;
@@ -1072,7 +1091,29 @@ IOGPUDeviceUserClient::releaseResource(struct resource *r)
 		r->gpuLength = 0;
 	}
 	/* the GPU's view first (updated before this returns), then the memory */
-	if (r->gpuLength != 0 && fAS >= 0) {
+	if (r->gpuLength != 0 && fAS >= 0 && r->kind == kIOGPUResourceClient) {
+		/*
+		 * (11-26) the client's own pages sit at their own addresses, and QuartzCore makes buffers over overlapping
+		 * pieces of the same memory: the pages another of its buffers still covers stay mapped (unmapped with
+		 * everything, a live buffer's pages went with a dead one's and the GPU faulted on them)
+		 */
+		uint64_t run = 0, end = r->gpuBase + r->gpuLength;
+
+		for (uint64_t page = r->gpuBase; page <= end; page += PAGE_SIZE) {
+			bool keep = page < end && clientPageCovered(r, page);
+
+			if (page < end && !keep) {
+				if (run == 0) {
+					run = page;
+				}
+				continue;
+			}
+			if (run != 0) {
+				fGPU->unmapFromAddressSpace(fAS, run, page - run);
+				run = 0;
+			}
+		}
+	} else if (r->gpuLength != 0 && fAS >= 0) {
 		fGPU->unmapFromAddressSpace(fAS, r->gpuBase, r->gpuLength);
 	}
 	OSSafeReleaseNULL(r->map);
