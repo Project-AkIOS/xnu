@@ -57,6 +57,15 @@ static const struct {
 	{ "dqe.lmatrix", 0x194d0000, 0x1400, 0x1420 },
 	{ "dqe.regamma0", 0x194d0000, 0x2000, 0x2120 },
 	{ "dqe.cgc", 0x194f0000, 0x000, 0x010 },
+	/* (11-27) the writeback (CWB): DECON0's DATA_PATH_CON_1 (the CWB's out-FIFO and WB interface), the writeback DMA
+	 * "ODMA" (Android's drmdpp@19908000 "dma": WDMA_* control, size, base, stride; its security at 0x200) and its DPP
+	 * ("dpp" 0x19938000) -- regs-dpp.h names */
+	{ "decon0.path1", 0x19470000, 0x204, 0x210 },
+	{ "odma.dma", 0x19908000, 0x000, 0x070 },
+	{ "odma.sec", 0x19908000, 0x200, 0x210 },
+	{ "dpp0.sec", 0x19900000, 0x200, 0x210 },      /* (compare: the channel that scans our picture out) */
+	{ "odma.err", 0x19908000, 0x730, 0x750 },
+	{ "odma.dpp", 0x19938000, 0x000, 0x0c0 },
 	/* not the SysMMU in front of DPUF0 (0x19840000): reading it restarts the phone (secure, or closed to the kernel); DPP0
 	 * reads physical addresses as the bootloader left it (RDMA_BASEADDR_P0 = 0xfac00000), so it is bypassed */
 };

@@ -244,6 +244,7 @@ screen_send(struct mux_conn *c, const void *data, uint32_t n)
  * Port 9 (11-26): the surface in layer 0 of the newest swap, as port 6's PPM -- what CoreAnimation last handed the
  * display, to compare with what the panel shows.
  */
+extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
 extern int akios_fb_newest_surface(const uint8_t **pixels, uint32_t *sid, uint32_t *width, uint32_t *height,
     uint32_t *row_bytes, void **token);
 extern void akios_fb_surface_done(void *token);
@@ -263,6 +264,11 @@ surface_thread(void *parameter, __unused wait_result_t result)
 	} else {
 		uint64_t bytes = (uint64_t)w * h * 3;
 		uint8_t *copy = kalloc_data(bytes, Z_WAITOK);
+
+		/* (11-27) the GPU wrote the surface behind the processor's cache: lines still held from earlier frames came
+		 * out as blots in the picture (black circles in "hello", never on the panel) -- written back and dropped
+		 * first, the copy reads memory */
+		flush_dcache((vm_offset_t)pixels, (unsigned)((uint64_t)h * rb), FALSE);
 
 		if (copy != NULL) {
 			uint8_t *to = copy;
@@ -322,6 +328,11 @@ screen_thread(void *parameter, __unused wait_result_t result)
 		 * picture -- since the buffer the DMA reads is drawn into again a few frames later */
 		uint64_t bytes = (uint64_t)w * h * 3;
 		uint8_t *copy = kalloc_data(bytes, Z_WAITOK);
+
+		/* (11-27) the GPU wrote the surface behind the processor's cache: lines still held from earlier frames came
+		 * out as blots in the picture (black circles in "hello", never on the panel) -- written back and dropped
+		 * first, the copy reads memory */
+		flush_dcache((vm_offset_t)pixels, (unsigned)((uint64_t)h * rb), FALSE);
 		uint8_t *to = copy;
 
 		n = (uint32_t)snprintf(chunk, sizeof(chunk), "P6\n# base %#llx stride %u size %ux%u\n%u %u\n255\n", phys, rb, w, h,
