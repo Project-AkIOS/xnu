@@ -225,3 +225,41 @@ hakios_rtc_before_power_off(void)
 	printf("akita rtc: before power off: SMPL %#x -> %#x, WTSR %#x -> %#x%s\n", smpl, smpl_after, wtsr, wtsr_after,
 	    read && cleared ? "" : " (an ACPM request failed)");
 }
+
+/*
+ * kern.monotonicclock_usecs: the platform's monotonic clock, as an iPhone's platform driver gives it -- microseconds
+ * that keep counting while the system sleeps, latched together with mach_absolute_time() ({usec, mach_time}: struct
+ * latched_time of osfmk/kern/clock.c, which reads it for the calendar's sleep and wake). PowerlogCore's time reference
+ * (PLTimeReferenceKernel, every 30 s) reads it: without it its sysctl() failed (EISDIR, its name not found) and its
+ * clock went unanchored (11-27). The phone has no system sleep, so the continuous clock is that monotonic clock.
+ */
+#include <sys/sysctl.h>
+#include <mach/mach_time.h>
+
+static int
+monotonic_clock_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	struct {
+		uint64_t monotonic_time_usec;
+		uint64_t mach_time;
+	} latched;
+	uint64_t abs, cont, nsec;
+
+	if (req->newptr != USER_ADDR_NULL) {
+		return EPERM;
+	}
+	/* the pair from one reading: continuous = absolute + the time asleep, which only changes across a sleep */
+	abs = mach_absolute_time();
+	cont = abs + mach_absolutetime_asleep;
+	absolutetime_to_nanoseconds(cont, &nsec);
+	latched.monotonic_time_usec = nsec / NSEC_PER_USEC;
+	latched.mach_time = abs;
+	/* the kernel's clock.c asks for the pair, user space (PowerlogCore: 8 bytes, else ENOMEM) for the microseconds */
+	if (req->oldptr != USER_ADDR_NULL && req->oldlen < sizeof(latched)) {
+		return SYSCTL_OUT(req, &latched.monotonic_time_usec, sizeof(latched.monotonic_time_usec));
+	}
+	return SYSCTL_OUT(req, &latched, sizeof(latched));
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, monotonicclock_usecs, CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    monotonic_clock_sysctl, "S,latched_time", "the monotonic clock (usec, counting through sleep) and mach_absolute_time");

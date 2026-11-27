@@ -95,6 +95,7 @@ iokit/Kernel/IOHIDFamily/IOHIDEventServiceQueue.cpp		optional iokitcpp
 iokit/Kernel/IOHIDFamily/IOHIDEventServiceUserClient.cpp	optional iokitcpp
 iokit/Kernel/IOHIDFamily/AppleEmbeddedHIDEventService.cpp	optional iokitcpp
 iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
+iokit/Kernel/AppleSMC.cpp			optional iokitcpp
 # HakiOS drivers: made by tools/hakios-config.py kernel from drivers/*/conf. Edit those, not these lines.
 iokit/Kernel/hakios.stubs.cpp            optional iokitcpp
 iokit/Kernel/hakios.haptics_ready.cpp    optional iokitcpp

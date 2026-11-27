@@ -331,12 +331,12 @@ GenericARMPE::start(IOService * provider)
 	/*
 	 * (11-26) /arm-io's children: on an iPhone AppleARMIO publishes each one as a nub (AppleARMIODevice) that its driver
 	 * matches by name. Here, so far, only those a driver of this kernel matches and that are wanted as services: "bluetooth"
-	 * (AppleBluetoothModule; bluetoothd looks it up by name). Each is a device-tree nub as the top-level ones are, attached
+	 * (AppleBluetoothModule; bluetoothd looks it up by name) and (11-27) "smc/iop-smc-nub" (AppleSMC, which libSMC opens). Each is a device-tree nub as the top-level ones are, attached
 	 * to this platform expert (an IOPlatformDevice asks its provider to compare names: it has to be the expert, not the
 	 * arm-io nub); in the device tree it stays where it is, IODeviceTree:/arm-io/bluetooth.
 	 */
 	{
-		static const char * const armio[] = { "/arm-io/bluetooth" };
+		static const char * const armio[] = { "/arm-io/bluetooth", "/arm-io/smc/iop-smc-nub" };
 
 		for (unsigned int i = 0; i < sizeof(armio) / sizeof(armio[0]); i++) {
 			IORegistryEntry * entry = IORegistryEntry::fromPath(armio[i], gIODTPlane);

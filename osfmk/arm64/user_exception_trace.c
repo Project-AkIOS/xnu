@@ -156,8 +156,10 @@ user_abort_trace(void)
 		char line[24 * 20 + 160];
 		size_t len;
 
-		len = (size_t)snprintf(line, sizeof(line), "userabort: %s[%d] aborts, shared cache slide 0x%x; called from:",
-		    proc ? proc_name_address(proc) : "?", proc ? proc_pid(proc) : -1, slide);
+		/* (11-27) and where the program itself was loaded, so its own frames can be read in its binary */
+		len = (size_t)snprintf(line, sizeof(line), "userabort: %s[%d] aborts, shared cache slide 0x%x, image 0x%llx; called from:",
+		    proc ? proc_name_address(proc) : "?", proc ? proc_pid(proc) : -1, slide,
+		    (unsigned long long)task->mach_header_vm_address);
 		fp = (uint64_t)get_saved_state_fp(state);
 		for (int depth = 0; depth < 24 && plausible_user_address(fp) && (fp & 7) == 0 && len < sizeof(line) - 24; depth++) {
 			if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {

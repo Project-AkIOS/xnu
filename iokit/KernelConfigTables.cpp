@@ -86,6 +86,17 @@ const char * gIOKernelConfigTables =
     "   }"
 #endif
 /*
+ * AkIOS (11-27): the SMC as an iPhone has it (iokit/Kernel/AppleSMC.cpp): AppleSMC on the device tree's
+ * /arm-io/smc/iop-smc-nub (the nub GenericARMPE publishes; Apple's provider is the RTBuddy nub of the SMC coprocessor),
+ * with Apple's user client, which libSMC opens.
+ */
+    "   ,{"
+    "     'IOClass'           = AppleSMC;"
+    "     'IOProviderClass'   = IOPlatformDevice;"
+    "     'IONameMatch'       = iop-smc-nub;"
+    "     'IOUserClientClass' = AppleSMCClient;"
+    "   }"
+/*
  * AkIOS (11-22): the rest of IOStorageFamily's personalities are NOT registered yet,
  * so nothing matches IOMedia / IOBlockStorageDevice (MiniIOMedia's descriptive objects stay driverless). Draft from the
  * family's Info.plist (337.100.1, iOS side: no IOAppleLabelScheme). Before enabling IOMediaBSDClient, keep it off
