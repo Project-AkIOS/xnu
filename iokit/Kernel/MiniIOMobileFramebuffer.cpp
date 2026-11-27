@@ -269,7 +269,9 @@ swapEventsDone(struct swap_events * ev)
 }
 
 #define kFBNotifyVSync          5
-#define kFBNotifyTypes          8
+/* (11-27) notification types (IOMobileFramebufferEnable*Notifications): 0 hot plug, 1 power, 3 frame info, 4 CRC,
+ * 5 vsync, 6 need swap, 9 DCP reset request, 11 genlock error -- 8 refused backboardd's type 9 */
+#define kFBNotifyTypes          16
 #define kFBRefreshHz            60                      /* unless boot-arg fb_hz says otherwise */
 
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
@@ -2404,7 +2406,16 @@ IOMobileFramebuffer::present(const uint8_t * swap, struct swap_events * events)
 	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz() * 5 / 4, &period);
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
-	gNewestSwapSurface = swapWord(swap, SWAP_SURFACE(0));
+	/* (11-27) the surface the panel will show: the first enabled layer that has one (not always layer 0 in iOS 27's
+	 * swaps: fb_test saw 0 after 241 swaps); a swap that hands over no surface keeps the last */
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+
+		if (sid != 0 && swapWord(swap, SWAP_ENABLED(layer)) != 0) {
+			gNewestSwapSurface = sid;
+			break;
+		}
+	}
 	if (gTouchLat) {
 		hakios_tl("tl: s %u at %llu surface %u layers %#x\n", swapWord(swap, SWAP_ID), micros(now),
 		    swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_LAYERS_SET));
@@ -3633,6 +3644,14 @@ IOMobileFramebufferUserClient::dispatchMethod(uint32_t selector, IOExternalMetho
 
 			memcpy((uint8_t *) args->structureOutput + 4, ids, sizeof(ids));
 		}
+		return kIOReturnSuccess;
+
+	case kFBMethodGetProtectionOptions:             /* out: content protection the panel offers (HDCP and kin): none */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = 0;
+		args->scalarOutputCount = 1;
 		return kIOReturnSuccess;
 
 	case kFBMethodGetCurrentAbsoluteTime:
