@@ -2166,9 +2166,19 @@ again:
 			 * debugging a lot.
 			 */
 			kn->kn_sfflags &= ~NOTE_WL_UPDATES_MASK;
-			kn->kn_sfflags |= kev->fflags;
-			if (kev->fflags & NOTE_WL_SYNC_WAKE) {
-				needs_wake = (kn->kn_thread != THREAD_NULL);
+			if (kev->fflags & NOTE_WL_DISCOVER_ONLY) {
+				/*
+				 * (AkIOS 11-27) iOS 27's discovery of a queue owner: ownership moves (phase 2), the knote
+				 * is not woken. A waiter's knote keeps waiting; any other keeps what it was. Without this the
+				 * owner, waiting on this workloop itself, was woken early, left dispatch_sync while its
+				 * waiter was still linked, and the next drainer spun on the stale link (locationd).
+				 */
+				kn->kn_sfflags |= kev->fflags & NOTE_WL_UPDATES_MASK;
+			} else {
+				kn->kn_sfflags |= kev->fflags;
+				if (kev->fflags & NOTE_WL_SYNC_WAKE) {
+					needs_wake = (kn->kn_thread != THREAD_NULL);
+				}
 			}
 		} else if (op == FILT_WLDROP) {
 			if ((kn->kn_sfflags & (NOTE_WL_SYNC_WAIT | NOTE_WL_SYNC_WAKE)) ==
@@ -2740,6 +2750,10 @@ out:
 		kev->flags |= EV_ERROR;
 		kev->data = error;
 		return result;
+	}
+	if (command == NOTE_WL_SYNC_WAIT && (kn->kn_sfflags & NOTE_WL_DISCOVER_ONLY)) {
+		/* (AkIOS 11-27) a knote made by a discovery only (NOTE_WL_DISCOVER_ONLY) is no early wake: wait */
+		kn->kn_sfflags &= ~(NOTE_WL_SYNC_WAKE | NOTE_WL_DISCOVER_ONLY);
 	}
 	if (command == NOTE_WL_SYNC_WAIT && !(kn->kn_sfflags & NOTE_WL_SYNC_WAKE)) {
 		return kevent_register_wait_prepare(kn, kev, result);

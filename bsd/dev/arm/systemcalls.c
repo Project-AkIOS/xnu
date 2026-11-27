@@ -34,6 +34,7 @@
 
 #if CONFIG_MACF
 #include <security/mac_framework.h>
+#include <sys/event_private.h>
 #endif
 
 /*
@@ -75,7 +76,7 @@ systrace_report(struct proc *proc, unsigned short syscode, struct uthread *uthre
 	 * number: the same call goes to Sandbox as well. And sysctl carries its MIB, which is the only
 	 * thing that says what was asked about.
 	 */
-	char detail[112] = "";
+	char detail[256] = "";
 	size_t done;
 
 	if (systrace_level < 2 && (error == 0 || error == EJUSTRETURN || error == ERESTART)) {
@@ -102,6 +103,20 @@ systrace_report(struct proc *proc, unsigned short syscode, struct uthread *uthre
 		policy[sizeof(policy) - 1] = 0;
 		snprintf(detail, sizeof(detail), " policy \"%s\" request %lld", policy,
 		    (long long)uthread->uu_arg[1]);
+	} else if (syscode == SYS_kevent_id) {
+		/* (11-27) a workloop's request and what came back: the first change and the first event, and the flags */
+		struct kevent_qos_s ch = { 0 }, ev = { 0 };
+
+		if ((int)uthread->uu_arg[2] > 0) {
+			(void)copyin((user_addr_t)uthread->uu_arg[1], &ch, sizeof(ch));
+		}
+		if ((int)uthread->uu_arg[4] > 0) {
+			(void)copyin((user_addr_t)uthread->uu_arg[3], &ev, sizeof(ev));
+		}
+		snprintf(detail, sizeof(detail), " fl 0x%x ch{id 0x%llx f %d fl 0x%x ff 0x%x d 0x%llx e0 0x%llx e1 0x%llx}"
+		    " ev{id 0x%llx f %d fl 0x%x ff 0x%x d 0x%llx}", (unsigned)uthread->uu_arg[7],
+		    ch.ident, ch.filter, ch.flags, ch.fflags, ch.data, ch.ext[0], ch.ext[1],
+		    ev.ident, ev.filter, ev.flags, ev.fflags, ev.data);
 	} else if (syscode == SYS_sysctl) {
 		int mib[6];
 		unsigned count = (unsigned)uthread->uu_arg[1];
@@ -118,8 +133,8 @@ systrace_report(struct proc *proc, unsigned short syscode, struct uthread *uthre
 		}
 	}
 	detail[sizeof(detail) - 1] = 0;
-	printf("systrace: %s[%d] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx)%s%s%s%s = %d\n",
-	    proc->p_comm, proc_getpid(proc), syscallnames[syscode],
+	printf("systrace: %s[%d] tid 0x%llx %s(0x%llx, 0x%llx, 0x%llx, 0x%llx)%s%s%s%s = %d\n",
+	    proc->p_comm, proc_getpid(proc), thread_tid(current_thread()), syscallnames[syscode],
 	    (unsigned long long)uthread->uu_arg[0], (unsigned long long)uthread->uu_arg[1],
 	    (unsigned long long)uthread->uu_arg[2], (unsigned long long)uthread->uu_arg[3],
 	    path[0] ? " \"" : "", path, path[0] ? "\"" : "", detail, error);
@@ -314,6 +329,16 @@ unix_syscall(
 #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
 
 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+	if (__improbable(systrace_level >= 2 && syscode == SYS_kevent_id && (int)uthread->uu_arg[2] > 0 &&
+	    (systrace_name[0] == 0 || strncmp(proc->p_comm, systrace_name, MAXCOMLEN) == 0))) {
+		/* (11-27) a workloop request as asked (the reply overwrites it: the same buffer comes back) */
+		struct kevent_qos_s ch = { 0 };
+
+		(void)copyin((user_addr_t)uthread->uu_arg[1], &ch, sizeof(ch));
+		printf("systrace: %s[%d] tid 0x%llx kevent_id asks 0x%llx fl 0x%x: id 0x%llx fl 0x%x ff 0x%x ext %llx %llx %llx %llx\n",
+		    proc->p_comm, proc_getpid(proc), thread_tid(current_thread()), uthread->uu_arg[0], (unsigned)uthread->uu_arg[7],
+		    ch.ident, ch.flags, ch.fflags, ch.ext[0], ch.ext[1], ch.ext[2], ch.ext[3]);
+	}
 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
 

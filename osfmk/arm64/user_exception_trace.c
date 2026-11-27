@@ -227,6 +227,8 @@ extern lck_mtx_t tasks_threads_lock;
 
 static char ustacks_name[32];
 static uint32_t ustacks_every;
+static TUNABLE(uint32_t, ustacks_regs, "ustacks_regs", 0);    /* (11-27) also registers and a TSD slot */
+static TUNABLE(uint32_t, ustacks_tsd, "ustacks_tsd", 0x7a);
 static uint32_t ustacks_threads = USTACKS_MAX_THREADS;  /* boot-arg ustacks_threads=N: only the first N (1: the main thread) */
 /*
  * Boot-arg ustacks_tname=TEXT: only the threads whose name has TEXT in it (ustacks_tname=coreanimation:
@@ -254,11 +256,11 @@ static void
 ustacks_task(task_t task, struct proc *proc)
 {
 	static struct {
-		uint64_t tid, pc, lr, fp;
+		uint64_t tid, pc, lr, fp, x[3], tsd;
 		int state;
 		char name[64];          /* (bsd_getthreadname() copies MAXTHREADNAMESIZE, 64) */
 	} snap[USTACKS_MAX_THREADS];
-	char line[768];
+	char line[1600];
 	int at;
 	vm_shared_region_t region;
 	vm_map_t map;
@@ -292,6 +294,10 @@ ustacks_task(task_t task, struct proc *proc)
 		snap[count].pc = get_saved_state_pc(state);
 		snap[count].lr = get_saved_state_lr(state);
 		snap[count].fp = get_saved_state_fp(state);
+		for (int r = 0; r < 3; r++) {
+			snap[count].x[r] = get_saved_state_reg(state, r);
+		}
+		snap[count].tsd = thread->machine.cthread_self;
 		count++;
 	}
 	map = task->map;
@@ -330,6 +336,54 @@ ustacks_task(task_t task, struct proc *proc)
 		at = snprintf(line, sizeof(line), "ustacks:  thread 0x%llx%s%s%s%s: 0x%llx 0x%llx", (unsigned long long)snap[i].tid,
 		    snap[i].name[0] ? " \"" : "", snap[i].name, snap[i].name[0] ? "\"" : "",
 		    (snap[i].state & TH_RUN) ? " (running)" : "", (unsigned long long)snap[i].pc, (unsigned long long)snap[i].lr);
+		if (ustacks_regs) {
+			/* (11-27) x0-x2 (a system call's first arguments) and a TSD slot (ustacks_tsd=N, libdispatch's enqueuer key 0x7a) */
+			uint64_t slot = 0;
+
+			if (snap[i].tsd != 0) {
+				(void)copyin((user_addr_t)(snap[i].tsd + 8 * ustacks_tsd), &slot, sizeof(slot));
+			}
+			at += snprintf(line + at, sizeof(line) - at, " [x0 0x%llx x1 0x%llx x2 0x%llx tsd[%u] 0x%llx]",
+			    (unsigned long long)snap[i].x[0], (unsigned long long)snap[i].x[1], (unsigned long long)snap[i].x[2],
+			    ustacks_tsd, (unsigned long long)slot);
+			/* (11-27) ustacks_regs=3: the kevent_qos_s at x1 (a kevent_id call's change list, while it waits) */
+			if (ustacks_regs >= 3 && plausible_user_address(snap[i].x[1]) && (snap[i].x[1] & 7) == 0) {
+				uint64_t k[9] = { 0 };   /* ident, filter|flags|qos, udata, fflags|xflags, data, ext[4] */
+
+				if (copyin((user_addr_t)snap[i].x[1], k, sizeof(k)) == 0) {
+					at += snprintf(line + at, sizeof(line) - at,
+					    " kev{id 0x%llx f %d fl 0x%x ff 0x%x d 0x%llx ext %llx %llx %llx %llx}",
+					    k[0], (int16_t)(k[1] & 0xffff), (unsigned)((k[1] >> 16) & 0xffff), (unsigned)(k[3] & 0xffffffff),
+					    k[4], k[5], k[6], k[7], k[8]);
+				}
+			}
+			/* the words just below the frame pointer (a callee's saved registers) and what each points to */
+			for (int w = 4; w >= 1; w--) {
+				uint64_t word = 0, target = 0;
+
+				if (copyin((user_addr_t)(snap[i].fp - 8 * w), &word, sizeof(word)) == 0) {
+					if (plausible_user_address(word) && (word & 7) == 0) {
+						(void)copyin((user_addr_t)word, &target, sizeof(target));
+					}
+					at += snprintf(line + at, sizeof(line) - at, " fp-%d 0x%llx->0x%llx", 8 * w,
+					    (unsigned long long)word, (unsigned long long)target);
+					/* (11-27, locationd's lost enqueue) ustacks_regs=2: eight words around each such pointer, and
+					 * around what it points to */
+					if (ustacks_regs >= 2 && plausible_user_address(word) && (word & 7) == 0) {
+						uint64_t around[8] = { 0 };
+
+						(void)copyin((user_addr_t)(word - 0x20), around, sizeof(around));
+						at += snprintf(line + at, sizeof(line) - at, " {%llx %llx %llx %llx|%llx %llx %llx %llx}",
+						    around[0], around[1], around[2], around[3], around[4], around[5], around[6], around[7]);
+						if (plausible_user_address(target) && (target & 7) == 0 &&
+						    copyin((user_addr_t)target, around, sizeof(around)) == 0) {
+							at += snprintf(line + at, sizeof(line) - at, " *{%llx %llx %llx %llx %llx %llx %llx %llx}",
+							    around[0], around[1], around[2], around[3], around[4], around[5], around[6], around[7]);
+						}
+					}
+				}
+			}
+		}
 		for (int depth = 0; depth < USTACKS_MAX_FRAMES && plausible_user_address(fp) && (fp & 7) == 0; depth++) {
 			if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
 				break;

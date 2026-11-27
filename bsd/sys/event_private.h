@@ -269,6 +269,14 @@ typedef uint64_t kqueue_id_t;
 #define NOTE_WL_END_OWNERSHIP    0x00000020
 #define NOTE_WL_DISCOVER_OWNER   0x00000080
 #define NOTE_WL_IGNORE_ESTALE    0x00000100
+/*
+ * AkIOS (11-27): 0x200, used by iOS 27's libdispatch (_dispatch_event_loop_wait_for_ownership, fflags 0x388) and not
+ * in xnu-12377: a SYNC_WAKE | DISCOVER_OWNER that names the owner of a queue under the workloop, a thread that may
+ * itself be in a SYNC_WAIT on the same workloop. It moves ownership (and priority) only: it must not wake that waiter,
+ * nor stand as an early wake for a SYNC_WAIT that comes later. Apple's name is not public; the meaning is read from
+ * libdispatch's use and from what goes wrong without it (kern_event.c, filt_wlupdate / filt_wltouch).
+ */
+#define NOTE_WL_DISCOVER_ONLY    0x00000200
 #define NOTE_WL_UPDATES_MASK     0x000001f0 /* Mask of all the [in] updates above */
 
 #define NOTE_WL_UPDATE_OWNER     0 /* ... compatibility define ... */
