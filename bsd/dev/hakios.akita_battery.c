@@ -71,6 +71,17 @@ write_reg(uint8_t addr, uint8_t reg, uint8_t value)
 #define CHG_CNFG_06             0xbf
 static volatile int32_t cc_wanted_ua;           /* 0 none */
 static int32_t cc_applied_ua;                   /* what is in the charger (0: its own) */
+/*
+ * THE INPUT CURRENT (11-27): what the charger may draw from the cable, CHG_CNFG_09 CHGIN_ILIM (bits 6:0: 0x04 + (uA -
+ * 125000) / 25000, 0x7f 3.2 A; bit 7 NO_AUTOIBUS), set from what the cable advertises (usb_current_ua: CC's 1.5
+ * or 3.0 A, at most 2 A; USB's 500 mA left to the chip), with the charger's input current loop (AICL) left on. Never set before: at the chip's own
+ * limit the phone drew more than the cable gave and drained ON the charger (-774 mA, 3.37 V, "charging", 11-27), sat
+ * at 1 % and browned out the USB link.
+ */
+#define CHG_CNFG_09             0xc2
+static uint32_t ilim_set_ua;                    /* what CHGIN_ILIM was last set to (0: never) */
+static void input_limit_apply(const struct hakios_battery_state *s);
+
 static int cc_own = -1;                         /* CHGCC before the first limit; -1 not read */
 static int charge_limit_ma;
 
@@ -154,6 +165,46 @@ gauge_word(uint8_t reg, int32_t *value, bool is_signed)
 	}
 	*value = is_signed ? (int32_t)(int16_t)(b[0] | b[1] << 8) : (int32_t)(b[0] | b[1] << 8);
 	return true;
+}
+
+static void
+input_limit_apply(const struct hakios_battery_state *s)
+{
+	uint32_t want = s->external && s->usb_current_ua >= 1500000 ? (uint32_t)s->usb_current_ua : 0;
+	uint8_t reg, prot, value;
+	static int enabled = -1;
+
+	if (enabled < 0) {
+		enabled = 1;
+		PE_parse_boot_argn("chg_ilim", &enabled, sizeof(enabled));     /* chg_ilim=0: leave CHGIN_ILIM alone */
+	}
+	if (!enabled) {
+		return;
+	}
+
+	if (want > 2000000) {
+		want = 2000000;
+	}
+	if (want == 0 || want == ilim_set_ua) {
+		if (!s->external) {
+			ilim_set_ua = 0;        /* (set again for the next cable) */
+		}
+		return;
+	}
+	if (!read_regs(CHARGER, CHG_CNFG_09, &reg, 1) || !read_regs(CHARGER, CHG_CNFG_06, &prot, 1)) {
+		return;
+	}
+	/* (11-27) AICL left on (bit 7, NO_AUTOIBUS, clear): asked for more than the port gave, with it off, VBUS sagged,
+	 * USB dropped and the nearly empty phone browned out within minutes; the charger backs off by itself with it on */
+	value = (uint8_t)(0x04 + (want - 125000) / 25000);
+	if (!write_reg(CHARGER, CHG_CNFG_06, (uint8_t)(prot | 0x0c)) || !write_reg(CHARGER, CHG_CNFG_09, value)) {
+		write_reg(CHARGER, CHG_CNFG_06, prot);
+		return;
+	}
+	write_reg(CHARGER, CHG_CNFG_06, prot);
+	ilim_set_ua = want;
+	printf("akita battery: input current %u mA, as the cable advertises (CHG_CNFG_09 %#x -> %#x)\n", want / 1000, reg,
+	    value);
 }
 
 static bool
@@ -332,6 +383,7 @@ akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			reads++;
 			hakios_battery_report(&s);
+			input_limit_apply(&s);
 			usb_repeater_check(s.external, was_external);
 			was_external = s.external;
 			if (say != 0 && tick % say == 0) {
@@ -343,6 +395,18 @@ akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
 				    (int)(((int64_t)avg * 3125) / 10000), s.voltage_uv / 1000, s.charge_uah,
 				    s.external ? "on a charger" : "not on a charger");
 			}
+			if (tick % 60 == 0) {           /* (11-27) the gauge's own state: did it lose power and its model? */
+				int32_t st = 0, mix = 0, av = 0, vf = 0;
+
+				(void)gauge_word(0x00, &st, false);
+				(void)gauge_word(0x0d, &mix, false);
+				(void)gauge_word(0x0e, &av, false);
+				(void)gauge_word(0xff, &vf, false);
+				printf("akita battery: gauge status %#x%s; SOC rep %d.%02d mix %d.%02d av %d.%02d vf %d.%02d %%\n", st,
+				    (st & 0x0002) ? " (POR: it was reset, its model is the default)" : "",
+				    s.percent_hundredths / 100, s.percent_hundredths % 100, mix / 256, (mix % 256) * 100 / 256,
+				    av / 256, (av % 256) * 100 / 256, vf / 256, (vf % 256) * 100 / 256);
+			}
 			if (tick % 60 == 0) {           /* every five minutes, and the first */
 				printf("akita battery: %d.%02d%%, %d mV, %d mA, %d.%d C, %s (CHG_DTLS %d), %d of %d mAh, "
 				    "%d cycles (%u reads, %u failed)\n", s.percent_hundredths / 100, s.percent_hundredths % 100,
@@ -353,6 +417,9 @@ akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 		} else {
 			failed++;
+			if (failed == 1 || failed % 100 == 0) {
+				printf("akita battery: the gauge or the charger did not answer (%u reads failed, %u read)\n", failed, reads);
+			}
 		}
 		charge_limit_apply();
 		delay_for_interval(5000, NSEC_PER_MSEC);

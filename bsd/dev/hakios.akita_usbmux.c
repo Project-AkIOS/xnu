@@ -541,7 +541,7 @@ static bool
 dmesg_send(struct mux_conn *c, struct msgbuf *mb, int from, int to, char *chunk)
 {
 	while (from != to && c->open) {
-		uint32_t n = 0, seq;
+		uint32_t n = 0;
 
 		while (from != to && n < MAX_DATA) {
 			if (mb->msg_bufc[from]) {
@@ -552,11 +552,9 @@ dmesg_send(struct mux_conn *c, struct msgbuf *mb, int from, int to, char *chunk)
 		if (n == 0) {
 			continue;
 		}
-		lck_mtx_lock(mux_lock);
-		seq = c->tx_seq;
-		c->tx_seq += n;
-		lck_mtx_unlock(mux_lock);
-		if (!send_tcp(c, TH_ACK, seq, c->rx_next, chunk, n, true)) {
+		/* (11-27) within the host's window, as every other sender: msgbuf=1 MB went out at once and overran usbmuxd,
+		 * which dropped the connection -- after a few `ak log --kernel` every port of the phone was refused */
+		if (!send_data(c, (const uint8_t *)chunk, n)) {
 			return false;
 		}
 	}
