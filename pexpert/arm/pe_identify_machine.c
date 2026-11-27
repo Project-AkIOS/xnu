@@ -31,6 +31,38 @@ static uint32_t pe_arm_init_timer(void *args);
  *
  * Sets up platform parameters. Returns:    nothing
  */
+/*
+ * (11-27) The timebase iOS user space is built for: 24 MHz, every Apple arm64 SoC's (libswift_Concurrency and libdispatch
+ * convert nanoseconds to ticks as ns * 3 / 125). Over a counter that runs at another rate (the Pixel 8a's 24.576 MHz) the
+ * kernel scales every counter read by 24 MHz / the counter's rate (osfmk/arm64/machine_routines.c) and reports 24 MHz.
+ * Boot-arg timebase_hz=N: another target; 0, the counter as it is.
+ */
+extern uint32_t ml_timebase_scale_num, ml_timebase_scale_den;
+
+static void
+pe_scaled_timebase(void)
+{
+	uint32_t target = 24000000;
+	uint64_t hardware = gPEClockFrequencyInfo.timebase_frequency_hz, a, b;
+
+	(void)PE_parse_boot_argn("timebase_hz", &target, sizeof(target));
+	if (target == 0 || hardware == 0 || target == hardware) {
+		return;
+	}
+	for (a = target, b = hardware; b != 0;) {
+		uint64_t r = a % b;
+
+		a = b;
+		b = r;
+	}
+	if (target / a > 0xffff || hardware / a > 0xffff) {     /* the scaled read keeps a remainder times num in 64 bits */
+		return;
+	}
+	ml_timebase_scale_num = (uint32_t)(target / a);
+	ml_timebase_scale_den = (uint32_t)(hardware / a);
+	gPEClockFrequencyInfo.timebase_frequency_hz = target;
+}
+
 void
 pe_identify_machine(boot_args * bootArgs)
 {
@@ -79,6 +111,7 @@ pe_identify_machine(boot_args * bootArgs)
 				gPEClockFrequencyInfo.timebase_frequency_hz = *(uint32_t const *)value;
 			}
 		}
+		pe_scaled_timebase();
 		gPEClockFrequencyInfo.dec_clock_rate_hz = gPEClockFrequencyInfo.timebase_frequency_hz;
 
 		/* Find the bus frequency next. */

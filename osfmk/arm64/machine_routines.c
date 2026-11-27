@@ -499,9 +499,15 @@ user_cont_hwclock_allowed(void)
  *
  */
 
+extern uint32_t ml_timebase_scale_num, ml_timebase_scale_den;   /* the timebase's scale (below; pe_identify_machine.c) */
+
 uint8_t
 user_timebase_type(void)
 {
+	/* (11-27) a scaled timebase is not the counter EL0 would read: user space takes it through the kernel's traps */
+	if (ml_timebase_scale_num != ml_timebase_scale_den) {
+		return USER_TIMEBASE_NONE;
+	}
 #if HAS_ACNTVCT
 	return USER_TIMEBASE_NOSPEC_APPLE;
 #elif HAS_APPLE_GENERIC_TIMER
@@ -2604,20 +2610,64 @@ ml_interrupt_prewarm(__unused uint64_t deadline)
 #endif
 
 /*
+ * (11-27) The timebase is the architected counter scaled by num/den, when the counter does not run at the 24 MHz of every
+ * Apple arm64 SoC (pe_identify_machine.c: 125/128 over the Pixel 8a's 24.576 MHz). iOS user space assumes 24 MHz in
+ * places: libswift_Concurrency converts a ContinuousClock/SuspendingClock deadline to ticks as ns * 3 / 125, so on the
+ * faster counter every Task.sleep(until:) deadline fell 2.4 % of the uptime into the past and fired at once (axassetsd
+ * spun on 1.5 cores re-sleeping). Every kernel read of the counter is scaled here, a decrementer value is converted back to
+ * counter ticks, and user space reads the timebase through the mach_absolute_time / mach_continuous_time traps
+ * (user_timebase_type). UniXNU did the same for a 19.2 MHz counter (its timebase-hz).
+ */
+uint32_t ml_timebase_scale_num = 1, ml_timebase_scale_den = 1;
+
+static inline bool
+timebase_scaled(void)
+{
+	return ml_timebase_scale_num != ml_timebase_scale_den;
+}
+
+static inline uint64_t
+timebase_from_counter(uint64_t counter)
+{
+	const uint64_t num = ml_timebase_scale_num, den = ml_timebase_scale_den;
+
+	if (__probable(num == den)) {
+		return counter;
+	}
+	return counter / den * num + counter % den * num / den;   /* no overflow: num, den < 2^16 */
+}
+
+/* counter ticks for a timebase interval, rounded up: a timer fires at its deadline or after, never before */
+static inline uint64_t
+counter_from_timebase(uint64_t ticks)
+{
+	const uint64_t num = ml_timebase_scale_num, den = ml_timebase_scale_den;
+
+	if (__probable(num == den)) {
+		return ticks;
+	}
+	return ticks / num * den + (ticks % num * den + num - 1) / num;
+}
+
+/*
  * Assumes fiq, irq disabled.
  */
 void
 ml_set_decrementer(uint32_t dec_value)
 {
 	cpu_data_t      *cdp = getCpuDatap();
+	uint64_t        counter_value = counter_from_timebase(dec_value);
 
 	assert(ml_get_interrupts_enabled() == FALSE);
 	cdp->cpu_decrementer = dec_value;
 
+	if (counter_value > 0x7fffffffULL) {
+		counter_value = 0x7fffffffULL;
+	}
 	if (cdp->cpu_set_decrementer_func) {
-		cdp->cpu_set_decrementer_func(dec_value);
+		cdp->cpu_set_decrementer_func((uint32_t)counter_value);
 	} else {
-		__builtin_arm_wsr64(KERNEL_CNTV_TVAL_EL0, (uint64_t)dec_value);
+		__builtin_arm_wsr64(KERNEL_CNTV_TVAL_EL0, counter_value);
 	}
 }
 
@@ -2628,7 +2678,7 @@ ml_set_decrementer(uint32_t dec_value)
 static inline uint64_t
 speculative_timebase(void)
 {
-	return __builtin_arm_rsr64(KERNEL_CNTVCT_EL0);
+	return timebase_from_counter(__builtin_arm_rsr64(KERNEL_CNTVCT_EL0));
 }
 
 /**
@@ -2640,7 +2690,7 @@ static inline uint64_t
 nonspeculative_timebase(void)
 {
 #if   __ARM_ARCH_8_6__
-	return __builtin_arm_rsr64(KERNEL_CNTVCTSS_EL0);
+	return timebase_from_counter(__builtin_arm_rsr64(KERNEL_CNTVCTSS_EL0));
 #else
 	// ISB required by ARMV7C.b section B8.1.2 & ARMv8 section D6.1.2
 	// "Reads of CNT[PV]CT[_EL0] can occur speculatively and out of order relative
@@ -2756,7 +2806,12 @@ ml_get_decrementer(void)
 		dec = (uint32_t)wide_val;
 		assert(wide_val == (uint64_t)dec);
 	}
+	/* back in timebase ticks; a timer already past (TVAL negative) stays as read */
+	if (timebase_scaled() && (int32_t)dec > 0) {
+		uint64_t ticks = timebase_from_counter(dec);
 
+		dec = ticks > 0x7fffffffULL ? 0x7fffffff : (uint32_t)ticks;
+	}
 	return dec;
 }
 
@@ -2823,7 +2878,8 @@ _enable_timebase_event_stream(uint32_t bit_index)
 	 * If the SOC supports it (and it isn't broken), enable
 	 * EL0 access to the timebase registers.
 	 */
-	if (user_timebase_type() != USER_TIMEBASE_NONE) {
+	if (user_timebase_type() != USER_TIMEBASE_NONE || timebase_scaled()) {
+		/* scaled (11-27): EL0 keeps the counter, so that code reading CNTVCT_EL0 itself sees it unscaled, not a fault */
 		cntkctl |= (CNTKCTL_EL1_PL0PCTEN | CNTKCTL_EL1_PL0VCTEN);
 	}
 

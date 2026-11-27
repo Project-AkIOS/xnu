@@ -45,6 +45,9 @@
  */
 static TUNABLE(uint32_t, systrace_level, "systrace", 0);
 static TUNABLE_STR(systrace_name, MAXCOMLEN + 1, "systrace_name", "");
+/* (11-27) systrace_stacks=N: every Nth call logged also gets the caller's user stack (a "userabort:" line) */
+static TUNABLE(uint32_t, systrace_stacks, "systrace_stacks", 0);
+extern void user_stack_say(const char *what);
 extern const char *syscallnames[];
 
 static void
@@ -120,6 +123,13 @@ systrace_report(struct proc *proc, unsigned short syscode, struct uthread *uthre
 	    (unsigned long long)uthread->uu_arg[0], (unsigned long long)uthread->uu_arg[1],
 	    (unsigned long long)uthread->uu_arg[2], (unsigned long long)uthread->uu_arg[3],
 	    path[0] ? " \"" : "", path, path[0] ? "\"" : "", detail, error);
+	if (systrace_stacks != 0) {
+		static uint32_t calls;
+
+		if (os_atomic_inc(&calls, relaxed) % systrace_stacks == 0) {
+			user_stack_say(syscallnames[syscode]);
+		}
+	}
 }
 
 #if CONFIG_DTRACE

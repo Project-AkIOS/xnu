@@ -57,6 +57,26 @@ plausible_user_address(uint64_t address)
 	return address >= 0x100000000ULL && address < MACH_VM_MAX_ADDRESS;
 }
 
+/*
+ * (11-27) The next frame up a user stack: FRAME is {saved fp, return address} read at FP. Swift's async functions mark
+ * their saved fp with bit 60: it then points at the caller's async context (on the heap), whose first two words are
+ * again {parent context, resume address} -- followed the same way, without the "up the stack" order check, which
+ * heap contexts do not keep. Returns 0 at the end.
+ */
+#define USER_ASYNC_FRAME_BIT (1ULL << 60)
+
+static uint64_t
+user_next_frame(uint64_t fp, const uint64_t frame[2])
+{
+	uint64_t next = frame[0];
+
+	if (next & USER_ASYNC_FRAME_BIT) {
+		next &= ~USER_ASYNC_FRAME_BIT;
+		return plausible_user_address(next) && (next & 7) == 0 && next != fp ? next : 0;
+	}
+	return next > fp ? next : 0;
+}
+
 void
 user_exception_trace(exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t count, thread_t thread)
 {
@@ -131,9 +151,18 @@ user_exception_trace(exception_type_t exception, mach_exception_data_t code, mac
  * puts that on the console), the stack is here.
  */
 void user_abort_trace(void);
+void user_stack_say(const char *what);
 
 void
 user_abort_trace(void)
+{
+	user_stack_say("aborts");
+}
+
+/* (11-27) the current thread's user stack, one line: "userabort: NAME[PID] WHAT, ... called from: ..." (abort(), and
+ * systrace_stacks= in bsd/dev/arm/systemcalls.c) */
+void
+user_stack_say(const char *what)
 {
 	thread_t thread = current_thread();
 	task_t task = get_threadtask(thread);
@@ -157,8 +186,8 @@ user_abort_trace(void)
 		size_t len;
 
 		/* (11-27) and where the program itself was loaded, so its own frames can be read in its binary */
-		len = (size_t)snprintf(line, sizeof(line), "userabort: %s[%d] aborts, shared cache slide 0x%x, image 0x%llx; called from:",
-		    proc ? proc_name_address(proc) : "?", proc ? proc_pid(proc) : -1, slide,
+		len = (size_t)snprintf(line, sizeof(line), "userabort: %s[%d] %s, shared cache slide 0x%x, image 0x%llx; called from:",
+		    proc ? proc_name_address(proc) : "?", proc ? proc_pid(proc) : -1, what, slide,
 		    (unsigned long long)task->mach_header_vm_address);
 		fp = (uint64_t)get_saved_state_fp(state);
 		for (int depth = 0; depth < 24 && plausible_user_address(fp) && (fp & 7) == 0 && len < sizeof(line) - 24; depth++) {
@@ -166,10 +195,9 @@ user_abort_trace(void)
 				break;
 			}
 			len += (size_t)snprintf(line + len, sizeof(line) - len, " 0x%llx", (unsigned long long)frame[1]);
-			if (frame[0] <= fp) {
+			if ((fp = user_next_frame(fp, frame)) == 0) {
 				break;
 			}
-			fp = frame[0];
 		}
 		snprintf(line + len, sizeof(line) - len, "\n");
 		printf("%s", line);
@@ -309,10 +337,9 @@ ustacks_task(task_t task, struct proc *proc)
 			if (at < (int)sizeof(line) - 24) {
 				at += snprintf(line + at, sizeof(line) - at, " 0x%llx", (unsigned long long)frame[1]);
 			}
-			if (frame[0] <= fp) {
+			if ((fp = user_next_frame(fp, frame)) == 0) {
 				break;
 			}
-			fp = frame[0];
 		}
 		snprintf(line + at, sizeof(line) - at, "\n");
 		ustacks_say(line);
