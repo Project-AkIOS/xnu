@@ -510,20 +510,30 @@ class IOGPUDeviceUserClient : public IOUserClient
 	struct surfaceMap fSurfaceMaps[kMaxSurfaceMaps];
 	struct surfaceMap *surfaceMapFor(MiniIOSurface *surface, uint64_t size, IOReturn *ret);
 	void sweepSurfaceMaps(bool all);
-	/* (fLock held) whether a client-memory resource other than r, live or deleted but not yet freed, covers the page */
+	/*
+	 * (fLock held) whether anything else of this client's still maps the page: a resource other than r (any kind, live or
+	 * deleted but not yet freed) or a cached surface mapping. (11-27: QuartzCore wraps pieces of its own Metal buffers as
+	 * no-copy buffers, so a client-memory resource lies inside a buffer of another kind; freeing the big one took the
+	 * small one's pages from the GPU -- 176 faults a boot, draws lost.)
+	 */
 	bool
-	clientPageCovered(struct resource *r, uint64_t page)
+	pageStillMapped(struct resource *r, uint64_t page)
 	{
 		for (uint32_t i = 0; i < fResourceCount; i++) {
 			struct resource *o = fResources[i];
 
-			if (o != NULL && o != r && o->kind == 0x80u /* kIOGPUResourceClient */ && page >= o->gpuBase &&
-			    page < o->gpuBase + o->gpuLength) {
+			if (o != NULL && o != r && o->gpuLength != 0 && page >= o->gpuBase && page < o->gpuBase + o->gpuLength) {
 				return true;
 			}
 		}
 		for (struct resource *o = fDeferred; o != NULL; o = o->nextDeferred) {
-			if (o != r && o->kind == 0x80u /* kIOGPUResourceClient */ && page >= o->gpuBase && page < o->gpuBase + o->gpuLength) {
+			if (o != r && o->gpuLength != 0 && page >= o->gpuBase && page < o->gpuBase + o->gpuLength) {
+				return true;
+			}
+		}
+		for (uint32_t i = 0; i < kMaxSurfaceMaps; i++) {
+			if (fSurfaceMaps[i].surface != NULL && page >= fSurfaceMaps[i].gpuBase &&
+			    page < fSurfaceMaps[i].gpuBase + fSurfaceMaps[i].gpuLength) {
 				return true;
 			}
 		}
@@ -1091,7 +1101,7 @@ IOGPUDeviceUserClient::releaseResource(struct resource *r)
 		r->gpuLength = 0;
 	}
 	/* the GPU's view first (updated before this returns), then the memory */
-	if (r->gpuLength != 0 && fAS >= 0 && r->kind == kIOGPUResourceClient) {
+	if (r->gpuLength != 0 && fAS >= 0) {
 		/*
 		 * (11-26) the client's own pages sit at their own addresses, and QuartzCore makes buffers over overlapping
 		 * pieces of the same memory: the pages another of its buffers still covers stay mapped (unmapped with
@@ -1100,7 +1110,7 @@ IOGPUDeviceUserClient::releaseResource(struct resource *r)
 		uint64_t run = 0, end = r->gpuBase + r->gpuLength;
 
 		for (uint64_t page = r->gpuBase; page <= end; page += PAGE_SIZE) {
-			bool keep = page < end && clientPageCovered(r, page);
+			bool keep = page < end && pageStillMapped(r, page);
 
 			if (page < end && !keep) {
 				if (run == 0) {
@@ -1113,8 +1123,6 @@ IOGPUDeviceUserClient::releaseResource(struct resource *r)
 				run = 0;
 			}
 		}
-	} else if (r->gpuLength != 0 && fAS >= 0) {
-		fGPU->unmapFromAddressSpace(fAS, r->gpuBase, r->gpuLength);
 	}
 	OSSafeReleaseNULL(r->map);
 	if (r->memory != NULL && r->prepared) {
