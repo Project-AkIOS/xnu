@@ -6,6 +6,55 @@
 #include <kern/clock.h>
 
 OSDefineMetaClassAndStructors(IOSurfaceSharedEvent, OSObject);
+OSDefineMetaClassAndStructors(AkiosEventNotifyPort, OSObject);
+
+/* (IOUserClient's async-reference helpers are protected statics: reached through a subclass that is never made) */
+class AkiosAsync : public IOUserClient
+{
+public:
+	static void set(OSAsyncReference64 ref, mach_port_t port, mach_vm_address_t callback, io_user_reference_t refcon)
+	{
+		IOUserClient::setAsyncReference64(ref, port, callback, refcon);
+	}
+	static IOReturn send(OSAsyncReference64 ref, IOReturn result, io_user_reference_t *args, UInt32 count)
+	{
+		return IOUserClient::sendAsyncResult64(ref, result, args, count);
+	}
+};
+
+AkiosEventNotifyPort *
+AkiosEventNotifyPort::withReference(const io_user_reference_t *ref)
+{
+	AkiosEventNotifyPort *p;
+
+	if (ref == NULL || ref[0] == 0 || (p = OSTypeAlloc(AkiosEventNotifyPort)) == NULL) {
+		return NULL;
+	}
+	if (!p->init()) {
+		p->release();
+		return NULL;
+	}
+	AkiosAsync::set(p->fRef, (mach_port_t)(uintptr_t)ref[0], ref[kIOAsyncCalloutFuncIndex],
+	    ref[kIOAsyncCalloutRefconIndex]);
+	return p;
+}
+
+void
+AkiosEventNotifyPort::free(void)
+{
+	if (fRef[0] != 0) {
+		IOUserClient::releaseAsyncReference64(fRef);
+	}
+	OSObject::free();
+}
+
+void
+AkiosEventNotifyPort::send(uint64_t value, uint64_t a, uint64_t b)
+{
+	io_user_reference_t args[4] = { b, a, value, value >> 32 };
+
+	AkiosAsync::send(fRef, kIOReturnSuccess, args, 4);
+}
 
 static IOLock *gEventLock;              /* every event's maps and waits (signals are rare enough for one lock) */
 static volatile SInt64 gEventTraceIDs = 1;
@@ -47,6 +96,9 @@ IOSurfaceSharedEvent::free(void)
 	for (unsigned i = 0; i < kMaxMaps; i++) {
 		OSSafeReleaseNULL(fMaps[i].map);
 	}
+	for (unsigned i = 0; i < kMaxNotes; i++) {
+		OSSafeReleaseNULL(fNotes[i].port);
+	}
 	OSSafeReleaseNULL(fPage);
 	OSObject::free();
 }
@@ -58,6 +110,59 @@ IOSurfaceSharedEvent::signal(uint64_t value)
 	*fValue = value;
 	IOLockWakeup(gEventLock, this, false);
 	IOLockUnlock(gEventLock);
+	deliverDue();
+}
+
+/* (11-27) the notifications whose value is reached, sent (outside the lock) and forgotten */
+void
+IOSurfaceSharedEvent::deliverDue(void)
+{
+	struct { AkiosEventNotifyPort *port; uint64_t value, a, b; } due[kMaxNotes];
+	unsigned n = 0;
+	uint64_t now;
+
+	IOLockLock(gEventLock);
+	now = *fValue;
+	for (unsigned i = 0; i < kMaxNotes; i++) {
+		if (fNotes[i].port != NULL && now >= fNotes[i].value) {
+			due[n].port = fNotes[i].port;
+			due[n].value = now;
+			due[n].a = fNotes[i].a;
+			due[n].b = fNotes[i].b;
+			n++;
+			fNotes[i].port = NULL;
+		}
+	}
+	IOLockUnlock(gEventLock);
+	for (unsigned i = 0; i < n; i++) {
+		due[i].port->send(due[i].value, due[i].a, due[i].b);
+		due[i].port->release();
+	}
+}
+
+IOReturn
+IOSurfaceSharedEvent::notifyAt(AkiosEventNotifyPort *port, uint64_t value, uint64_t a, uint64_t b)
+{
+	IOReturn ret = kIOReturnNoMemory;
+
+	if (port == NULL) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(gEventLock);
+	for (unsigned i = 0; i < kMaxNotes; i++) {
+		if (fNotes[i].port == NULL) {
+			port->retain();
+			fNotes[i].port = port;
+			fNotes[i].value = value;
+			fNotes[i].a = a;
+			fNotes[i].b = b;
+			ret = kIOReturnSuccess;
+			break;
+		}
+	}
+	IOLockUnlock(gEventLock);
+	deliverDue();                   /* (reached already: sent now) */
+	return ret;
 }
 
 IOReturn

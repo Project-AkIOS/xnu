@@ -68,6 +68,62 @@ enum {
 	kSurfaceMethodSharedEventInfo   = 38,   /* (port name) -> (0, the value's address, trace id, 0) */
 	kSurfaceMethodDetachModeCode    = 43,
 	kSurfaceMethodSetOwnershipIdentity = 44,
+	/* (11-27) the rest of iOS 27.2.1's 60-entry table (IOExternalMethodDispatch2022 in the kernelcache; names from the
+	 * macOS KDK's IOSurface.kext -- the same up to 42; 43- shifted by three macOS-only entries) */
+	kSurfaceMethodRelease           = 1,
+	kSurfaceMethodLock              = 2,
+	kSurfaceMethodUnlock            = 3,
+	kSurfaceMethodGetYCbCrMatrix    = 8,
+	kSurfaceMethodIncUseCount       = 14,
+	kSurfaceMethodDecUseCount       = 15,
+	kSurfaceMethodGetUseCount       = 16,
+	kSurfaceMethodSetSurfaceNotify  = 17,
+	kSurfaceMethodRemoveSurfaceNotify = 18,
+	kSurfaceMethodIsTiled           = 23,
+	kSurfaceMethodGetTileFormat     = 25,
+	kSurfaceMethodGetDataValue      = 26,
+	kSurfaceMethodGetBulkAttachments = 28,
+	kSurfaceMethodPrefetchPages     = 29,
+	kSurfaceMethodGatherData        = 30,
+	kSurfaceMethodSetCmpTileDataUsed = 31,
+	kSurfaceMethodSharedEventSignal = 37,
+	kSurfaceMethodSharedEventNotify = 39,
+	kSurfaceMethodAddEventNotifyPort = 40,
+	kSurfaceMethodRemoveEventNotifyPort = 41,
+	kSurfaceMethodSignalEventOperation = 42,
+	kSurfaceMethodSharedEventWait   = 45,
+	kSurfaceMethodCreateMemoryPool  = 46,
+	kSurfaceMethodEnsureMemoryPool  = 47,
+	kSurfaceMethodFlushMemoryPool   = 48,
+	kSurfaceMethodGatherMemoryPool  = 49,
+	kSurfaceMethodSetDataProperty   = 50,
+	kSurfaceMethodGetDataProperty   = 51,
+	kSurfaceMethodClearDataProperties = 52,
+	kSurfaceMethodInvalidate        = 53,
+	kSurfaceMethodSetCVBridgedKeys  = 54,
+	kSurfaceMethodRemoveCVBridged   = 55,
+	kSurfaceMethodRemoveAttachments = 56,
+	kSurfaceMethodAppendTransaction = 57,
+	kSurfaceMethodQueryTransactions = 58,
+	kSurfaceMethodPruneTransactions = 59,
+	kSurfaceMethodCount             = 60,
+};
+
+static const char * const kSurfaceNames[kSurfaceMethodCount] = {
+	"create_surface", "release_surface", "lock_surface", "unlock_surface", "lookup_surface", "set_ycbcrmatrix",
+	"create_surface_fast_path", "create_surface_client_mem", "get_ycbcrmatrix", "set_value", "get_value",
+	"remove_value", "bind_accel", "get_limits", "inc_sfc_use_count_for_category", "dec_sfc_use_count_for_category",
+	"get_surface_use_count", "set_surface_notify", "remove_surface_notify", "log", "set_purgeable", "set_ownership",
+	"set_tiled", "is_tiled", "set_timestamp", "get_tile_format", "get_data_value", "set_bulk_attachments",
+	"get_bulk_attachments", "prefetch_pages", "gather_iosurface_data", "set_cmp_tile_data_used_of_plane",
+	"get_graphics_comm_page_address", "set_indexed_timestamp", "lookup_surface_from_port", "create_port_from_surface",
+	"create_shared_event", "signal_shared_event", "query_shared_event", "notify_shared_event",
+	"add_shared_event_notify_port", "remove_shared_event_notify_port", "signal_shared_event_operation",
+	"set_detach_mode_code", "set_ownership_identity", "wait_shared_event", "create_memory_pool",
+	"ensure_memory_pool_memory", "flush_memory_pool", "gather_memory_pool_data", "set_data_property",
+	"get_data_property", "clear_data_properties", "invalidate_surface", "set_corevideo_bridged_keys",
+	"remove_corevideo_bridged_values", "remove_bulk_attachments", "append_transaction", "query_transaction_list",
+	"prune_transaction_list",
 };
 
 /* IOConnectTrap indices */
@@ -90,6 +146,7 @@ enum {
 };
 
 #define kSurfaceLockReadOnly    1u
+#define kSurfaceValueHeader     12      /* (11-27) iOS 27's IOSurfaceValueArgs / ValueResultArgs header (iOS 16: 8) */
 
 #define MINISURF_TABLE_SIZE     16384
 #define MINISURF_MAX_DIMENSION  16384
@@ -110,6 +167,7 @@ static uint32_t         gSurfacesMade, gSurfacesFreed;
 static uint64_t         gSurfaceLogged[2];                      /* selectors already complained about */
 /* Boot-arg surftrace=N: log the first N surfaces created (default 24). */
 static TUNABLE(uint32_t, gSurfaceTrace, "surftrace", 24);
+static TUNABLE(uint32_t, gSurfaceTraceCalls, "surftrace_calls", 3);  /* (11-27) each selector's first N calls traced */
 static uint32_t         gSurfaceTraced;                         /* (a tunable is read-only after boot) */
 /*
  * Boot-arg surftrace_of=NAME: only the surfaces made by programs whose name begins with NAME count for
@@ -314,6 +372,16 @@ MiniIOSurface::free(void)
 	}
 
 	OSSafeReleaseNULL(values);
+	for (unsigned i = 0; i < transactionCount; i++) {
+		OSSafeReleaseNULL(transactions[i].event);
+	}
+	transactionCount = 0;
+	for (unsigned i = 0; i < 6; i++) {
+		if (dataProperty[i] != NULL) {
+			IOFree(dataProperty[i], dataPropertySize[i]);
+			dataProperty[i] = NULL;
+		}
+	}
 	OSSafeReleaseNULL(clientMap);
 	if (client != NULL) {
 		client->complete();
@@ -983,6 +1051,10 @@ class IOSurfaceRootUserClient : public IOUserClient
 	uint32_t                        fRefCount;
 	uint32_t                        fRefCapacity;
 	IOExternalTrap                  fTraps[kSurfaceTrapCount];
+	/* (11-27) */
+	OSArray *                       fEventPorts;    /* AkiosEventNotifyPort: add_shared_event_notify_port */
+	struct { OSAsyncReference64 ref; uint64_t id; bool used; } fSurfaceNotify[16];   /* set_surface_notify */
+	OSArray *                       fCVBridgedKeys; /* set_corevideo_bridged_keys: OSStrings */
 
 	struct minisurf_client_ref * findRef(uint32_t sid, bool detached);
 	struct minisurf_client_ref * addRef(MiniIOSurface * surface);
@@ -1014,6 +1086,16 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn methodSharedEventCreate(IOExternalMethodArguments * args);
 	IOReturn methodSharedEventInfo(IOExternalMethodArguments * args);
 	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
+	/* (11-27) */
+	IOReturn dispatchMethod(uint32_t selector, IOExternalMethodArguments * args);
+	IOReturn methodNewer(uint32_t selector, IOExternalMethodArguments * args);
+	IOReturn appendTransaction(uint32_t sid, mach_port_name_t event, uint64_t value, bool write);
+	IOReturn pruneTransactions(uint32_t sid);
+	IOReturn signalEventOperation(uint32_t sid, uint64_t op, mach_port_name_t event, uint64_t value);
+	IOReturn removeCVBridged(uint32_t sid);
+	IOReturn trapSignalEventOperation(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn trapAppendTransaction(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	IOReturn trapPruneTransactions(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn useCountCommon(uint32_t sid, uint32_t category, int delta);
 
 public:
@@ -1055,9 +1137,10 @@ IOSurfaceRootUserClient::start(IOService * provider)
 	fTraps[kSurfaceTrapSharedEventSignal].func = (IOTrap) & IOSurfaceRootUserClient::trapSharedEventSignal;
 	fTraps[kSurfaceTrapRemoveCVBridged].func = (IOTrap) & IOSurfaceRootUserClient::trapRemoveCVBridged;
 	fTraps[kSurfaceTrapRemoveAttachments].func = (IOTrap) & IOSurfaceRootUserClient::trapRemoveAttachments;
-	fTraps[kSurfaceTrapSignalEvent].func = (IOTrap) & IOSurfaceRootUserClient::trapUnsupported;
-	fTraps[kSurfaceTrapAppendTransaction].func = (IOTrap) & IOSurfaceRootUserClient::trapUnsupported;
-	fTraps[kSurfaceTrapPruneTransactions].func = (IOTrap) & IOSurfaceRootUserClient::trapUnsupported;
+	fTraps[kSurfaceTrapSignalEvent].func = (IOTrap) & IOSurfaceRootUserClient::trapSignalEventOperation;
+	fTraps[kSurfaceTrapAppendTransaction].func = (IOTrap) & IOSurfaceRootUserClient::trapAppendTransaction;
+	fTraps[kSurfaceTrapPruneTransactions].func = (IOTrap) & IOSurfaceRootUserClient::trapPruneTransactions;
+	fEventPorts = OSArray::withCapacity(2);
 	for (unsigned i = 0; i < kSurfaceTrapCount; i++) {
 		fTraps[i].object = this;
 	}
@@ -1067,6 +1150,14 @@ IOSurfaceRootUserClient::start(IOService * provider)
 IOReturn
 IOSurfaceRootUserClient::clientClose(void)
 {
+	OSSafeReleaseNULL(fEventPorts);
+	OSSafeReleaseNULL(fCVBridgedKeys);
+	for (unsigned i = 0; i < 16; i++) {
+		if (fSurfaceNotify[i].used) {
+			releaseAsyncReference64(fSurfaceNotify[i].ref);
+			fSurfaceNotify[i].used = false;
+		}
+	}
 	IOLockLock(gSurfaceLock);
 	while (fRefCount != 0) {
 		dropRef(&fRefs[fRefCount - 1]);
@@ -1600,13 +1691,27 @@ IOSurfaceRootUserClient::methodSetValue(IOExternalMethodArguments * args, const 
 	struct minisurf_client_ref * ref;
 	IOReturn ret = kIOReturnBadArgument;
 
-	if (inSize < 12) {
+	if (inSize <= kSurfaceValueHeader) {
 		return kIOReturnBadArgument;
 	}
 	memcpy(&sid, in, sizeof(sid));
-	obj = unserialize(in + 8, inSize - 8);
+	/* (11-27) iOS 27's IOSurfaceValueArgs: a 12-byte header (the surface first), the serialized values from 0xc --
+	 * Apple's s_set_value takes nothing of 12 bytes or less; 8 (iOS 16's) refused backboardd's every request */
+	obj = unserialize(in + kSurfaceValueHeader, inSize - kSurfaceValueHeader);
 	array = OSDynamicCast(OSArray, obj);
 	if (array == NULL) {
+		static uint32_t said;
+
+		/* (11-27) what was refused, the first few times: for finding out what the request is */
+		if (said++ < 6) {
+			char hex[3 * 72 + 1] = "";
+
+			for (size_t i = 0; i < inSize && i < 72; i++) {
+				snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ", in[i]);
+			}
+			IOLog("MiniIOSurface: set_value refused (%s): %zu bytes: %s\n", obj == NULL ? "not unserialized" :
+			    obj->getMetaClass()->getClassName(), inSize, hex);
+		}
 		OSSafeReleaseNULL(obj);
 		return kIOReturnBadArgument;
 	}
@@ -1643,7 +1748,7 @@ IOSurfaceRootUserClient::methodRemoveValue(IOExternalMethodArguments * args, con
 	struct minisurf_client_ref * ref;
 	IOReturn ret = kIOReturnNotFound;
 
-	if (inSize < 9 || in[inSize - 1] != 0) {
+	if (inSize <= kSurfaceValueHeader || in[inSize - 1] != 0) {
 		return kIOReturnBadArgument;
 	}
 	memcpy(&sid, in, sizeof(sid));
@@ -1651,7 +1756,8 @@ IOSurfaceRootUserClient::methodRemoveValue(IOExternalMethodArguments * args, con
 	ref = findRef(sid, false);
 	if (ref != NULL && ref->surface->values != NULL) {
 		MiniIOSurface * s = ref->surface;
-		const char * key = (const char *) in + 8;
+		/* (11-27) the key at +12: at +8 every iOS 27 request read "", and removed ALL the surface's values */
+		const char * key = (const char *) in + kSurfaceValueHeader;
 
 		if (key[0] == 0) {
 			s->values->flushCollection();
@@ -1670,20 +1776,20 @@ IOSurfaceRootUserClient::methodRemoveValue(IOExternalMethodArguments * args, con
 IOReturn
 IOSurfaceRootUserClient::methodCopyValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize)
 {
-	uint32_t sid, header[2] = { 0, 0 };
+	uint32_t sid, header[3] = { 0, 0, 0 };  /* (11-27) iOS 27's result header: 12 bytes, the values' seed at +4 */
 	struct minisurf_client_ref * ref;
 	OSSerialize * s = NULL;
 	IOReturn ret = kIOReturnNotFound;
 	uint32_t length = 0, total;
 
-	if (inSize < 9 || in[inSize - 1] != 0) {
+	if (inSize <= kSurfaceValueHeader || in[inSize - 1] != 0) {
 		return kIOReturnBadArgument;
 	}
 	memcpy(&sid, in, sizeof(sid));
 	IOLockLock(gSurfaceLock);
 	ref = findRef(sid, false);
 	if (ref != NULL && ref->surface->values != NULL) {
-		const char * key = (const char *) in + 8;
+		const char * key = (const char *) in + kSurfaceValueHeader;     /* (11-27: at +12, not +8 -- which read "" = all) */
 		OSObject * value = key[0] ? ref->surface->values->getObject(key) : ref->surface->values;
 
 		header[1] = ref->surface->shared()->valuesSeed;
@@ -1771,6 +1877,28 @@ IOSurfaceRootUserClient::methodSetBulkAttachments(const uint8_t * in, size_t inS
 IOReturn
 IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
+{
+	IOReturn ret = dispatchMethod(selector, args);
+
+	/* (11-27) the trace: each selector's first surftrace_calls calls, by Apple's name, with the caller and the answer */
+	static uint8_t calls[128];
+
+	if (selector < 128 && calls[selector] < gSurfaceTraceCalls) {
+		char procname[32] = "?";
+
+		calls[selector]++;
+		proc_selfname(procname, sizeof(procname));
+		IOLog("MiniIOSurface: %s[%d] %u %s (in %u [0x%llx 0x%llx 0x%llx] + %u bytes; out %u + %u bytes) = %#x\n", procname,
+		    proc_selfpid(), selector, selector < kSurfaceMethodCount ? kSurfaceNames[selector] : "?", args->scalarInputCount,
+		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0, args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
+		    args->scalarInputCount > 2 ? args->scalarInput[2] : 0, args->structureInputSize, args->scalarOutputCount,
+		    args->structureOutputSize, ret);
+	}
+	return ret;
+}
+
+IOReturn
+IOSurfaceRootUserClient::dispatchMethod(uint32_t selector, IOExternalMethodArguments * args)
 {
 	const uint8_t * in = (const uint8_t *) args->structureInput;
 	size_t inSize = args->structureInputSize;
@@ -1883,6 +2011,10 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		return kIOReturnSuccess;
 
 	default:
+		ret = methodNewer(selector, args);
+		if (ret != kIOReturnInvalid) {
+			return ret;
+		}
 		break;
 	}
 
@@ -1917,7 +2049,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		IOLog("MiniIOSurface: selector %u not implemented (scalars %u in, %u out; structure %u in, %u out)\n", selector,
 		    args->scalarInputCount, args->scalarOutputCount, args->structureInputSize, args->structureOutputSize);
 	}
-	return kIOReturnUnsupported;
+	return selector < kSurfaceMethodCount ? kIOReturnUnsupported : kIOReturnBadArgument;
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -2163,4 +2295,556 @@ IOSurfaceRootUserClient::trapSharedEventSignal(void * p1, void * p2, void * p3, 
 	e->signal((uint64_t)(uintptr_t)p2);
 	e->release();
 	return kIOReturnSuccess;
+}
+
+/* ---- (11-27) the rest of iOS 27's IOSurface interface: as Apple's IOSurface.kext does it (the macOS KDK's, decompiled
+ * with Ghidra: IOSurfaceRootUserClient::s_*, IOSurface::*_transaction*, setDataProperty, ...) ---- */
+
+static inline uint64_t
+scalarIn(IOExternalMethodArguments * args, unsigned i)
+{
+	return i < args->scalarInputCount ? args->scalarInput[i] : 0;
+}
+
+/* a surface's transactions whose event is done (value reached) dropped; gSurfaceLock held */
+static void
+pruneLocked(MiniIOSurface * s)
+{
+	unsigned kept = 0;
+
+	for (unsigned i = 0; i < s->transactionCount; i++) {
+		if (s->transactions[i].event->value() >= s->transactions[i].value) {
+			s->transactions[i].event->release();
+		} else {
+			s->transactions[kept++] = s->transactions[i];
+		}
+	}
+	s->transactionCount = kept;
+}
+
+/* append_transaction (method 57, trap 11): (surface, shared event port, wait value, write) -- kept only if not done yet;
+ * a write moves the seed on (IOSurface::append_transaction) */
+IOReturn
+IOSurfaceRootUserClient::appendTransaction(uint32_t sid, mach_port_name_t name, uint64_t value, bool write)
+{
+	IOSurfaceSharedEvent * e = IOSurfaceSharedEvent::fromPortName(fTask, name);
+	struct minisurf_client_ref * ref;
+	IOReturn ret = kIOReturnBadArgument;
+
+	if (e == NULL) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(gSurfaceLock);
+	ref = findRef(sid, false);
+	if (ref != NULL) {
+		MiniIOSurface * s = ref->surface;
+
+		ret = kIOReturnSuccess;
+		if (e->value() < value) {
+			pruneLocked(s);
+			if (s->transactionCount < sizeof(s->transactions) / sizeof(s->transactions[0])) {
+				e->retain();
+				s->transactions[s->transactionCount].event = e;
+				s->transactions[s->transactionCount].value = value;
+				s->transactions[s->transactionCount].write = write;
+				s->transactionCount++;
+				if (write) {
+					s->shared()->seed++;
+				}
+			} else {
+				ret = kIOReturnNoMemory;
+			}
+		}
+	}
+	IOLockUnlock(gSurfaceLock);
+	e->release();
+	return ret;
+}
+
+IOReturn
+IOSurfaceRootUserClient::pruneTransactions(uint32_t sid)
+{
+	struct minisurf_client_ref * ref;
+
+	IOLockLock(gSurfaceLock);
+	ref = findRef(sid, false);
+	if (ref != NULL) {
+		pruneLocked(ref->surface);
+	}
+	IOLockUnlock(gSurfaceLock);
+	return ref != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+/* signal_shared_event_operation (method 42, trap 10): (surface, operation, event port, value). Operation 0: signal the
+ * event once the surface's device work is done -- there is no device cache here, so at once (Apple's path without one);
+ * 2: a memory callback (not kept here); others unsupported (as Apple's) */
+IOReturn
+IOSurfaceRootUserClient::signalEventOperation(uint32_t sid, uint64_t op, mach_port_name_t name, uint64_t value)
+{
+	IOSurfaceSharedEvent * e;
+	bool known;
+
+	IOLockLock(gSurfaceLock);
+	known = findRef(sid, false) != NULL;
+	IOLockUnlock(gSurfaceLock);
+	if (!known || (e = IOSurfaceSharedEvent::fromPortName(fTask, name)) == NULL) {
+		return kIOReturnBadArgument;
+	}
+	IOReturn ret = kIOReturnUnsupported;
+
+	if (op == 0) {
+		if (value > e->value()) {
+			e->signal(value);
+		}
+		ret = kIOReturnSuccess;
+	} else if (op == 2) {
+		ret = kIOReturnSuccess;
+	}
+	e->release();
+	return ret;
+}
+
+/* remove_corevideo_bridged_values (method 55, trap 8): every bulk attachment cleared, and the values whose keys
+ * set_corevideo_bridged_keys named removed (IOSurfaceRootUserClient::remove_corevideo_bridged_values) */
+IOReturn
+IOSurfaceRootUserClient::removeCVBridged(uint32_t sid)
+{
+	struct minisurf_client_ref * ref;
+
+	if (fCVBridgedKeys == NULL) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(gSurfaceLock);
+	ref = findRef(sid, false);
+	if (ref != NULL) {
+		MiniIOSurface * s = ref->surface;
+
+		bzero(s->shared()->attachments, sizeof(s->shared()->attachments));
+		if (s->values != NULL) {
+			for (unsigned i = 0; i < fCVBridgedKeys->getCount(); i++) {
+				OSString * key = OSDynamicCast(OSString, fCVBridgedKeys->getObject(i));
+
+				if (key != NULL) {
+					s->values->removeObject(key);
+				}
+			}
+			s->updateValuesState();
+		}
+	}
+	IOLockUnlock(gSurfaceLock);
+	return ref != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+IOReturn
+IOSurfaceRootUserClient::trapSignalEventOperation(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
+{
+	return signalEventOperation((uint32_t) (uintptr_t) p1, (uint64_t) (uintptr_t) p2, (mach_port_name_t) (uintptr_t) p3,
+	           (uint64_t) (uintptr_t) p4);
+}
+
+IOReturn
+IOSurfaceRootUserClient::trapAppendTransaction(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
+{
+	return appendTransaction((uint32_t) (uintptr_t) p1, (mach_port_name_t) (uintptr_t) p2, (uint64_t) (uintptr_t) p3, p4 != NULL);
+}
+
+IOReturn
+IOSurfaceRootUserClient::trapPruneTransactions(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
+{
+	return pruneTransactions((uint32_t) (uintptr_t) p1);
+}
+
+/* the methods the first switch does not name; kIOReturnInvalid: not one of these either */
+IOReturn
+IOSurfaceRootUserClient::methodNewer(uint32_t selector, IOExternalMethodArguments * args)
+{
+	struct minisurf_client_ref * ref;
+	IOReturn ret;
+	uint32_t sid = (uint32_t) scalarIn(args, 0);
+
+	switch (selector) {
+	case kSurfaceMethodRelease:                     /* (surface) */
+		return trapRelease((void *) (uintptr_t) sid, NULL, NULL, NULL, NULL, NULL);
+
+	case kSurfaceMethodInvalidate:                  /* (surface, ...): as trap 4 */
+		return trapDetach((void *) (uintptr_t) sid, NULL, NULL, NULL, NULL, NULL);
+
+	case kSurfaceMethodLock:                        /* in: { surface, options, ... }; out: the surface, as a lookup */
+	case kSurfaceMethodUnlock:                      /* in: { surface, options, ... }; out: the seed */
+	{
+		uint32_t lock[3] = { 0, 0, 0 };
+		uint32_t seed = 0;
+
+		if (args->structureInput == NULL || args->structureInputSize < 8) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(lock, args->structureInput, MIN(args->structureInputSize, sizeof(lock)));
+		IOLockLock(gSurfaceLock);
+		ref = findRef(lock[0], false);
+		if (ref == NULL) {
+			IOLockUnlock(gSurfaceLock);
+			return kIOReturnBadArgument;
+		}
+		if (!(lock[1] & kSurfaceLockReadOnly)) {
+			ref->surface->shared()->seed++;
+		}
+		seed = ref->surface->shared()->seed;
+		if (selector == kSurfaceMethodLock) {
+			ret = returnSurface(ref, false, args);
+		} else {
+			ret = kIOReturnSuccess;
+			if (args->structureOutput != NULL && args->structureOutputSize >= 4) {
+				memcpy(args->structureOutput, &seed, 4);
+				args->structureOutputSize = 4;
+			}
+		}
+		IOLockUnlock(gSurfaceLock);
+		return ret;
+	}
+
+	case kSurfaceMethodIncUseCount:                 /* (surface, category): as traps 0 and 1 */
+	case kSurfaceMethodDecUseCount:
+		return useCountCommon(sid, (uint32_t) scalarIn(args, 1), selector == kSurfaceMethodIncUseCount ? 1 : -1);
+
+	case kSurfaceMethodGetUseCount:                 /* (surface) -> both categories' counts, summed */
+	case kSurfaceMethodGetYCbCrMatrix:              /* (surface) -> the matrix (an attachment) */
+	case kSurfaceMethodIsTiled:
+	case kSurfaceMethodGetTileFormat:
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gSurfaceLock);
+		ref = findRef(sid, false);
+		if (ref != NULL) {
+			MiniIOSurface * s = ref->surface;
+
+			args->scalarOutput[0] = selector == kSurfaceMethodGetUseCount ? s->useCount[0] + s->useCount[1] :
+			    selector == kSurfaceMethodGetYCbCrMatrix ? s->shared()->attachments[MINISURF_ATTACHMENT_YCBCR] :
+			    selector == kSurfaceMethodIsTiled ? s->tiled : s->tileFormat;
+			args->scalarOutputCount = 1;
+		}
+		IOLockUnlock(gSurfaceLock);
+		return ref != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+
+	case kSurfaceMethodSetTiled:                    /* (surface, on): only surfaces made tileable (none here): unsupported */
+		IOLockLock(gSurfaceLock);
+		ref = findRef(sid, false);
+		IOLockUnlock(gSurfaceLock);
+		if (ref == NULL) {
+			return kIOReturnBadArgument;
+		}
+		return kIOReturnUnsupported;    /* (Apple's IOSurface::setTiled: only a surface made tileable may be) */
+
+	case kSurfaceMethodGetBulkAttachments:          /* (surface) -> the 0x84 bytes of attachments in a 160-byte record */
+		if (args->structureOutput == NULL || args->structureOutputSize < 0xa0) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gSurfaceLock);
+		ref = findRef(sid, false);
+		if (ref != NULL) {
+			bzero(args->structureOutput, 0xa0);
+			memcpy(args->structureOutput, ref->surface->shared()->attachments, MINISURF_ATTACHMENTS_SIZE);
+		}
+		IOLockUnlock(gSurfaceLock);
+		args->structureOutputSize = 0xa0;
+		return ref != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+
+	case kSurfaceMethodRemoveAttachments:           /* (surface, mask): as trap 9 */
+		return trapRemoveAttachments((void *) (uintptr_t) sid, (void *) (uintptr_t) scalarIn(args, 1), NULL, NULL, NULL, NULL);
+
+	case kSurfaceMethodRemoveCVBridged:             /* (surface) -> (0) */
+		ret = removeCVBridged(sid);
+		if (args->scalarOutputCount >= 1) {
+			args->scalarOutput[0] = 0;
+			args->scalarOutputCount = 1;
+		}
+		return ret;
+
+	case kSurfaceMethodSetCVBridgedKeys:            /* in: IOSurfaceValueArgs, an XML array of keys from 0xc */
+	{
+		IOMemoryMap * map = NULL;
+		const char * in = (const char *) args->structureInput;
+		size_t size = args->structureInputSize;
+
+		if (in == NULL && args->structureInputDescriptor != NULL) {
+			map = args->structureInputDescriptor->map(kIOMapReadOnly);
+			in = map != NULL ? (const char *) map->getVirtualAddress() : NULL;
+			size = map != NULL ? map->getLength() : 0;
+		}
+		ret = kIOReturnBadArgument;
+		if (in != NULL && size > 0xc && in[size - 1] == 0) {
+			OSObject * o = OSUnserializeXML(in + 0xc, size - 0xc);
+			OSArray * keys = OSDynamicCast(OSArray, o);
+
+			if (keys != NULL) {
+				OSSafeReleaseNULL(fCVBridgedKeys);
+				fCVBridgedKeys = OSArray::withArray(keys);
+				ret = kIOReturnSuccess;
+			}
+			OSSafeReleaseNULL(o);
+		}
+		OSSafeReleaseNULL(map);
+		return ret;
+	}
+
+	case kSurfaceMethodSetDataProperty:             /* (surface, index 0-5) + up to 1024 bytes */
+	case kSurfaceMethodGetDataProperty:             /* (surface, index) -> size (and the bytes, if there is room) */
+	case kSurfaceMethodClearDataProperties:         /* (surface) */
+	{
+		uint64_t index = scalarIn(args, 1);
+		IOMemoryMap * map = NULL;
+		const uint8_t * in = (const uint8_t *) args->structureInput;
+		size_t size = args->structureInputSize;
+
+		if (selector != kSurfaceMethodClearDataProperties && index >= 6) {
+			return kIOReturnBadArgument;
+		}
+		if (selector == kSurfaceMethodSetDataProperty && in == NULL && args->structureInputDescriptor != NULL) {
+			map = args->structureInputDescriptor->map(kIOMapReadOnly);
+			in = map != NULL ? (const uint8_t *) map->getVirtualAddress() : NULL;
+			size = map != NULL ? map->getLength() : 0;
+		}
+		if (selector == kSurfaceMethodSetDataProperty && (size > 1024 || (size != 0 && in == NULL))) {
+			OSSafeReleaseNULL(map);
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gSurfaceLock);
+		ref = findRef(sid, false);
+		ret = ref != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+		if (ref != NULL) {
+			MiniIOSurface * s = ref->surface;
+
+			if (selector == kSurfaceMethodSetDataProperty) {
+				if (s->dataProperty[index] != NULL) {
+					IOFree(s->dataProperty[index], s->dataPropertySize[index]);
+					s->dataProperty[index] = NULL;
+					s->dataPropertySize[index] = 0;
+				}
+				if (size != 0) {
+					s->dataProperty[index] = IOMalloc(size);
+					if (s->dataProperty[index] == NULL) {
+						ret = kIOReturnNoMemory;
+					} else {
+						memcpy(s->dataProperty[index], in, size);
+						s->dataPropertySize[index] = (uint32_t) size;
+						s->shared()->dataPropertyFlags |= 1u << index;
+					}
+				}
+			} else if (selector == kSurfaceMethodGetDataProperty) {
+				uint32_t have = s->dataPropertySize[index];
+
+				if (args->scalarOutputCount >= 1) {
+					args->scalarOutput[0] = have;
+					args->scalarOutputCount = 1;
+				}
+				if (args->structureOutput != NULL && args->structureOutputSize != 0 && have != 0) {
+					if (args->structureOutputSize < have) {
+						ret = kIOReturnOverrun;
+					} else {
+						memcpy(args->structureOutput, s->dataProperty[index], have);
+						args->structureOutputSize = have;
+					}
+				}
+			} else {
+				for (unsigned i = 0; i < 6; i++) {
+					if (s->dataProperty[i] != NULL) {
+						IOFree(s->dataProperty[i], s->dataPropertySize[i]);
+						s->dataProperty[i] = NULL;
+						s->dataPropertySize[i] = 0;
+					}
+				}
+				s->shared()->dataPropertyFlags = 0;
+			}
+		}
+		IOLockUnlock(gSurfaceLock);
+		OSSafeReleaseNULL(map);
+		return ret;
+	}
+
+	case kSurfaceMethodAppendTransaction:           /* (surface, event port, value, write) */
+		return appendTransaction(sid, (mach_port_name_t) scalarIn(args, 1), scalarIn(args, 2), scalarIn(args, 3) != 0);
+
+	case kSurfaceMethodPruneTransactions:           /* (surface) */
+		return pruneTransactions(sid);
+
+	case kSurfaceMethodQueryTransactions:           /* (surface, buffer, room, filter, prune) -> (copied, all, matching) */
+	{
+		uint64_t buffer = scalarIn(args, 1), room = scalarIn(args, 2), filter = scalarIn(args, 3);
+		bool prune = scalarIn(args, 4) != 0;
+		struct { uint64_t event; uint64_t value; uint8_t write, pad[7]; } out[32];
+		uint64_t all = 0, matching = 0, copied = 0;
+
+		if (args->scalarOutputCount < 3) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gSurfaceLock);
+		ref = findRef(sid, false);
+		if (ref != NULL) {
+			MiniIOSurface * s = ref->surface;
+
+			all = s->transactionCount;
+			for (unsigned i = 0; i < s->transactionCount; i++) {
+				bool write = s->transactions[i].write;
+				/* the filter (IOSurface::query_transaction_list): bit 0 leaves reads out, bit 1 writes */
+				bool take = write ? (filter & 2) == 0 : (filter & 1) == 0;
+
+				if (!take) {
+					continue;
+				}
+				matching++;
+				if (copied < room && copied < 32) {
+					mach_port_name_t name = 0;
+
+					s->transactions[i].event->retain();
+					IOLockUnlock(gSurfaceLock);
+					(void) IOUserClient::copyPortNameForObjectInTask(fTask, s->transactions[i].event, &name);
+					s->transactions[i].event->release();
+					IOLockLock(gSurfaceLock);
+					bzero(&out[copied], sizeof(out[copied]));
+					out[copied].event = name;
+					out[copied].value = s->transactions[i].value;
+					out[copied].write = write;
+					copied++;
+				}
+			}
+			if (prune) {
+				pruneLocked(s);
+			}
+		}
+		IOLockUnlock(gSurfaceLock);
+		if (ref == NULL) {
+			return kIOReturnBadArgument;
+		}
+		if (copied != 0 && (buffer == 0 || copyout(out, buffer, copied * sizeof(out[0])) != 0)) {
+			return kIOReturnBadArgument;
+		}
+		args->scalarOutput[0] = copied;
+		args->scalarOutput[1] = all;
+		args->scalarOutput[2] = matching;
+		args->scalarOutputCount = 3;
+		return kIOReturnSuccess;
+	}
+
+	case kSurfaceMethodSharedEventSignal:           /* (event port, value): as trap 7 */
+		return trapSharedEventSignal((void *) (uintptr_t) scalarIn(args, 0), (void *) (uintptr_t) scalarIn(args, 1), NULL, NULL,
+		           NULL, NULL);
+
+	case kSurfaceMethodSharedEventWait:             /* (event port, value, ms): as trap 6 */
+		return trapSharedEventWait((void *) (uintptr_t) scalarIn(args, 0), (void *) (uintptr_t) scalarIn(args, 1),
+		           (void *) (uintptr_t) scalarIn(args, 2), NULL, NULL, NULL);
+
+	case kSurfaceMethodSignalEventOperation:        /* (surface, operation, event port, value) */
+		return signalEventOperation(sid, scalarIn(args, 1), (mach_port_name_t) scalarIn(args, 2), scalarIn(args, 3));
+
+	case kSurfaceMethodAddEventNotifyPort:          /* async: the port shared-event notifications go to (one per refcon) */
+	{
+		AkiosEventNotifyPort * port;
+
+		if (args->asyncReference == NULL || fEventPorts == NULL) {
+			return kIOReturnBadArgument;
+		}
+		for (unsigned i = 0; i < fEventPorts->getCount(); i++) {
+			port = (AkiosEventNotifyPort *) fEventPorts->getObject(i);
+			if (port->refcon() == args->asyncReference[kIOAsyncCalloutRefconIndex]) {
+				return kIOReturnSuccess;
+			}
+		}
+		port = AkiosEventNotifyPort::withReference(args->asyncReference);
+		if (port == NULL) {
+			return kIOReturnNoMemory;
+		}
+		fEventPorts->setObject(port);
+		port->release();
+		return kIOReturnSuccess;
+	}
+
+	case kSurfaceMethodRemoveEventNotifyPort:       /* (refcon) */
+		if (fEventPorts != NULL) {
+			for (unsigned i = 0; i < fEventPorts->getCount(); i++) {
+				if (((AkiosEventNotifyPort *) fEventPorts->getObject(i))->refcon() == scalarIn(args, 0)) {
+					fEventPorts->removeObject(i);
+					return kIOReturnSuccess;
+				}
+			}
+		}
+		return kIOReturnBadArgument;
+
+	case kSurfaceMethodSharedEventNotify:           /* (event port, refcon, a, b, value): a message at that value */
+	{
+		IOSurfaceSharedEvent * e = IOSurfaceSharedEvent::fromPortName(fTask, (mach_port_name_t) scalarIn(args, 0));
+		AkiosEventNotifyPort * port = NULL;
+
+		if (e == NULL) {
+			return kIOReturnBadArgument;
+		}
+		for (unsigned i = 0; fEventPorts != NULL && i < fEventPorts->getCount(); i++) {
+			AkiosEventNotifyPort * p = (AkiosEventNotifyPort *) fEventPorts->getObject(i);
+
+			if (p->refcon() == scalarIn(args, 1)) {
+				port = p;
+			}
+		}
+		ret = port != NULL ? e->notifyAt(port, scalarIn(args, 4), scalarIn(args, 2), scalarIn(args, 3)) : kIOReturnBadArgument;
+		e->release();
+		return ret;
+	}
+
+	case kSurfaceMethodSetSurfaceNotify:            /* async + { reference, refcon, id }: kept (sent when a surface event
+	                                                 * comes -- none is made here yet) */
+	case kSurfaceMethodRemoveSurfaceNotify:         /* { ..., id }: forgotten */
+	{
+		uint64_t notify[3] = { 0, 0, 0 };
+
+		if (args->structureInput == NULL || args->structureInputSize < sizeof(notify)) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(notify, args->structureInput, sizeof(notify));
+		if (selector == kSurfaceMethodRemoveSurfaceNotify) {
+			for (unsigned i = 0; i < 16; i++) {
+				if (fSurfaceNotify[i].used && fSurfaceNotify[i].id == notify[1]) {
+					releaseAsyncReference64(fSurfaceNotify[i].ref);
+					fSurfaceNotify[i].used = false;
+					return kIOReturnSuccess;
+				}
+			}
+			return kIOReturnBadArgument;
+		}
+		if (args->asyncReference == NULL) {
+			return kIOReturnBadArgument;
+		}
+		for (unsigned i = 0; i < 16; i++) {
+			if (!fSurfaceNotify[i].used) {
+				setAsyncReference64(fSurfaceNotify[i].ref, (mach_port_t) args->asyncReference[0], notify[0], notify[1]);
+				fSurfaceNotify[i].id = notify[1];
+				fSurfaceNotify[i].used = true;
+				return kIOReturnSuccess;
+			}
+		}
+		return kIOReturnNoResources;
+	}
+
+	case kSurfaceMethodPrefetchPages:               /* the pixels are resident: nothing to fetch */
+	case kSurfaceMethodSetCmpTileDataUsed:          /* (surface, plane, bytes): compressed tiles are not made here */
+		IOLockLock(gSurfaceLock);
+		ref = findRef(sid, false);
+		if (ref != NULL && selector == kSurfaceMethodSetCmpTileDataUsed && scalarIn(args, 1) < 5) {
+			ref->surface->shared()->compressedMemoryUsed[scalarIn(args, 1)] = scalarIn(args, 2);
+		}
+		IOLockUnlock(gSurfaceLock);
+		return ref != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+
+	case kSurfaceMethodCommPageAddress:             /* no graphics comm page here: Apple's answer without one */
+		return kIOReturnNoMemory;
+
+	case kSurfaceMethodGatherData:                  /* diagnostics, for entitled clients only */
+		return kIOReturnNotPrivileged;
+
+	case kSurfaceMethodCreateMemoryPool:            /* memory pools, IOSurface around client memory, data values: not here */
+	case kSurfaceMethodEnsureMemoryPool:
+	case kSurfaceMethodFlushMemoryPool:
+	case kSurfaceMethodGatherMemoryPool:
+	case kSurfaceMethodGetDataValue:
+		return kIOReturnUnsupported;
+	}
+	return kIOReturnInvalid;
 }

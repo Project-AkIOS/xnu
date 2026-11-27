@@ -138,6 +138,17 @@ public:
 	uint32_t                        useCount[2];
 	uint32_t                        purgeable;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
+	/* (11-27) Apple's IOSurface state the user client keeps besides (IOSurface.kext, the macOS KDK's, decompiled) */
+	struct {
+		class IOSurfaceSharedEvent *    event;          /* held */
+		uint64_t                        value;          /* done once the event's value is at least this */
+		bool                            write;
+	} transactions[32];                             /* append_transaction / query / prune */
+	uint32_t                        transactionCount;
+	void *                          dataProperty[6];        /* set_data_property: index 0-5, up to 1024 bytes each */
+	uint32_t                        dataPropertySize[6];
+	bool                            tiled;
+	uint32_t                        tileFormat;
 
 	virtual bool
 	init(void) APPLE_KEXT_OVERRIDE
