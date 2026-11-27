@@ -65,6 +65,67 @@ enum {
 	kFBMethodGetBlock               = 79,
 	kFBMethodSwapCancelAll          = 81,
 	kFBMethodGetProtectionOptions   = 82,
+	/* (11-27) the rest of Apple's table (iOS 27.2.1: 101 entries, IOExternalMethodDispatch2022; names from the macOS
+	 * KDK's IOMobileGraphicsFamily, whose table matches entry for entry). Apple's own reserved entries: 1 2 9 21 32
+	 * 36-40 45 46 58 76; empty: 59-65 70 71. */
+	kFBMethodRotateSurface          = 0,
+	kFBMethodSetTVOutMode           = 10,
+	kFBMethodSetWSSInfo             = 11,
+	kFBMethodEnableStats            = 13,
+	kFBMethodSetFlags               = 14,
+	kFBMethodSetDebugFlags          = 15,
+	kFBMethodSetTVOutSignalType     = 16,
+	kFBMethodSetGammaTable          = 17,
+	kFBMethodSetWhiteOnBlackMode    = 19,
+	kFBMethodSetDisplayDevice       = 22,
+	kFBMethodSetDigitalOutMode      = 23,
+	kFBMethodGetHDCPDownstreamState = 24,
+	kFBMethodPrintDisplayRegs       = 26,
+	kFBMethodGetGammaTable          = 27,
+	kFBMethodSetDithering           = 30,
+	kFBMethodSetUnderrunColor       = 31,
+	kFBMethodSetVideoPowerSavings   = 33,
+	kFBMethodSetVideoDACGain        = 34,
+	kFBMethodSetLine21Data          = 35,
+	kFBMethodEnableMirroring        = 41,
+	kFBMethodGetMirroringCapability = 42,
+	kFBMethodSetRenderingAngle      = 43,
+	kFBMethodSetOverscanSafeRegion  = 44,
+	kFBMethodHDCPSendRequest        = 47,
+	kFBMethodHDCPGetReply           = 48,
+	kFBMethodSurfaceIsReplaceable   = 49,
+	kFBMethodSetBrightnessCorrection = 50,
+	kFBMethodSetColorRemapMode      = 51,
+	kFBMethodSetCanvasSize          = 53,
+	kFBMethodGetMatrix              = 54,
+	kFBMethodSetMatrix              = 55,
+	kFBMethodKernelTests            = 56,
+	kFBMethodSPLCSetBrightness      = 66,
+	kFBMethodSPLCGetBrightness      = 67,
+	kFBMethodSetParameter           = 68,
+	kFBMethodSwapSetColorMatrix     = 69,
+	kFBMethodFactoryPortal          = 75,
+	kFBMethodSetBlock               = 78,
+	kFBMethodGetLinkQuality         = 80,
+	kFBMethodDisplayedFBSurface     = 83,
+	kFBMethodSetContrast            = 84,
+	kFBMethodGetBufBlock            = 85,
+	kFBMethodCreateGainMap          = 86,
+	kFBMethodAnnounceNextSwapPTS    = 87,
+	kFBMethodMapDisplayType         = 88,
+	kFBMethodSetClamshellState      = 89,
+	kFBMethodGetDotPitchFloat       = 90,
+	kFBMethodSwapGetCurrent         = 91,
+	kFBMethodSwapCancelAllGetCurrent = 92,
+	kFBMethodStartTask              = 93,
+	kFBMethodAbortTask              = 94,
+	kFBMethodCheckTaskStatus        = 95,
+	kFBMethodGetBlockSize           = 96,
+	kFBMethodAbortBlock             = 97,
+	kFBMethodGetLPRFrameTimestamp   = 98,
+	kFBMethodCreateLPRMetadata      = 99,
+	kFBMethodSetGainMapCapBuffer    = 100,
+	kFBMethodCount                  = 101,
 };
 
 /* The swap request (IOMobileFramebufferSwapEnd): 0x46c bytes, of which we read these. */
@@ -457,6 +518,31 @@ static inline uint32_t refreshHz(void);
  * half drawn, and with three buffers drawing never waits for the panel.
  */
 extern "C" {
+/*
+ * (11-27) The panel's colour as iOS sets it through the framebuffer (Apple's IOMobileFramebufferUserClient selectors
+ * 17/27 gamma table, 54/55 matrices, 51/57 colour remap, 19 white on black, 84 contrast, 50 brightness correction,
+ * 30 dithering, 69 the swap's colour matrix): the device's display driver applies what its hardware can (the Pixel
+ * 8a's: DECON0's DQE -- gamma matrix and regamma LUT), every time any of it changes. Values exactly as iOS gave them.
+ */
+struct hakios_display_color {
+	uint32_t        have;                   /* HDC_* bits: which of the below iOS has set */
+	uint32_t        gamma[3][257];          /* IOMFBGammaTable: red, green, blue, 257 entries each */
+	uint64_t        matrix[9];              /* the last set_matrix (selector 55): 3x3 */
+	uint32_t        matrix_location;        /* its IOMFB_MatrixLocation */
+	uint32_t        remap_mode;             /* DisplayColorRemapMode (0 normal) */
+	uint32_t        white_on_black;
+	uint32_t        contrast;               /* a float's bits */
+	uint32_t        brightness_correction;  /* 16.16 */
+	uint32_t        dither;
+};
+#define HDC_GAMMA       0x01
+#define HDC_MATRIX      0x02
+#define HDC_REMAP       0x04
+#define HDC_INVERT      0x08
+#define HDC_CONTRAST    0x10
+#define HDC_BRIGHTNESS  0x20
+#define HDC_DITHER      0x40
+
 struct hakios_display_ops {
 	int (*buffers)(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *height, uint32_t *row_bytes);
 	void (*flip)(unsigned index);
@@ -476,6 +562,8 @@ struct hakios_display_ops {
 	 * light on or off (backboardd's RequestPowerChange: the screen locked, auto-lock); neither waits */
 	void (*brightness)(uint32_t nits16);
 	void (*power)(bool on);
+	/* (optional, 11-27) the colour iOS asked for (struct hakios_display_color): applied where the hardware can */
+	void (*color)(const struct hakios_display_color *c);
 };
 const struct hakios_display_ops * hakios_display_ops;
 /*
@@ -2943,6 +3031,62 @@ counted:
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
+/*
+ * (11-27) The rest of Apple's framebuffer interface: state the panel keeps between calls (one panel), and the selectors'
+ * names for the trace (fbtrace=N: each selector's first N calls, with the caller, the arguments and the answer).
+ */
+static const char * const kFBNames[kFBMethodCount] = {
+	"rotate_surface", "reserved", "reserved", "default_fb_surface", "swap_start", "swap_submit", "swap_wait",
+	"get_framebuffer_id", "get_display_size", "reserved", "set_tvout_mode", "set_wss_info", "request_power_change",
+	"enable_stats", "set_flags", "set_debug_flags", "set_tvout_signaltype", "set_gamma_table", "is_main_display",
+	"set_white_on_black_mode", "swap_signal", "reserved", "set_display_device", "set_digital_out_mode",
+	"get_HDCP_downstream_state", "get_digital_out_state", "printDisplayRegs", "get_gamma_table", "get_dot_pitch",
+	"get_display_area", "enable_disable_dithering", "set_underrun_color", "reserved",
+	"enable_disable_video_power_savings", "set_video_dac_gain", "set_line21_data", "reserved", "reserved", "reserved",
+	"reserved", "reserved", "enableInternalToExternalMirroring", "getExternalMirroringCapability", "setRenderingAngle",
+	"setOverscanSafeRegion", "reserved", "reserved", "hdcp_send_request", "hdcp_get_reply", "surface_is_replaceable",
+	"set_brightness_correction", "set_color_remap_mode", "swap_cancel", "set_canvas_size", "get_matrix", "set_matrix",
+	"kernel_tests", "get_color_remap_mode", "reserved", "-", "-", "-", "-", "-", "-", "-", "splc_set_brightness",
+	"splc_get_brightness", "set_parameter", "swap_set_color_matrix", "-", "-", "set_notify", "set_tag_mask",
+	"supported_frame_info", "factory_portal", "reserved", "get_current_absolute_time", "set_block", "get_block",
+	"get_link_quality", "swap_cancel_all", "get_protection_options", "displayed_fb_surface", "set_contrast",
+	"get_buf_block", "create_gain_map", "announce_next_swap_pts", "map_display_type", "set_clamshell_state",
+	"get_dot_pitch_float", "swap_get_current", "swap_cancel_all_get_current", "start_task", "abort_task",
+	"check_task_status", "get_block_size", "abort_block", "get_lpr_frame_timestamp", "create_lpr_metadata",
+	"set_gain_map_cap_buffer",
+};
+
+#define FB_PARAMS       16                      /* set_parameter: the last value of each of so many names */
+#define FB_PARAM_BYTES  64
+#define FB_BLOCKS       8                       /* set_block: the last of so many blocks */
+#define FB_BLOCK_BYTES  512
+
+static struct {
+	IOLock *                        lock;
+	struct hakios_display_color     color;
+	uint64_t                        matrices[16][9];        /* by IOMFB_MatrixLocation */
+	uint32_t                        matrix_set;             /* bit per location set */
+	uint8_t                         swap_color_matrix[136]; /* swap_set_color_matrix: IOMFBColorFixedMatrix + function */
+	bool                            have_swap_color_matrix;
+	uint64_t                        flags, debug_flags;
+	uint32_t                        stats, display_device, display_type, video_power_savings, underrun_color;
+	uint32_t                        canvas[2];
+	uint32_t                        splc_brightness;
+	uint32_t                        clamshell;
+	uint64_t                        next_swap_pts;
+	struct { uint32_t name, size; uint8_t data[FB_PARAM_BYTES]; } params[FB_PARAMS];
+	struct { uint32_t id, size; uint8_t data[FB_BLOCK_BYTES]; } blocks[FB_BLOCKS];
+} gFB;
+
+/* the colour to the display driver (its hardware), after every change */
+static void
+fbColorChanged(void)
+{
+	if (hakios_display_ops != NULL && hakios_display_ops->color != NULL) {
+		hakios_display_ops->color(&gFB.color);
+	}
+}
+
 class IOMobileFramebufferUserClient;
 static IOLock *gFrameInfoLock;                          /* around the next */
 static IOMobileFramebufferUserClient *gFrameInfoClient; /* who turned frame info on (the window server); NULL: nobody */
@@ -2980,6 +3124,8 @@ public:
 	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
 	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
+private:
+	IOReturn dispatchMethod(uint32_t selector, IOExternalMethodArguments * args);
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
@@ -3006,6 +3152,13 @@ IOMobileFramebufferUserClient::start(IOService * provider)
 		IOLock *lock = IOLockAlloc();
 
 		if (!OSCompareAndSwapPtr(NULL, lock, &gFrameInfoLock)) {
+			IOLockFree(lock);
+		}
+	}
+	if (gFB.lock == NULL) {         /* (11-27) the panel's kept state */
+		IOLock *lock = IOLockAlloc();
+
+		if (!OSCompareAndSwapPtr(NULL, lock, &gFB.lock)) {
 			IOLockFree(lock);
 		}
 	}
@@ -3266,21 +3419,32 @@ IOReturn
 IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
 {
-	const uint64_t * in = args->scalarInput;
-	uint64_t * out = args->scalarOutput;
-	MiniIOSurface * s;
+	IOReturn ret = dispatchMethod(selector, args);
 
+	/* (11-27) the trace: which call, whose, with what, and what it got (fbtrace=N: each selector's first N calls) */
 	if (selector < 128 && gFBCalls[selector] < gFBTrace) {
 		char procname[32] = "?";
+		const uint64_t * in = args->scalarInput;
+		const uint64_t * out = args->scalarOutput;
 
 		gFBCalls[selector]++;
 		proc_selfname(procname, sizeof(procname));
-		IOLog("MiniIOMobileFramebuffer: %s[%d] selector %u (scalars %u in [0x%llx 0x%llx 0x%llx 0x%llx], %u out; "
-		    "structure %u in, %u out)\n", procname, proc_selfpid(), selector, args->scalarInputCount,
-		    args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
-		    args->scalarInputCount > 2 ? in[2] : 0, args->scalarInputCount > 3 ? in[3] : 0, args->scalarOutputCount,
-		    args->structureInputSize, args->structureOutputSize);
+		IOLog("MiniIOMobileFramebuffer: %s[%d] %u %s (in %u [0x%llx 0x%llx 0x%llx 0x%llx] + %u bytes; out %u [0x%llx 0x%llx] + "
+		    "%u bytes) = %#x\n", procname, proc_selfpid(), selector, selector < kFBMethodCount ? kFBNames[selector] : "?",
+		    args->scalarInputCount, args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
+		    args->scalarInputCount > 2 ? in[2] : 0, args->scalarInputCount > 3 ? in[3] : 0, args->structureInputSize,
+		    args->scalarOutputCount, args->scalarOutputCount > 0 ? out[0] : 0, args->scalarOutputCount > 1 ? out[1] : 0,
+		    args->structureOutputSize, ret);
 	}
+	return ret;
+}
+
+IOReturn
+IOMobileFramebufferUserClient::dispatchMethod(uint32_t selector, IOExternalMethodArguments * args)
+{
+	const uint64_t * in = args->scalarInput;
+	uint64_t * out = args->scalarOutput;
+	MiniIOSurface * s;
 
 	switch (selector) {
 	case kFBMethodGetDisplaySize:                   /* out: width, height */
@@ -3479,6 +3643,383 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		args->scalarOutputCount = 1;
 		return kIOReturnSuccess;
 
+	/* ---- (11-27) the rest of Apple's table ---- */
+
+	/* colour: kept exactly as given, read back as given, handed to the display driver's hardware (fbColorChanged) */
+	case kFBMethodSetGammaTable:                    /* in: IOMFBGammaTable, 3 x 257 32-bit entries */
+		if (args->structureInput == NULL || args->structureInputSize < sizeof(gFB.color.gamma)) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gFB.lock);
+		memcpy(gFB.color.gamma, args->structureInput, sizeof(gFB.color.gamma));
+		gFB.color.have |= HDC_GAMMA;
+		IOLockUnlock(gFB.lock);
+		IOLog("MiniIOMobileFramebuffer: gamma table: red %u %u %u .. %u, green .. %u, blue .. %u\n", gFB.color.gamma[0][0],
+		    gFB.color.gamma[0][1], gFB.color.gamma[0][128], gFB.color.gamma[0][256], gFB.color.gamma[1][256],
+		    gFB.color.gamma[2][256]);
+		fbColorChanged();
+		return kIOReturnSuccess;
+
+	case kFBMethodGetGammaTable:                    /* out: the table last set; before that the panel's own, identity */
+		if (args->structureOutput == NULL || args->structureOutputSize < sizeof(gFB.color.gamma)) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gFB.lock);
+		if (!(gFB.color.have & HDC_GAMMA)) {
+			/*
+			 * (11-27) An iPhone's DCP firmware answers with the panel's table; backboardd sets one only after reading
+			 * it (with "unsupported" it set none). Identity, 0..1023 (10 bits: a guess -- the scale is not in the
+			 * kernel; the trace logs what backboardd sets back, and the display driver normalises each channel by its
+			 * last entry, so the scale does not change the picture).
+			 */
+			for (unsigned c = 0; c < 3; c++) {
+				for (unsigned i = 0; i < 257; i++) {
+					gFB.color.gamma[c][i] = MIN(i * 4, 1023u);
+				}
+			}
+		}
+		memcpy(args->structureOutput, gFB.color.gamma, sizeof(gFB.color.gamma));
+		IOLockUnlock(gFB.lock);
+		return kIOReturnSuccess;
+
+	case kFBMethodSetMatrix:                        /* in: IOMFB_MatrixLocation; 3x3 of 64-bit fixed point */
+		if (args->scalarInputCount < 1 || in[0] >= 16 || args->structureInput == NULL ||
+		    args->structureInputSize < sizeof(gFB.matrices[0])) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gFB.lock);
+		memcpy(gFB.matrices[in[0]], args->structureInput, sizeof(gFB.matrices[0]));
+		gFB.matrix_set |= 1u << in[0];
+		memcpy(gFB.color.matrix, gFB.matrices[in[0]], sizeof(gFB.color.matrix));
+		gFB.color.matrix_location = (uint32_t) in[0];
+		gFB.color.have |= HDC_MATRIX;
+		IOLockUnlock(gFB.lock);
+		IOLog("MiniIOMobileFramebuffer: matrix %llu: %#llx %#llx %#llx / %#llx %#llx %#llx / %#llx %#llx %#llx\n", in[0],
+		    gFB.color.matrix[0], gFB.color.matrix[1], gFB.color.matrix[2], gFB.color.matrix[3], gFB.color.matrix[4],
+		    gFB.color.matrix[5], gFB.color.matrix[6], gFB.color.matrix[7], gFB.color.matrix[8]);
+		fbColorChanged();
+		return kIOReturnSuccess;
+
+	case kFBMethodGetMatrix:                        /* in: location; out: that matrix, if one was set there */
+		if (args->scalarInputCount < 1 || in[0] >= 16 || args->structureOutput == NULL ||
+		    args->structureOutputSize < sizeof(gFB.matrices[0])) {
+			return kIOReturnBadArgument;
+		}
+		if (!(gFB.matrix_set & (1u << in[0]))) {
+			return kIOReturnUnsupported;
+		}
+		IOLockLock(gFB.lock);
+		memcpy(args->structureOutput, gFB.matrices[in[0]], sizeof(gFB.matrices[0]));
+		IOLockUnlock(gFB.lock);
+		return kIOReturnSuccess;
+
+	case kFBMethodSwapSetColorMatrix:               /* in: IOMFBColorFixedMatrix with its function and flags (136 bytes) */
+		if (args->structureInput == NULL || args->structureInputSize < sizeof(gFB.swap_color_matrix)) {
+			return kIOReturnBadArgument;
+		}
+		IOLockLock(gFB.lock);
+		memcpy(gFB.swap_color_matrix, args->structureInput, sizeof(gFB.swap_color_matrix));
+		gFB.have_swap_color_matrix = true;
+		IOLockUnlock(gFB.lock);
+		return kIOReturnSuccess;
+
+	case kFBMethodSetColorRemapMode:                /* in: DisplayColorRemapMode (accessibility: invert, grayscale) */
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		gFB.color.remap_mode = (uint32_t) in[0];
+		gFB.color.have |= HDC_REMAP;
+		fbColorChanged();
+		return kIOReturnSuccess;
+
+	case kFBMethodGetColorRemapMode:                /* out: the mode (0 normal until set) */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = gFB.color.remap_mode;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSetWhiteOnBlackMode:              /* in: 1 inverted colours */
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		gFB.color.white_on_black = (uint32_t) in[0];
+		gFB.color.have |= HDC_INVERT;
+		fbColorChanged();
+		return kIOReturnSuccess;
+
+	case kFBMethodSetContrast:                      /* in: a float */
+		if (args->structureInput == NULL || args->structureInputSize < 4) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(&gFB.color.contrast, args->structureInput, 4);
+		gFB.color.have |= HDC_CONTRAST;
+		fbColorChanged();
+		return kIOReturnSuccess;
+
+	case kFBMethodSetBrightnessCorrection:          /* in: 16.16 factor, and a second word (0) */
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		gFB.color.brightness_correction = (uint32_t) in[0];
+		gFB.color.have |= HDC_BRIGHTNESS;
+		fbColorChanged();
+		return kIOReturnSuccess;
+
+	case kFBMethodSetDithering:                     /* in: 1 on */
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		gFB.color.dither = (uint32_t) in[0];
+		gFB.color.have |= HDC_DITHER;
+		fbColorChanged();
+		return kIOReturnSuccess;
+
+	/* settings the panel keeps (no hardware behind them here) */
+	case kFBMethodSetFlags:                         /* in: mask, value; out: the flags before */
+	case kFBMethodSetDebugFlags:
+		if (args->scalarInputCount < 2) {
+			return kIOReturnBadArgument;
+		}
+		{
+			uint64_t * f = selector == kFBMethodSetFlags ? &gFB.flags : &gFB.debug_flags;
+
+			if (args->scalarOutputCount >= 1) {
+				out[0] = *f;
+				args->scalarOutputCount = 1;
+			}
+			*f = (*f & ~in[0]) | (in[1] & in[0]);
+		}
+		return kIOReturnSuccess;
+
+	case kFBMethodEnableStats:
+	case kFBMethodSetDisplayDevice:
+	case kFBMethodSetUnderrunColor:
+	case kFBMethodSetVideoPowerSavings:
+	case kFBMethodMapDisplayType:
+	case kFBMethodSetClamshellState:
+	case kFBMethodAnnounceNextSwapPTS:
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		switch (selector) {
+		case kFBMethodEnableStats: gFB.stats = (uint32_t) in[0]; break;
+		case kFBMethodSetDisplayDevice: gFB.display_device = (uint32_t) in[0]; break;
+		case kFBMethodSetUnderrunColor: gFB.underrun_color = (uint32_t) in[0]; break;
+		case kFBMethodSetVideoPowerSavings: gFB.video_power_savings = (uint32_t) in[0]; break;
+		case kFBMethodMapDisplayType: gFB.display_type = (uint32_t) in[0]; break;
+		case kFBMethodSetClamshellState: gFB.clamshell = (uint32_t) in[0]; break;
+		default: gFB.next_swap_pts = in[0]; break;
+		}
+		return kIOReturnSuccess;
+
+	case kFBMethodSetCanvasSize:                    /* in: width, height */
+		if (args->scalarInputCount < 2) {
+			return kIOReturnBadArgument;
+		}
+		gFB.canvas[0] = (uint32_t) in[0];
+		gFB.canvas[1] = (uint32_t) in[1];
+		return kIOReturnSuccess;
+
+	case kFBMethodSPLCSetBrightness:                /* in: level, and a second word; kept, and given to the panel */
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		gFB.splc_brightness = (uint32_t) in[0];
+		return kIOReturnSuccess;
+
+	case kFBMethodSPLCGetBrightness:
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = gFB.splc_brightness;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSetParameter:                     /* in: IOMFBParameterName; its value (bytes): the last of each kept */
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		{
+			const uint8_t * data = (const uint8_t *) args->structureInput;
+			uint32_t size = args->structureInputSize, name = (uint32_t) in[0];
+			IOMemoryMap * map = NULL;
+			unsigned slot = FB_PARAMS;
+
+			if (data == NULL && args->structureInputDescriptor != NULL) {
+				map = args->structureInputDescriptor->map(kIOMapReadOnly);
+				data = map != NULL ? (const uint8_t *) map->getVirtualAddress() : NULL;
+				size = map != NULL ? (uint32_t) map->getLength() : 0;
+			}
+			IOLockLock(gFB.lock);
+			for (unsigned i = 0; i < FB_PARAMS && slot == FB_PARAMS; i++) {
+				if (gFB.params[i].size == 0 || gFB.params[i].name == name) {
+					slot = i;
+				}
+			}
+			if (slot < FB_PARAMS) {
+				gFB.params[slot].name = name;
+				gFB.params[slot].size = (uint32_t) MIN(size, FB_PARAM_BYTES);
+				if (data != NULL) {
+					memcpy(gFB.params[slot].data, data, gFB.params[slot].size);
+				}
+			}
+			IOLockUnlock(gFB.lock);
+			OSSafeReleaseNULL(map);
+		}
+		return kIOReturnSuccess;
+
+	case kFBMethodSetBlock:                         /* in: block id, ...; its bytes: the last of each kept for get_block */
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		{
+			const uint8_t * data = (const uint8_t *) args->structureInput;
+			uint32_t size = args->structureInputSize, id = (uint32_t) in[0];
+			IOMemoryMap * map = NULL;
+			unsigned slot = FB_BLOCKS;
+
+			if (data == NULL && args->structureInputDescriptor != NULL) {
+				map = args->structureInputDescriptor->map(kIOMapReadOnly);
+				data = map != NULL ? (const uint8_t *) map->getVirtualAddress() : NULL;
+				size = map != NULL ? (uint32_t) map->getLength() : 0;
+			}
+			IOLockLock(gFB.lock);
+			for (unsigned i = 0; i < FB_BLOCKS && slot == FB_BLOCKS; i++) {
+				if (gFB.blocks[i].size == 0 || gFB.blocks[i].id == id) {
+					slot = i;
+				}
+			}
+			if (slot < FB_BLOCKS) {
+				gFB.blocks[slot].id = id;
+				gFB.blocks[slot].size = (uint32_t) MIN(size, FB_BLOCK_BYTES);
+				if (data != NULL) {
+					memcpy(gFB.blocks[slot].data, data, gFB.blocks[slot].size);
+				}
+			}
+			IOLockUnlock(gFB.lock);
+			OSSafeReleaseNULL(map);
+		}
+		return kIOReturnSuccess;
+
+	case kFBMethodGetBlockSize:                     /* in: block id; out: its size (a block set, or the mode blocks) */
+		if (args->scalarInputCount < 1 || args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = (in[0] == 0x40 || in[0] == 0x41) ? 44 : 0;
+		for (unsigned i = 0; i < FB_BLOCKS; i++) {
+			if (gFB.blocks[i].size != 0 && gFB.blocks[i].id == in[0]) {
+				out[0] = gFB.blocks[i].size;
+			}
+		}
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodAbortBlock:
+		return kIOReturnSuccess;
+
+	/* queries */
+	case kFBMethodSurfaceIsReplaceable:             /* in: surface id; out: 1 unless the panel is showing it */
+		if (args->scalarInputCount < 1 || args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = (uint32_t) in[0] != gNewestSwapSurface;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodDisplayedFBSurface:               /* in: layer; out: the surface the panel shows (layer 0) */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = (args->scalarInputCount < 1 || in[0] == 0) ? gNewestSwapSurface : 0;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSwapGetCurrent:                   /* out: the newest swap's number */
+	case kFBMethodSwapCancelAllGetCurrent:          /* (swaps are shown as they come: none waits to be cancelled) */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = (uint32_t) fOwner->fSwapID;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodGetDotPitchFloat:                 /* out: pixels per inch, a float's bits */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		{
+			/* (no floating point in the kernel) 476 as an IEEE single: 0x43ee0000 */
+			uint32_t bits = 0, v = kFBDotsPerInch, e = 31;
+
+			while (!(v & 0x80000000u)) {
+				v <<= 1;
+				e--;
+			}
+			bits = ((e + 127) << 23) | ((v >> 8) & 0x7fffff);
+			out[0] = bits;
+		}
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodGetLinkQuality:                   /* out: the panel's link: DSI, no errors counted as lost */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = 0;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodGetLPRFrameTimestamp:             /* out: 0, as Apple's base framebuffer (no low-power refresh) */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = 0;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodGetHDCPDownstreamState:           /* out: no downstream (external) receiver */
+	case kFBMethodGetMirroringCapability:           /* out: no external mirroring */
+		if (args->structureOutput == NULL) {
+			return kIOReturnBadArgument;
+		}
+		bzero(args->structureOutput, args->structureOutputSize);
+		return kIOReturnSuccess;
+
+	case kFBMethodGetBufBlock:
+		return kIOReturnUnsupported;
+
+	case kFBMethodPrintDisplayRegs:                 /* the panel's state, to the log */
+		IOLog("MiniIOMobileFramebuffer: %ux%u, swap %u, surface %u, colour have %#x (remap %u, invert %u, dither %u)\n",
+		    fOwner->fWidth, fOwner->fHeight, (uint32_t) fOwner->fSwapID, gNewestSwapSurface, gFB.color.have,
+		    gFB.color.remap_mode, gFB.color.white_on_black, gFB.color.dither);
+		return kIOReturnSuccess;
+
+	/* what a phone's own panel has not: TV out, external digital out, HDCP, mirroring to an external display, HDR
+	 * gain maps and low-power-refresh metadata (Apple's base: unsupported), factory and calibration tasks */
+	case kFBMethodRotateSurface:
+	case kFBMethodSetTVOutMode:
+	case kFBMethodSetWSSInfo:
+	case kFBMethodSetTVOutSignalType:
+	case kFBMethodSetDigitalOutMode:
+	case kFBMethodSetVideoDACGain:
+	case kFBMethodSetLine21Data:
+	case kFBMethodEnableMirroring:
+	case kFBMethodSetRenderingAngle:
+	case kFBMethodSetOverscanSafeRegion:
+	case kFBMethodHDCPSendRequest:
+	case kFBMethodHDCPGetReply:
+	case kFBMethodKernelTests:
+	case kFBMethodFactoryPortal:
+	case kFBMethodCreateGainMap:
+	case kFBMethodStartTask:
+	case kFBMethodAbortTask:
+	case kFBMethodCheckTaskStatus:
+	case kFBMethodCreateLPRMetadata:
+	case kFBMethodSetGainMapCapBuffer:
+		return kIOReturnUnsupported;
+
 	default:
 		break;
 	}
@@ -3490,14 +4031,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, args->scalarOutputCount,
 		    args->structureInputSize, args->structureOutputSize);
 	}
-	/* a request that only sets something is accepted; one that wants an answer gets zeros */
-	if (args->scalarOutputCount != 0) {
-		bzero(out, args->scalarOutputCount * sizeof(out[0]));
-	}
-	if (args->structureOutput != NULL && args->structureOutputSize != 0) {
-		bzero(args->structureOutput, args->structureOutputSize);
-	}
-	return kIOReturnSuccess;
+	/* (11-27) Apple's reserved entries and anything past the table: as Apple's -- no answer made up */
+	return selector < kFBMethodCount ? kIOReturnUnsupported : kIOReturnBadArgument;
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */

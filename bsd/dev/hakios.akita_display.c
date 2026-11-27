@@ -1268,6 +1268,31 @@ panel_commands(void)
 	}
 }
 
+/*
+ * (11-27) The panel's colour as iOS sets it through the framebuffer (Apple's IOMobileFramebufferUserClient selectors
+ * 17/27 gamma table, 54/55 matrices, 51/57 colour remap, 19 white on black, 84 contrast, 50 brightness correction,
+ * 30 dithering, 69 the swap's colour matrix): the device's display driver applies what its hardware can (the Pixel
+ * 8a's: DECON0's DQE -- gamma matrix and regamma LUT), every time any of it changes. Values exactly as iOS gave them.
+ */
+struct hakios_display_color {
+	uint32_t        have;                   /* HDC_* bits: which of the below iOS has set */
+	uint32_t        gamma[3][257];          /* IOMFBGammaTable: red, green, blue, 257 entries each */
+	uint64_t        matrix[9];              /* the last set_matrix (selector 55): 3x3 */
+	uint32_t        matrix_location;        /* its IOMFB_MatrixLocation */
+	uint32_t        remap_mode;             /* DisplayColorRemapMode (0 normal) */
+	uint32_t        white_on_black;
+	uint32_t        contrast;               /* a float's bits */
+	uint32_t        brightness_correction;  /* 16.16 */
+	uint32_t        dither;
+};
+#define HDC_GAMMA       0x01
+#define HDC_MATRIX      0x02
+#define HDC_REMAP       0x04
+#define HDC_INVERT      0x08
+#define HDC_CONTRAST    0x10
+#define HDC_BRIGHTNESS  0x20
+#define HDC_DITHER      0x40
+
 struct hakios_display_ops {
 	int (*buffers)(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *height, uint32_t *row_bytes);
 	void (*flip)(unsigned index);
@@ -1280,11 +1305,12 @@ struct hakios_display_ops {
 	bool (*wait_scanned)(uint64_t base, uint32_t us);
 	void (*brightness)(uint32_t nits16);
 	void (*power)(bool on);
+	void (*color)(const struct hakios_display_color *c);
 };
 extern const struct hakios_display_ops *hakios_display_ops;     /* MiniIOMobileFramebuffer's */
 static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip, display_shown, display_refresh_hz,
 	                                                     display_vblank_time, display_slot, display_scanout, display_scanned,
-	                                                     display_wait_scanned, display_brightness, display_power };
+	                                                     display_wait_scanned, display_brightness, display_power, NULL /* color: DQE, next */ };
 
 /*
  * The DPP's scaler, tried on its own (display_scale=1, without display_flip; display_scale_delay= seconds, 60): DPP0 made
