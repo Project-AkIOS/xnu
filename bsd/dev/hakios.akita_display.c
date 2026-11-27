@@ -1424,7 +1424,8 @@ display_color(const struct hakios_display_color *c)
 		uint32_t test = 0;
 
 		if (PE_parse_boot_argn("dqe_test", &test, sizeof(test)) && test) {
-			static const int32_t red[9] = { 1024, 0, 0, 0, 0, 0, 0, 0, 0 }, zero[3] = { 0, 0, 0 };
+			/* (B, G, R: the last coefficient is red's -- a red screen confirms the order) */
+			static const int32_t red[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 1024 }, zero[3] = { 0, 0, 0 };
 
 			printf("akita_display: dqe: TEST: the red channel alone for 15 s\n");
 			dqe_set_matrix(red, zero);
@@ -1435,8 +1436,12 @@ display_color(const struct hakios_display_color *c)
 	if (on >= 2 && (c->have & HDC_MATRIX)) {        /* dqe=2: iOS's matrix too (dqe=1: identity only, the first look) */
 		int32_t m[9], zero[3] = { 0, 0, 0 };
 
-		for (int i = 0; i < 9; i++) {
-			m[i] = (int32_t)((int64_t)c->matrix[i] >> 22);  /* 32.32 -> 1.0 = 1024 */
+		/* 32.32 -> 1.0 = 1024; and the DQE's channels are B, G, R (11-27, the tester's video of dqe_test=1: the
+		 * "red alone" matrix left blue alone, at the right brightness): rows and columns reversed */
+		for (int r = 0; r < 3; r++) {
+			for (int k = 0; k < 3; k++) {
+				m[(2 - r) * 3 + (2 - k)] = (int32_t)((int64_t)c->matrix[r * 3 + k] >> 22);
+			}
 		}
 		dqe_set_matrix(m, zero);
 	}
