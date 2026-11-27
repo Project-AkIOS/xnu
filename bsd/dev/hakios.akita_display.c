@@ -44,6 +44,19 @@ static const struct {
 	{ "dpp0.dpp", 0x19930000, 0x000, 0x0c0 },
 	{ "decon0.main", 0x19470000, 0x400, 0x440 },
 	{ "dpp0.rdma", 0x19900000, 0x400, 0x4a0 },
+	/* (11-27) the colour block for iOS's matrices and gamma tables: DECON0's DATA_PATH_CON_0 (bits 15:12, the
+	 * enhance path: 2 = through the DQE) and its shadow, then the DQE (Android's drmdecon "dqe" reg, 0x194d0000):
+	 * top and version, gamma matrix (0xc00), degamma (0x1000), linear matrix (0x1400), regamma 0 (0x2000), and the
+	 * CGC's control (0x194f0000). Register names: Google's cal_9865 regs-dqe.h / regs-decon.h (read as documentation) */
+	{ "decon0.path", 0x19470000, 0x200, 0x210 },
+	{ "decon0.pathsh", 0x19470000, 0xa00, 0xa10 },
+	{ "dqe.top", 0x194d0000, 0x000, 0x020 },
+	{ "dqe.ver", 0x194d0000, 0x0f0, 0x100 },
+	{ "dqe.gmatrix", 0x194d0000, 0xc00, 0xc20 },
+	{ "dqe.degamma", 0x194d0000, 0x1000, 0x1010 },
+	{ "dqe.lmatrix", 0x194d0000, 0x1400, 0x1420 },
+	{ "dqe.regamma0", 0x194d0000, 0x2000, 0x2120 },
+	{ "dqe.cgc", 0x194f0000, 0x000, 0x010 },
 	/* not the SysMMU in front of DPUF0 (0x19840000): reading it restarts the phone (secure, or closed to the kernel); DPP0
 	 * reads physical addresses as the bootloader left it (RDMA_BASEADDR_P0 = 0xfac00000), so it is bypassed */
 };
@@ -1293,6 +1306,88 @@ struct hakios_display_color {
 #define HDC_BRIGHTNESS  0x20
 #define HDC_DITHER      0x40
 
+/*
+ * (11-27) The colour iOS asks for (MiniIOMobileFramebuffer's color op), in DECON0's DQE -- "display quality enhancer"
+ * (Android's drmdecon "dqe" reg, 0x194d0000; register names and layout from Google's cal_9865 regs-dqe.h / dqe_reg.c,
+ * read as documentation). As the bootloader leaves it the DQE is out of the path (DATA_PATH_CON_0 bits 15:12 = 0) and
+ * unconfigured (image size 0, every block off); DQE_TOP_CORE_SECURITY reads 1.
+ * Boot-arg dqe=1 (off by default until seen on the panel): at the first colour iOS sets, the image size is written and
+ * read back (no write taken: the block is the secure world's -- stop there, said in the log), then the gamma matrix
+ * (0xc00: nine 14-bit coefficients two to a register, 00-01 / 02-10 / 11-12 / 20-21 / 22, three offsets) is set to
+ * iOS's matrix, the path is turned to the DQE (ENHANCE_PATH = 2) and DECON's shadow update for the DQE requested
+ * (SHD_REG_UP_REQ bit 24).
+ * Formats: iOS's set_matrix values are signed 32.32 fixed point (backboardd's location 9, True Tone's white point:
+ * 0xffffe100 = 0.999998 on the diagonal); the DQE's coefficients signed with 10 fraction bits, 1.0 = 1024 (an
+ * assumption: dqe=1 starts with identity, which must leave the picture as it was).
+ */
+#define DQE0                    0x194d0000ULL
+#define DQE_TOP_IMG_SIZE        0x004
+#define DQE_TOP_FRM_SIZE        0x008
+#define DQE_TOP_FRM_PXL_NUM     0x00c
+#define DQE_GAMMA_MATRIX_CON    0xc00
+#define DQE_GAMMA_MATRIX_COEFF  0xc04
+#define DQE_GAMMA_MATRIX_OFF0   0xc18
+#define DQE_GAMMA_MATRIX_OFF1   0xc1c
+#define DECON_DATA_PATH_CON_0   0x200
+#define DECON_ENHANCE_DQE_ON    (2u << 12)
+#define DECON_ENHANCE_MASK      (0xfu << 12)
+#define DECON_SHD_REG_UP_REQ    0x050
+#define DECON_SHD_UP_REQ_DQE    (1u << 24)
+
+static volatile uint32_t *dqe;
+static int dqe_state;           /* 0 not tried, 1 on, -1 refused */
+
+static void
+dqe_set_matrix(const int32_t m[9], const int32_t off[3])
+{
+	uint32_t c[9];
+
+	for (int i = 0; i < 9; i++) {
+		int32_t v = m[i] < -8192 ? -8192 : m[i] > 8191 ? 8191 : m[i];
+
+		c[i] = (uint32_t)v & 0x3fff;
+	}
+	dqe[(DQE_GAMMA_MATRIX_COEFF + 0x0) / 4] = c[0] | c[1] << 16;
+	dqe[(DQE_GAMMA_MATRIX_COEFF + 0x4) / 4] = c[2] | c[3] << 16;
+	dqe[(DQE_GAMMA_MATRIX_COEFF + 0x8) / 4] = c[4] | c[5] << 16;
+	dqe[(DQE_GAMMA_MATRIX_COEFF + 0xc) / 4] = c[6] | c[7] << 16;
+	dqe[(DQE_GAMMA_MATRIX_COEFF + 0x10) / 4] = c[8];
+	dqe[DQE_GAMMA_MATRIX_OFF0 / 4] = ((uint32_t)off[0] & 0x3fff) | ((uint32_t)off[1] & 0x3fff) << 16;
+	dqe[DQE_GAMMA_MATRIX_OFF1 / 4] = (uint32_t)off[2] & 0x3fff;
+	dqe[DQE_GAMMA_MATRIX_CON / 4] = 1;
+	decon[DECON_SHD_REG_UP_REQ / 4] = DECON_SHD_UP_REQ_DQE;
+}
+
+static bool
+dqe_start(void)
+{
+	static const int32_t identity[9] = { 1024, 0, 0, 0, 1024, 0, 0, 0, 1024 }, zero[3] = { 0, 0, 0 };
+	uint32_t size = (uint32_t)FB_HEIGHT << 16 | FB_WIDTH, back, path;
+
+	printf("akita_display: dqe: mapping, writing the image size\n");
+	dqe = (volatile uint32_t *)ml_io_map(DQE0, 0x2000);
+	dqe[DQE_TOP_IMG_SIZE / 4] = size;
+	back = dqe[DQE_TOP_IMG_SIZE / 4];
+	if (back != size) {
+		printf("akita_display: dqe: the image size reads %#x after writing %#x: writes not taken (secure?), no colour\n",
+		    back, size);
+		return false;
+	}
+	dqe[DQE_TOP_FRM_SIZE / 4] = size;
+	dqe[DQE_TOP_FRM_PXL_NUM / 4] = (uint32_t)FB_WIDTH * FB_HEIGHT;
+	dqe_set_matrix(identity, zero);
+	path = decon[DECON_DATA_PATH_CON_0 / 4];
+	decon[DECON_DATA_PATH_CON_0 / 4] = (path & ~DECON_ENHANCE_MASK) | DECON_ENHANCE_DQE_ON;
+	decon[DECON_SHD_REG_UP_REQ / 4] = DECON_SHD_UP_REQ_DQE | (1u << 31);
+	printf("akita_display: dqe: on (identity): path %#x -> %#x, matrix con %#x, coeff0 %#x\n", path,
+	    decon[DECON_DATA_PATH_CON_0 / 4], dqe[DQE_GAMMA_MATRIX_CON / 4], dqe[DQE_GAMMA_MATRIX_COEFF / 4]);
+	return true;
+}
+
+struct hakios_display_color;
+static void
+display_color(const struct hakios_display_color *c);
+
 struct hakios_display_ops {
 	int (*buffers)(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *height, uint32_t *row_bytes);
 	void (*flip)(unsigned index);
@@ -1310,7 +1405,42 @@ struct hakios_display_ops {
 extern const struct hakios_display_ops *hakios_display_ops;     /* MiniIOMobileFramebuffer's */
 static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip, display_shown, display_refresh_hz,
 	                                                     display_vblank_time, display_slot, display_scanout, display_scanned,
-	                                                     display_wait_scanned, display_brightness, display_power, NULL /* color: DQE, next */ };
+	                                                     display_wait_scanned, display_brightness, display_power, display_color };
+
+static void
+display_color(const struct hakios_display_color *c)
+{
+	uint32_t on = 0;
+
+	if (!PE_parse_boot_argn("dqe", &on, sizeof(on)) || !on || dqe_state < 0 || decon == NULL) {
+		return;
+	}
+	if (dqe_state == 0) {
+		dqe_state = dqe_start() ? 1 : -1;
+		if (dqe_state < 0) {
+			return;
+		}
+		/* dqe_test=1: 15 s of the red channel alone -- seen on the panel, the coefficients' scale is right */
+		uint32_t test = 0;
+
+		if (PE_parse_boot_argn("dqe_test", &test, sizeof(test)) && test) {
+			static const int32_t red[9] = { 1024, 0, 0, 0, 0, 0, 0, 0, 0 }, zero[3] = { 0, 0, 0 };
+
+			printf("akita_display: dqe: TEST: the red channel alone for 15 s\n");
+			dqe_set_matrix(red, zero);
+			delay(15 * 1000 * 1000);
+			printf("akita_display: dqe: TEST over\n");
+		}
+	}
+	if (on >= 2 && (c->have & HDC_MATRIX)) {        /* dqe=2: iOS's matrix too (dqe=1: identity only, the first look) */
+		int32_t m[9], zero[3] = { 0, 0, 0 };
+
+		for (int i = 0; i < 9; i++) {
+			m[i] = (int32_t)((int64_t)c->matrix[i] >> 22);  /* 32.32 -> 1.0 = 1024 */
+		}
+		dqe_set_matrix(m, zero);
+	}
+}
 
 /*
  * The DPP's scaler, tried on its own (display_scale=1, without display_flip; display_scale_delay= seconds, 60): DPP0 made
