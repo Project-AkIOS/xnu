@@ -266,3 +266,24 @@ akios_pstore_init(void)
 }
 
 #endif /* ARM64_BOARD_CONFIG_BCM2837 */
+
+/*
+ * (11-28) The zone as it is, oldest byte first (from the newest separator back to the ring's oldest byte -- earlier
+ * boots too, as much as 2 MiB holds): for the log of a boot that ended by itself (a panic, a watchdog) to be read in
+ * the next one, over USB (hakios.akita_usbmux.c's port 11). Copies up to max bytes from position at; gives the count.
+ */
+size_t
+akios_pstore_read(uint32_t at, char *out, size_t max)
+{
+	uint32_t held = akios_pstore_held, start = akios_pstore_start, first;
+	size_t n = 0;
+
+	if (akios_pstore_zone == NULL || at >= held) {
+		return 0;
+	}
+	first = held < AKIOS_PSTORE_DATA ? 0 : start;      /* the oldest byte: 0 until the ring has once been full */
+	for (; n < max && at + n < held; n++) {
+		out[n] = (char)akios_pstore_zone[AKIOS_PSTORE_HEADER + (first + at + n) % AKIOS_PSTORE_DATA];
+	}
+	return n;
+}

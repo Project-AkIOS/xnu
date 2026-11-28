@@ -36,5 +36,6 @@ void akios_pstore_early(boot_args *args);       /* top of arm_init(): through st
 void akios_pstore_suspend(void);                /* arm_vm_init(), before it leaves start.s's tables */
 void akios_pstore_init(void);                   /* after arm_vm_init(): mapped for good */
 void akios_pstore_putc(char c);                 /* each console character (loader_log_put_locked()) */
+size_t akios_pstore_read(uint32_t at, char *out, size_t max);  /* the zone oldest first (usbmux port 11) */
 
 #endif /* _ARM64_AKIOS_PSTORE_H_ */

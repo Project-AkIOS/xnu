@@ -1990,6 +1990,20 @@ in_pcbdetach(struct inpcb *inp)
 			INC_ATOMIC_INT64_LIM(net_api_stats.nas_socket_inet_dgram_no_data);
 		}
 	}
+	/*
+	 * AkIOS (11-28): a connection that brought in much -- who, for whom (a delegated socket: nsurlsessiond's for an
+	 * application), how much -- said when it goes: ~350 MB came in within a minute of every boot, by nobody known.
+	 */
+	if (inp->inp_mstat.ms_total.ts_rxbytes >= (16ull << 20)) {
+		char who[32] = "?", whom[32] = "?";
+
+		proc_name(so->last_pid, who, sizeof(who));
+		proc_name((so->so_flags & SOF_DELEGATED) ? so->e_pid : so->last_pid, whom, sizeof(whom));
+		printf("net: a connection closed after %llu MB in, %llu MB out: %s %s [%d], for %s [%d], port %u\n",
+		    inp->inp_mstat.ms_total.ts_rxbytes >> 20, inp->inp_mstat.ms_total.ts_txbytes >> 20,
+		    SOCK_PROTO(so) == IPPROTO_UDP ? "UDP" : "TCP", who, so->last_pid, whom,
+		    (so->so_flags & SOF_DELEGATED) ? so->e_pid : so->last_pid, ntohs(inp->inp_fport));
+	}
 
 	/*
 	 * Let NetworkStatistics know this PCB is going away

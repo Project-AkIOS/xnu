@@ -351,6 +351,36 @@ snaps_thread(void *parameter, __unused wait_result_t result)
 	lck_mtx_unlock(mux_lock);
 }
 
+/*
+ * Port 11 (11-28): the persistent console (osfmk/arm64/akios_pstore.c), oldest first -- the end of a boot that
+ * restarted by itself is there in the next one; then the connection is closed. usbmux-log.py --pstore on the host.
+ */
+extern size_t akios_pstore_read(uint32_t at, char *out, size_t max);
+
+static void
+pstore_thread(void *parameter, __unused wait_result_t result)
+{
+	struct mux_conn *c = parameter;
+	static char chunk[MAX_DATA];
+	uint32_t at = 0;
+	size_t n;
+
+	while (c->open && (n = akios_pstore_read(at, chunk, sizeof(chunk))) > 0) {
+		if (!screen_send(c, chunk, (uint32_t)n)) {
+			break;
+		}
+		at += (uint32_t)n;
+	}
+	delay_for_interval(200, NSEC_PER_MSEC);
+	lck_mtx_lock(mux_lock);
+	if (c->open) {
+		send_tcp(c, TH_FIN | TH_ACK, c->tx_seq, c->rx_next, NULL, 0, false);
+		send_tcp(c, TH_RST, c->tx_seq + 1, c->rx_next, NULL, 0, false);
+	}
+	conn_free(c);
+	lck_mtx_unlock(mux_lock);
+}
+
 static void
 screen_thread(void *parameter, __unused wait_result_t result)
 {
@@ -738,7 +768,7 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		return;
 	}
 	if (phone_port == 1 || phone_port == 5 || phone_port == 6 || phone_port == 7 || phone_port == 8 || phone_port == 9 ||
-	    phone_port == 10) {
+	    phone_port == 10 || phone_port == 11) {
 		lck_mtx_lock(mux_lock);
 		for (unsigned i = 0; i < CONNS && !c; i++) {
 			if (!conns[i].used) {
@@ -760,10 +790,10 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		}
 		printf("akita usbmux: host port %u: the %s\n", host_port,
 		    phone_port == 1 ? "console log" : phone_port == 5 ? "kernel message buffer" : phone_port == 7 ? "screen recording" :
-		    phone_port == 8 ? "sound recording" : phone_port == 9 ? "newest swap's surface" : phone_port == 10 ? "snapshot ring" : "screen");
+		    phone_port == 8 ? "sound recording" : phone_port == 9 ? "newest swap's surface" : phone_port == 10 ? "snapshot ring" : phone_port == 11 ? "persistent console" : "screen");
 		send_tcp(c, TH_SYN | TH_ACK, 0, seq + 1, NULL, 0, false);
 		if (kernel_thread_start(phone_port == 1 ? klog_thread : phone_port == 5 ? dmesg_thread : phone_port == 7 ? rec_thread :
-		    phone_port == 8 ? sound_thread : phone_port == 9 ? surface_thread : phone_port == 10 ? snaps_thread : screen_thread, c,
+		    phone_port == 8 ? sound_thread : phone_port == 9 ? surface_thread : phone_port == 10 ? snaps_thread : phone_port == 11 ? pstore_thread : screen_thread, c,
 		    &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		}
