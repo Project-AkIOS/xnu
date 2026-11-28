@@ -58,6 +58,10 @@ struct hakios_sta_state {
 	enum hakios_sta_phase phase;
 	struct hakios_sta_bss bss;             /* the network joined or being joined */
 	int last_error;                         /* why the last join failed or the network was lost (an errno); 0: it was not */
+	/* (11-28) as the radio measured them once the network was joined; 0 / "" when it could not say */
+	uint32_t rate_mbps;                     /* the rate it sends at */
+	int16_t noise;                          /* dBm */
+	char country[4];                        /* the regulatory country it works under ("EE") */
 };
 
 #define HAKIOS_STA_CHANNEL_PASSIVE     1u      /* the radio may only listen there */

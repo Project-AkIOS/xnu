@@ -346,6 +346,25 @@ give(const struct apple80211req *request, const void *data, size_t length)
 }
 
 /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
+/* (11-26) the kinds a network speaks: by band and rates, then HT (element 45) and VHT (element 191) */
+static uint32_t
+bss_phy(const struct hakios_sta_bss *bss)
+{
+	uint32_t phy = bss->frequency >= 4000 ? PHY_11A : PHY_11B;
+
+	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
+	    at += 2 + bss->elements[at + 1]) {
+		for (unsigned i = 0; bss->frequency < 4000 && (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1];
+		    i++) {
+			if ((bss->elements[at + 2 + i] & 0x7f) > 22) {  /* (above 11 Mbit/s: OFDM) */
+				phy |= PHY_11G;
+			}
+		}
+		phy |= bss->elements[at] == 45 ? PHY_11N : bss->elements[at] == 191 ? PHY_11AC : 0;
+	}
+	return phy;
+}
+
 static int
 give_network(const struct apple80211req *request, const struct hakios_sta_bss *bss)
 {
@@ -385,26 +404,21 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 	 * left 0, every result was as old as the boot, and auto-join's maxAge filter threw them all out ("All scan
 	 * results are filtered out"), so a known network was never rejoined. The station's age in ms taken off now.
 	 */
+	/*
+	 * (11-28) In nanoseconds of that clock, not its ticks: with the timebase at 24 MHz (11-27) the ticks were taken as
+	 * nanoseconds and every result was ~1/41 of the boot old -- 4.7 s at 197 s, "Filtering based on maxAge
+	 * (... age=192398ms)", the known network never a candidate (candidateBSSCount=0) and auto-join scanning again
+	 * every ~10 s, for ever.
+	 */
 	{
-		uint64_t now = mach_continuous_time(), ago;
+		uint64_t now, ago = (uint64_t)bss->age_ms * NSEC_PER_MSEC;
 
-		nanoseconds_to_absolutetime((uint64_t)bss->age_ms * NSEC_PER_MSEC, &ago);
+		absolutetime_to_nanoseconds(mach_continuous_time(), &now);
 		result->timestamp = now > ago ? now - ago : 0;
 	}
 	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
 	memcpy(result->elements, bss->elements, result->elements_length);
-	/* (11-26) the kinds it speaks: by band and rates, then HT (element 45) and VHT (element 191) */
-	result->phy_mode = bss->frequency >= 4000 ? PHY_11A : PHY_11B;
-	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
-	    at += 2 + bss->elements[at + 1]) {
-		for (unsigned i = 0; bss->frequency < 4000 && (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1];
-		    i++) {
-			if ((bss->elements[at + 2 + i] & 0x7f) > 22) {  /* (above 11 Mbit/s: OFDM) */
-				result->phy_mode |= PHY_11G;
-			}
-		}
-		result->phy_mode |= bss->elements[at] == 45 ? PHY_11N : bss->elements[at] == 191 ? PHY_11AC : 0;
-	}
+	result->phy_mode = bss_phy(bss);
 	/* the rates it says it has (elements 1 and 50: units of 500 kbit/s, the top bit marks the ones everybody must have) */
 	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
 	    at += 2 + bss->elements[at + 1]) {
@@ -630,6 +644,51 @@ get(struct apple80211req *request)
 	case 103:                               /* all of it, as a scan's result */
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
 		break;
+	case 8:                                 /* (11-28) the rate it sends at, Mbit/s, in the value (no buffer asked) */
+		if (state->phase != HAKIOS_STA_JOINED || state->rate_mbps == 0) {
+			error = ENXIO;
+		} else {
+			struct {
+				uint32_t version, radios, rate[4];
+			} answer = { .version = 1, .radios = 1, .rate = { state->rate_mbps } };
+
+			request->req_val = (int32_t)state->rate_mbps;
+			error = request->req_len >= sizeof(answer) ? give(request, &answer, sizeof(answer)) : 0;
+		}
+		break;
+	case 17: {                              /* (11-28) the noise on its channel: as RSSI's layout, dBm */
+		struct {
+			uint32_t version, radios, unit;
+			int32_t each[4], all, each_ext[4], all_ext;
+		} answer = { .version = 1, .radios = 1, .each = { state->noise }, .all = state->noise,
+			     .each_ext = { state->noise }, .all_ext = state->noise };
+
+		error = state->phase != HAKIOS_STA_JOINED || state->noise == 0 ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 14: {                              /* (11-28) the kinds of 802.11: what the radio has, what the network uses */
+		struct {
+			uint32_t version, supported, active;
+		} answer = { .version = 1, .supported = PHY_11A | PHY_11B | PHY_11G | PHY_11N | PHY_11AC };
+
+		if (state->phase == HAKIOS_STA_JOINED) {
+			uint32_t phy = bss_phy(&state->bss);
+
+			/* the newest both have */
+			answer.active = phy & PHY_11AC ? PHY_11AC : phy & PHY_11N ? PHY_11N : phy & PHY_11G ? PHY_11G :
+			    phy & PHY_11A ? PHY_11A : PHY_11B;
+		}
+		request->req_val = (int32_t)answer.active;
+		error = give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 51:                                /* (11-28) the country it works under: two letters and a 0 */
+		if (state->country[0] == 0) {
+			error = ENXIO;
+		} else {
+			error = give(request, state->country, request->req_len < 3 ? request->req_len : 3);
+		}
+		break;
 	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
 		struct {
 			uint32_t version, lower, upper, extended;
@@ -762,6 +821,11 @@ out:
 	return error;
 }
 
+/* (11-28) what wifid has told about the phone (sets 483, 365, 485): for a power policy to read */
+static uint8_t told_external_power;
+static bool told_display_on = true;
+static uint16_t told_app_state;
+
 static int
 set(const struct apple80211req *request, char *said, size_t said_size)
 {
@@ -784,6 +848,40 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	/*
+	 * (11-28) What wifid tells a driver about the phone, for its power policy: external power (483, a byte), the
+	 * display on/off (365, the value), the foreground app's state (485, 2 bytes), its heartbeat (481), the antenna
+	 * setup it wants (473, 4 bytes), the country it believes in (51: version and 2 letters). Kept and taken; the radio's
+	 * own power saving and regulatory country are the firmware's (the CLM), not changed from here yet.
+	 */
+	case 483:
+	case 485:
+	case 473:
+	case 51: {
+		uint8_t told[8] = { 0 };
+		size_t n = request->req_len < sizeof(told) ? request->req_len : sizeof(told);
+		int error = n != 0 ? req_read(request, 0, told, n) : 0;
+
+		if (error == 0) {
+			lck_mtx_lock(&apple80211_lock);
+			if (request->req_type == 483) {
+				told_external_power = told[0];
+			} else if (request->req_type == 485) {
+				told_app_state = (uint16_t)(told[0] | told[1] << 8);
+			}
+			lck_mtx_unlock(&apple80211_lock);
+			snprintf(said, said_size, " (told: %02x %02x %02x %02x)", told[0], told[1], told[2], told[3]);
+		}
+		return error;
+	}
+	case 365:
+		lck_mtx_lock(&apple80211_lock);
+		told_display_on = request->req_val != 0;
+		lck_mtx_unlock(&apple80211_lock);
+		snprintf(said, said_size, " (display %s)", request->req_val ? "on" : "off");
+		return 0;
+	case 481:
+		return 0;
 	default:
 		return EOPNOTSUPP;
 	}

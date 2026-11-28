@@ -3463,6 +3463,41 @@ sta_radio_cycle(void)
 
 static struct hakios_sta_join sta_joined_with;  /* the request the network joined came from (to know a repeat of it) */
 
+/*
+ * (11-28) What Darwin's Wi-Fi side asks of a joined network and only the radio knows: the rate it sends at
+ * (WLC_GET_RATE 12, units of 500 kbit/s), the noise on the channel (WLC_GET_PHY_NOISE 135, dBm) and the country it
+ * works under ("country": wl_country_t, its abbreviation first). Asked ONCE per join, on the station's thread: ioctls
+ * have cost this firmware packet ids before (fragile-mem-zones: "hnd_pktid_free_cnt 0"), so never on a timer.
+ */
+static uint32_t sta_rate_mbps;
+static int16_t sta_noise;
+static char sta_country[4];
+
+static void
+sta_measure(void)
+{
+	int32_t rate = 0, noise = 0;
+	struct {
+		char abbrev[4];
+		int32_t rev;
+		char ccode[4];
+	} country;
+
+	bzero(&country, sizeof(country));
+	if (bcm_ioctl(12, NULL, 0, &rate, sizeof(rate)) == 0 && rate > 0) {
+		sta_rate_mbps = (uint32_t)rate / 2;
+	}
+	if (bcm_ioctl(135, NULL, 0, &noise, sizeof(noise)) == 0 && noise < 0 && noise > -128) {
+		sta_noise = (int16_t)noise;
+	}
+	if (iovar_get("country", &country, sizeof(country)) == 0 && country.abbrev[0] != 0) {
+		memcpy(sta_country, country.abbrev, 2);
+		sta_country[2] = 0;
+	}
+	printf("wifi: station: measured: %u Mbit/s, noise %d dBm, country \"%s\" (rev %d)\n", sta_rate_mbps, sta_noise,
+	    sta_country, country.rev);
+}
+
 static int
 sta_join(const struct hakios_sta_join *j)
 {
@@ -3619,6 +3654,7 @@ sta_join(const struct hakios_sta_join *j)
 
 		sta_last_error = 0;
 		sta_phase = HAKIOS_STA_JOINED;
+		sta_measure();
 	}
 	printf("wifi: station: join (%s, a name of %u bytes) after %llu ms: %d (set SSID %d, link %s, supplicant %d); %u MHz, "
 	    "%d dBm\n", psk ? "WPA2-PSK" : "open", j->ssid_length, micros_since(t0) / 1000, result, join_status,
@@ -3647,6 +3683,9 @@ sta_state(struct hakios_sta_state *st)
 	st->phase = (enum hakios_sta_phase)sta_phase;
 	st->bss = sta_bss;
 	st->last_error = sta_last_error;
+	st->rate_mbps = sta_rate_mbps;
+	st->noise = sta_noise;
+	memcpy(st->country, sta_country, sizeof(st->country));
 }
 
 /* the channels: 2.4 GHz 1-13; 5 GHz 36-64 (52-64 radar), 100-144 (radar), 149-165 -- the EU's (the CLM decides what it sends) */
