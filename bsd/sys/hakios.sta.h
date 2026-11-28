@@ -62,6 +62,8 @@ struct hakios_sta_state {
 	uint32_t rate_mbps;                     /* the rate it sends at */
 	int16_t noise;                          /* dBm */
 	char country[4];                        /* the regulatory country it works under ("EE") */
+	uint8_t mcs, nss;                       /* the rate's modulation index and spatial streams (nss 0: not known) */
+	int8_t powersave;                       /* the radio's power saving: 0 off, 1 on; -1 not known */
 };
 
 #define HAKIOS_STA_CHANNEL_PASSIVE     1u      /* the radio may only listen there */
@@ -85,6 +87,7 @@ struct hakios_sta_ops {
 	int (*leave)(void);
 	void (*state)(struct hakios_sta_state *state);         /* on any thread; does not sleep */
 	unsigned (*channels)(struct hakios_sta_channel *channels, unsigned most);      /* what the radio may tune to */
+	int (*country)(const char cc[2]);       /* (11-28) work under this country's rules (ISO letters); may be NULL */
 	uint8_t address[6];
 };
 
@@ -110,6 +113,7 @@ int      hakios_sta_ask_join(const struct hakios_sta_join *what);
 /* ... and joined again whenever the radio is turned on, until some other network is asked for */
 int      hakios_sta_ask_join_standing(const struct hakios_sta_join *what);
 int      hakios_sta_ask_leave(void);
+int      hakios_sta_ask_country(const char cc[2]);     /* (11-28) applied now if no network is joined, else before the next join */
 bool     hakios_sta_busy(void);                                        /* something asked for is not over yet */
 bool     hakios_sta_powered(void);
 /* the `index`th access point the last scan heard: true, or false when there are not that many */

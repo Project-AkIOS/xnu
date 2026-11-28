@@ -3472,6 +3472,8 @@ static struct hakios_sta_join sta_joined_with;  /* the request the network joine
 static uint32_t sta_rate_mbps;
 static int16_t sta_noise;
 static char sta_country[4];
+static uint8_t sta_mcs, sta_nss;
+static int8_t sta_pm = -1;
 
 static void
 sta_measure(void)
@@ -3494,8 +3496,33 @@ sta_measure(void)
 		memcpy(sta_country, country.abbrev, 2);
 		sta_country[2] = 0;
 	}
-	printf("wifi: station: measured: %u Mbit/s, noise %d dBm, country \"%s\" (rev %d)\n", sta_rate_mbps, sta_noise,
-	    sta_country, country.rev);
+	/*
+	 * The rate's spec ("nrate", as Google's wl_android_get_link_status; bcmwifi_rspec.h): the encoding in bits 24-26
+	 * (0 legacy, 1 HT, 2 VHT, 3 HE), for VHT/HE the MCS in bits 0-3 and the streams in 4-7, for HT the MCS 0-31
+	 * (8 a stream). The power saving: WLC_GET_PM (85): 0 off, 1 maximum, 2 fast.
+	 */
+	{
+		uint32_t rspec = 0;
+		int32_t pm = 0;
+
+		if (iovar_get("nrate", &rspec, sizeof(rspec)) == 0 && rspec != 0) {
+			uint32_t enc = (rspec >> 24) & 7;
+
+			if (enc == 2 || enc == 3) {
+				sta_mcs = rspec & 0xf;
+				sta_nss = (rspec >> 4) & 0xf;
+			} else if (enc == 1) {
+				sta_mcs = rspec & 0x7f;
+				sta_nss = (uint8_t)(sta_mcs / 8 + 1);
+			}
+		}
+		if (bcm_ioctl(85, NULL, 0, &pm, sizeof(pm)) == 0) {
+			sta_pm = pm != 0;
+		}
+		printf("wifi: station: measured: %u Mbit/s, noise %d dBm, country \"%s\" (rev %d), rate spec %#x (MCS %u, %u "
+		    "streams), power saving %d\n", sta_rate_mbps, sta_noise, sta_country, country.rev, rspec, sta_mcs, sta_nss,
+		    pm);
+	}
 }
 
 static int
@@ -3686,6 +3713,9 @@ sta_state(struct hakios_sta_state *st)
 	st->rate_mbps = sta_rate_mbps;
 	st->noise = sta_noise;
 	memcpy(st->country, sta_country, sizeof(st->country));
+	st->mcs = sta_mcs;
+	st->nss = sta_nss;
+	st->powersave = sta_pm;
 }
 
 /* the channels: 2.4 GHz 1-13; 5 GHz 36-64 (52-64 radar), 100-144 (radar), 149-165 -- the EU's (the CLM decides what it sends) */
@@ -3707,7 +3737,39 @@ sta_channels(struct hakios_sta_channel *c, unsigned most)
 	return n;
 }
 
+/*
+ * (11-28) The rules of a country (wl_country_t to "country", as Google's wldev_set_country): the firmware starts under
+ * "US" (its own default); Android on this phone switches to "XZ" -- the world-safe set -- as long as it knows no
+ * country, then to the one the system names. Here the same: XZ at the start, then what wifid sets (COUNTRY_CODE).
+ * Revision -1: the regulatory database's own for that country. Refused (not in the database): the rules stay.
+ */
+static int
+sta_country_set(const char cc[2])
+{
+	struct {
+		char abbrev[4];
+		int32_t rev;
+		char ccode[4];
+	} want, now;
+	int err;
+
+	bzero(&want, sizeof(want));
+	bzero(&now, sizeof(now));
+	want.abbrev[0] = want.ccode[0] = cc[0];
+	want.abbrev[1] = want.ccode[1] = cc[1];
+	want.rev = (cc[0] == 'X' && cc[1] == 'Z') ? 0 : -1;
+	err = iovar_set("country", &want, sizeof(want));
+	if (iovar_get("country", &now, sizeof(now)) == 0 && now.abbrev[0] != 0) {
+		memcpy(sta_country, now.abbrev, 2);
+		sta_country[2] = 0;
+	}
+	printf("wifi: station: country %c%c asked: %d; the radio works under \"%.2s\" (%.2s rev %d)\n", cc[0], cc[1], err,
+	    now.abbrev, now.ccode, now.rev);
+	return err;
+}
+
 static struct hakios_sta_ops sta_ops_bcm = {
+	.country = sta_country_set,
 	.power = sta_power,
 	.scan = sta_scan,
 	.heard = sta_heard_each,
@@ -4097,6 +4159,7 @@ bcm_steps(void)
 		if (strncmp(ver, "wl0:", 4) == 0) {
 			(void)blob_load("bcmdhd_clm.blob_4383_a3", "clmload", "clmload_status");
 			(void)blob_load("bcmdhd_txcap.blob_4383_a3", "txcapload", "txcapload_status");
+			(void)sta_country_set("XZ");    /* (no country known yet: the world-safe rules, as Android) */
 		}
 		wl_take();
 		info_rings_up();

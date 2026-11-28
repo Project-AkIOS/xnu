@@ -65,6 +65,10 @@ heard_one(const struct hakios_sta_bss *bss, __unused void *context)
 	}
 }
 
+/* (11-28) the country Darwin asked for: applied when no network is joined (a change can drop the link), else before the next join */
+static char country_cc[2];
+static bool country_waits, asked_country;
+
 static void
 sta_runs(__unused void *parameter, __unused wait_result_t result)
 {
@@ -73,11 +77,12 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 
 	for (;;) {
 		const struct hakios_sta_ops *ops;
-		bool power = false, power_on = false, leave = false, do_join = false, do_scan = false;
+		bool power = false, power_on = false, leave = false, do_join = false, do_scan = false, do_country = false;
+		char cc[2] = { 0, 0 };
 		int error = 0;
 
 		lck_mtx_lock(&sta_lock);
-		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
+		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan || asked_country)) {
 			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
 		}
 		ops = sta_ops;
@@ -89,6 +94,9 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 		} else if (asked_leave) {
 			leave = true;
 			asked_leave = false;
+		} else if (asked_country) {
+			do_country = true;
+			asked_country = false;
 		} else if (asked_join) {
 			do_join = true;
 			join = asked_join_what;
@@ -99,8 +107,16 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			scan = asked_scan_what;
 			asked_scan = false;
 		}
+		if (do_country || (do_join && country_waits)) {
+			memcpy(cc, country_cc, sizeof(cc));
+			country_waits = false;
+		}
 		sta_calls = true;
 		lck_mtx_unlock(&sta_lock);
+
+		if (cc[0] != 0 && ops->country != NULL) {
+			(void)ops->country(cc);
+		}
 
 		if (power) {
 			struct hakios_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
@@ -144,6 +160,8 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			if (was_joined && !join_waits) {
 				hakios_apple80211_event(HAKIOS_STA_LINK, 0);
 			}
+		} else if (do_country) {
+			/* (done above) */
 		} else if (do_join) {
 			error = ops->join(&join);
 			bzero(&join, sizeof(join));
@@ -387,4 +405,29 @@ hakios_sta_address(uint8_t *address)
 		memcpy(address, ops->address, 6);
 	}
 	return ops != NULL;
+}
+
+int
+hakios_sta_ask_country(const char cc[2])
+{
+	struct hakios_sta_state *state;
+	bool joined = false;
+
+	if (sta_ops == NULL || sta_ops->country == NULL) {
+		return ENXIO;
+	}
+	if ((state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO)) != NULL) {
+		sta_ops->state(state);
+		joined = state->phase == HAKIOS_STA_JOINED;
+		kfree_data(state, sizeof(*state));
+	}
+	lck_mtx_lock(&sta_lock);
+	memcpy(country_cc, cc, sizeof(country_cc));
+	country_waits = true;
+	if (!joined) {
+		asked_country = true;
+	}
+	lck_mtx_unlock(&sta_lock);
+	thread_wakeup((event_t)&sta_ops);
+	return 0;
 }
