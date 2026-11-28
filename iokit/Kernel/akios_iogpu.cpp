@@ -11,9 +11,11 @@
 #include "MiniIOSurface.h"
 #include "akios_shared_event.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBSD.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <pexpert/pexpert.h>
+extern "C" void proc_selfname(char *buf, int size);
 
 #ifndef MAX
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -494,6 +496,7 @@ class IOGPUDeviceUserClient : public IOUserClient
 		uint64_t gpuBase, gpuLength;    /* the GPU mapping (page-aligned) */
 		uint32_t sharedSlot;            /* in the client-shared blocks */
 		bool prepared;
+		uint8_t purgeable;              /* (11-28) its purgeable state as Metal sees it: 2 non-volatile (0: not set = 2) */
 		struct resource *nextDeferred;
 		uint64_t deferredUntil;         /* freed once every submission of the client numbered below this is done */
 	};
@@ -559,7 +562,9 @@ class IOGPUDeviceUserClient : public IOUserClient
 
 	/* command queues (selector 6): the id is the index + 1 */
 	enum { kMaxQueues = 64, kMaxNotificationQueues = 64 };
-	struct queue { bool used; int hq; uint32_t nq; } fQueues[kMaxQueues];
+	/* (11-28) priority/background (selector 26) and QoS (27) kept as IOGPUCommandQueue keeps them (+0x444/0x448/0x450) */
+	struct queue { bool used; int hq; uint32_t nq; uint32_t priority, background, qos; } fQueues[kMaxQueues];
+	IOReturn purgeable(uint32_t id, uint32_t state, uint32_t *old);
 	struct nqueue { IOSharedDataQueue *queue; IOMemoryMap *map; mach_port_t port; } fNQueues[kMaxNotificationQueues];
 	bool addressSpace(void);
 	void deleteQueue(uint32_t id);
@@ -590,6 +595,14 @@ class IOGPUDeviceUserClient : public IOUserClient
 	static IOReturn s_create_shmem(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_destroy_shmem(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_perform_mapping(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_finish_object_event(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_set_resource_purgeable(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_set_priority_and_background(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_set_quality_of_service(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_set_app_gpu_role(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_get_app_gpu_role(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_set_resource_owner_identity(OSObject *target, void *reference, IOExternalMethodArguments *args);
+	static IOReturn s_create_device_assertion(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_new_resource(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_delete_resource(OSObject *target, void *reference, IOExternalMethodArguments *args);
 	static IOReturn s_new_command_queue(OSObject *target, void *reference, IOExternalMethodArguments *args);
@@ -630,8 +643,8 @@ const IOExternalMethodDispatch IOGPUDeviceUserClient::sMethods[56] = {
 	M(s_delete_command_queue, 1, 0, 0, 0),          /*  7 */
 	M(s_new_resource, 0, V, 0, V),                  /*  8 */
 	M(s_delete_resource, 1, 0, 0, 0),               /*  9 */
-	U(2, 0, 0, 0),                                  /* 10 finish_object_event */
-	U(2, 0, 1, 0),                                  /* 11 set_resource_purgeable */
+	M(s_finish_object_event, 2, 0, 0, 0),           /* 10 */
+	M(s_set_resource_purgeable, 2, 0, 1, 0),        /* 11 */
 	M(s_create_shmem, 2, 0, 0, 0x10),               /* 12 */
 	M(s_destroy_shmem, 1, 0, 0, 0),                 /* 13 */
 	M(s_create_notificationqueue, 2, 0, 0, 0x10),   /* 14 */
@@ -646,16 +659,16 @@ const IOExternalMethodDispatch IOGPUDeviceUserClient::sMethods[56] = {
 	M(s_get_allocated_size, 0, 0, 1, 0),            /* 23 */
 	M(s_set_notification_queue, 2, 0, 0, 0),        /* 24 */
 	M(s_submit_command_buffers, 4, V, 1, 0),        /* 25 */
-	U(1, 0xc, 1, 0),                                /* 26 set_priority_and_background */
-	U(1, 4, 0, 0),                                  /* 27 set_quality_of_service */
+	M(s_set_priority_and_background, 1, 0xc, 1, 0), /* 26 */
+	M(s_set_quality_of_service, 1, 4, 0, 0),        /* 27 */
 	U(0, 0, 2, 0),                                  /* 28 create_mtllateevalevent */
 	U(1, 0, 0, 0),                                  /* 29 destroy_mtllateevalevent */
 	U(2, 0, 0, 0),                                  /* 30 async_signal_mtlLateEvalevent */
 	U(1, 0, 2, 0),                                  /* 31 query_mtlLateEvalevent */
-	U(2, 0, 0, 0),                                  /* 32 set_display_params_for_gpu */
-	U(2, 0, 0, 0),                                  /* 33 set_app_gpu_role */
-	U(1, 0, 1, 0),                                  /* 34 get_app_gpu_role */
-	U(2, 0, 0, 0),                                  /* 35 set_resource_owner_identity */
+	U(2, 0, 0, 0),                                  /* 32 set_display_params_for_gpu (Apple's base: unsupported too) */
+	M(s_set_app_gpu_role, 2, 0, 0, 0),              /* 33 */
+	M(s_get_app_gpu_role, 1, 0, 1, 0),              /* 34 */
+	M(s_set_resource_owner_identity, 2, 0, 0, 0),   /* 35 */
 	U(3, 0, 1, 0),                                  /* 36 create_resource_iosurface */
 	U(1, 0, 0, 0),                                  /* 37 resource_detach_backing */
 	U(0, 0x18, 0, 0),                               /* 38 resource_replace_backing_bytes */
@@ -674,7 +687,7 @@ const IOExternalMethodDispatch IOGPUDeviceUserClient::sMethods[56] = {
 	U(3, 0, 0, 0),                                  /* 51 io_command_buffer_barrier_complete */
 	U(2, V, 0, 0),                                  /* 52 group_add_resources */
 	U(2, V, 0, 0),                                  /* 53 group_remove_resources */
-	U(2, 0, 1, 0),                                  /* 54 create_device_assertion */
+	M(s_create_device_assertion, 2, 0, 1, 0),       /* 54 */
 	M(s_perform_mapping, 0, 0, 0, 0),               /* 55 */
 };
 
@@ -814,6 +827,18 @@ IOGPUDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 IOReturn
 IOGPUDeviceUserClient::s_unsupported(OSObject *target, void *reference, IOExternalMethodArguments *args)
 {
+	/* (11-28) which of these iOS really calls, and who: the first 4 of each selector said, then a count every 64 */
+	static uint32_t calls[56];
+	uint32_t sel = args->selector < 56 ? args->selector : 55, n = ++calls[sel];
+
+	if (n <= 4 || (n & 63) == 0) {
+		char who[32] = "?";
+
+		proc_selfname(who, sizeof(who));
+		printf("akios_iogpu: unsupported selector %u by %s (call %u; scalars in %u: %#llx %#llx, structure in %u)\n", sel,
+		    who, n, args->scalarInputCount, args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
+		    args->scalarInputCount > 1 ? args->scalarInput[1] : 0, args->structureInputSize);
+	}
 	return kIOReturnUnsupported;
 }
 
@@ -1594,25 +1619,251 @@ IOGPUDeviceUserClient::t_finish_resource_event(void *p1, void *p2, void *p3, voi
 }
 
 /*
- * (id, state, where the old state goes): IOGPU's states 1 non-volatile, 2 volatile, 3 empty, 4 keep. Nothing is
- * purged here yet: every resource stays non-volatile, and that is the old state answered.
+ * (11-28, as Apple's IOGPUDevice::set_resource_purgeable) the states are IOMemoryDescriptor's / MTLPurgeableState's:
+ * 1 keep the current one, 2 non-volatile, 3 volatile, 4 empty; 5 make resident, 6 evict. The answer is the state before.
+ * Our resources' memory is wired for the GPU's tables and is never reclaimed (as on a system under no pressure): the
+ * state is kept as Metal set it and answered back. (Reclaiming volatile memory waits on unwired, faultable GPU memory.)
  */
+IOReturn
+IOGPUDeviceUserClient::purgeable(uint32_t id, uint32_t state, uint32_t *old)
+{
+	struct resource *r;
+
+	if (id == 0 || state < 1 || state > 6) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(fLock);
+	r = id <= fResourceCount ? fResources[id - 1] : NULL;
+	if (r == NULL) {
+		IOLockUnlock(fLock);
+		return kIOReturnBadArgument;
+	}
+	*old = r->purgeable != 0 ? r->purgeable : 2;
+	if (state >= 2 && state <= 4) {
+		r->purgeable = (uint8_t)state;
+	} else if (state == 5) {
+		r->purgeable = 2;               /* (resident again: its contents as they are) */
+	}
+	IOLockUnlock(fLock);
+	return kIOReturnSuccess;
+}
+
 IOReturn
 IOGPUDeviceUserClient::t_set_resource_purgeable(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6)
 {
-	uint32_t id = (uint32_t)(uintptr_t)p1;
-	uint64_t old = 1;
+	uint32_t old = 0;
+	IOReturn ret = purgeable((uint32_t)(uintptr_t)p1, (uint32_t)(uintptr_t)p2, &old);
+	uint64_t answer = old;
+
+	if (ret == kIOReturnSuccess && p3 != NULL && copyout(&answer, (user_addr_t)(uintptr_t)p3, sizeof(answer)) != 0) {
+		return kIOReturnBadArgument;
+	}
+	return ret;
+}
+
+/* Selector 11: the same, the old state in the scalar out */
+IOReturn
+IOGPUDeviceUserClient::s_set_resource_purgeable(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	uint32_t old = 0;
+	IOReturn ret = ((IOGPUDeviceUserClient *)target)->purgeable((uint32_t)args->scalarInput[0],
+	    (uint32_t)args->scalarInput[1], &old);
+
+	if (ret == kIOReturnSuccess) {
+		args->scalarOutput[0] = old;
+	}
+	return ret;
+}
+
+/* Selector 10 (object, which of its two events): finishing a resource's event. Ours complete with the submission. */
+IOReturn
+IOGPUDeviceUserClient::s_finish_object_event(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	uint32_t id = (uint32_t)args->scalarInput[0];
 	bool known;
 
-	IOLockLock(fLock);
-	known = id >= 1 && id <= fResourceCount && fResources[id - 1] != NULL;
-	IOLockUnlock(fLock);
-	if (!known) {
+	if (args->scalarInput[1] >= 2) {
 		return kIOReturnBadArgument;
 	}
-	if (p3 != NULL && copyout(&old, (user_addr_t)(uintptr_t)p3, sizeof(old)) != 0) {
+	IOLockLock(me->fLock);
+	known = id >= 1 && id <= me->fResourceCount && me->fResources[id - 1] != NULL;
+	IOLockUnlock(me->fLock);
+	return known ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+/*
+ * Selector 26 (queue; {priority, background}) -> the priority taken. As IOGPUCommandQueue::set_priority_and_background:
+ * priorities 0-2 and 4, 5 (real-time) only with com.apple.private.gpu-realtime... else High (0); background 2 or 3.
+ * Kept per queue; our hardware queue's priority was fixed when it was made (a CSF group's: changing it waits on the
+ * Mali scheduler's priority update).
+ */
+IOReturn
+IOGPUDeviceUserClient::s_set_priority_and_background(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	const uint32_t *in = (const uint32_t *)args->structureInput;
+	uint32_t id = (uint32_t)args->scalarInput[0], priority, background;
+
+	if (in == NULL || args->structureInputSize < 8) {
 		return kIOReturnBadArgument;
 	}
+	priority = in[0];
+	background = in[1];
+	if (priority == 3 || priority > 5) {
+		return kIOReturnBadArgument;
+	}
+	if (priority == 5 && !IOTaskHasEntitlement(me->fTask, "com.apple.private.gpu-realtime-priority")) {
+		priority = 0;
+	}
+	if ((background & ~1u) != 2) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(me->fLock);
+	if (id < 1 || id > kMaxQueues || !me->fQueues[id - 1].used) {
+		IOLockUnlock(me->fLock);
+		return kIOReturnBadArgument;
+	}
+	me->fQueues[id - 1].priority = priority;
+	me->fQueues[id - 1].background = background;
+	IOLockUnlock(me->fLock);
+	args->scalarOutput[0] = priority;
+	return kIOReturnSuccess;
+}
+
+/* Selector 27 (queue; {QoS level 0-4}): kept per queue (IOGPUCommandQueue::setQualityOfService) */
+IOReturn
+IOGPUDeviceUserClient::s_set_quality_of_service(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	const uint32_t *in = (const uint32_t *)args->structureInput;
+	uint32_t id = (uint32_t)args->scalarInput[0];
+
+	if (in == NULL || args->structureInputSize < 4 || in[0] > 4) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(me->fLock);
+	if (id < 1 || id > kMaxQueues || !me->fQueues[id - 1].used) {
+		IOLockUnlock(me->fLock);
+		return kIOReturnBadArgument;
+	}
+	me->fQueues[id - 1].qos = in[0];
+	IOLockUnlock(me->fLock);
+	return kIOReturnSuccess;
+}
+
+/*
+ * Selectors 33/34 (pid, role) / (pid) -> role: runningboardd tells the GPU driver each app's role as it changes (11-28:
+ * ~64 calls in a boot's first 3 minutes). IOGPUDevice's own answer is "unsupported"; the GPU's driver (AGX on an
+ * iPhone) keeps them, for its scheduling. Ours keeps the newest of 256 processes; a process not told about is 0.
+ */
+static struct { int pid; uint32_t role; } gAppRoles[256];
+static uint32_t gAppRoleNext;
+static IOLock *gAppRoleLock;
+
+IOReturn
+IOGPUDeviceUserClient::s_set_app_gpu_role(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	int pid = (int)args->scalarInput[0];
+	uint32_t role = (uint32_t)args->scalarInput[1], i;
+
+	if (pid <= 0) {
+		return kIOReturnBadArgument;
+	}
+	if (gAppRoleLock == NULL) {
+		IOLock *lock = IOLockAlloc();
+
+		if (!OSCompareAndSwapPtr(NULL, lock, &gAppRoleLock)) {
+			IOLockFree(lock);
+		}
+	}
+	IOLockLock(gAppRoleLock);
+	for (i = 0; i < 256 && gAppRoles[i].pid != pid; i++) {
+	}
+	if (i == 256) {
+		i = gAppRoleNext++ % 256;
+		gAppRoles[i].pid = pid;
+	}
+	gAppRoles[i].role = role;
+	IOLockUnlock(gAppRoleLock);
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOGPUDeviceUserClient::s_get_app_gpu_role(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	int pid = (int)args->scalarInput[0];
+	uint32_t role = 0;
+
+	if (gAppRoleLock != NULL) {
+		IOLockLock(gAppRoleLock);
+		for (uint32_t i = 0; i < 256; i++) {
+			if (gAppRoles[i].pid == pid) {
+				role = gAppRoles[i].role;
+				break;
+			}
+		}
+		IOLockUnlock(gAppRoleLock);
+	}
+	args->scalarOutput[0] = role;
+	return kIOReturnSuccess;
+}
+
+/*
+ * Selector 35 (resource, a task's identity token port name): its memory charged to that task (IOGPUResource::
+ * setOwnership): the graphics ledger of the task that really uses it -- a daemon allocating for an app.
+ */
+extern "C" kern_return_t task_id_token_port_name_to_task(mach_port_name_t name, task_t *taskp);
+
+IOReturn
+IOGPUDeviceUserClient::s_set_resource_owner_identity(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+	uint32_t id = (uint32_t)args->scalarInput[0], name = (uint32_t)args->scalarInput[1];
+	IOMemoryDescriptor *md = NULL;
+	task_t task = TASK_NULL;
+	IOReturn ret;
+
+	if (name - 1 >= 0xfffffffeu) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(me->fLock);
+	if (id >= 1 && id <= me->fResourceCount && me->fResources[id - 1] != NULL) {
+		md = me->fResources[id - 1]->memory;
+		if (md != NULL) {
+			md->retain();
+		}
+	}
+	IOLockUnlock(me->fLock);
+	if (md == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (task_id_token_port_name_to_task(name, &task) != KERN_SUCCESS) {
+		ret = kIOReturnBadArgument;
+	} else if (task == TASK_NULL) {
+		ret = kIOReturnUnsupported;
+	} else {
+		ret = md->setOwnership(task, kIOMemoryLedgerTagGraphics, 0);
+		task_deallocate(task);
+	}
+	md->release();
+	return ret;
+}
+
+/*
+ * Selector 54 (kind, argument) -> an assertion's port: kind 1 (keep the wired collector off) with
+ * com.apple.private.iogpu.disable_wired_collector, else not permitted -- as IOGPUDevice::create_device_assertion. Our
+ * GPU has no wired collector: an entitled caller is answered with no object (Apple's answer when it makes none).
+ */
+IOReturn
+IOGPUDeviceUserClient::s_create_device_assertion(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+	IOGPUDeviceUserClient *me = (IOGPUDeviceUserClient *)target;
+
+	if (args->scalarInput[0] != 1 || !IOTaskHasEntitlement(me->fTask, "com.apple.private.iogpu.disable_wired_collector")) {
+		return kIOReturnNotPermitted;
+	}
+	args->scalarOutput[0] = 0;
 	return kIOReturnSuccess;
 }
 
