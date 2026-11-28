@@ -15,6 +15,7 @@
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
+#include <kern/kalloc.h>
 #include <sys/systm.h>
 #include <sys/sysctl.h>
 #include <kern/startup.h>
@@ -114,6 +115,7 @@ akita_display_probe(__unused thread_call_param_t p0, __unused thread_call_param_
 extern vm_map_address_t pmap_map(vm_map_address_t virt, vm_offset_t start, vm_offset_t end, vm_prot_t prot, unsigned int flags);
 extern uint64_t mach_absolute_time(void);
 extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
+extern void nanoseconds_to_absolutetime(uint64_t nanoseconds, uint64_t *result);
 
 static volatile uint32_t *decon, *rdma;
 
@@ -1346,10 +1348,22 @@ struct hakios_display_color {
 static volatile uint32_t *dqe;
 static int dqe_state;           /* 0 not tried, 1 on, -1 refused */
 
+/* what the DQE applies now, for the snapshots (snap=N): its matrix in its own order (B, G, R), 1.0 = 1024 */
+static int32_t dqe_now[12];
+static int dqe_now_on;
+
 static void
 dqe_set_matrix(const int32_t m[9], const int32_t off[3])
 {
 	uint32_t c[9];
+
+	for (int i = 0; i < 9; i++) {
+		dqe_now[i] = m[i];
+	}
+	dqe_now[9] = off[0];
+	dqe_now[10] = off[1];
+	dqe_now[11] = off[2];
+	dqe_now_on = 1;
 
 	for (int i = 0; i < 9; i++) {
 		int32_t v = m[i] < -8192 ? -8192 : m[i] > 8191 ? 8191 : m[i];
@@ -1620,6 +1634,290 @@ akita_display_scale(__unused thread_call_param_t p0, __unused thread_call_param_
 }
 
 __startup_func
+
+/*
+ * (11-28) Snapshots of what the panel gets, once a second, kept in RAM only (the tester's request: no camera, no UFS).
+ * Boot-arg snap=N: a ring of N frames (default 60 when snap=1), snap_step=S (1 full size, default 2: one pixel of every
+ * 2 across and down), snap_ms= the interval (1000). Each frame is what DPP0's DMA reads at that moment (as port 6's
+ * picture), RGB, with its time and the DQE's matrix then (the DQE comes after the DMA: the host applies it --
+ * tools/phone/usbmux-snap.py). Fetched over USB on request: hakios.akita_usbmux.c's port 10, the ring paused meanwhile.
+ * (The hardware writeback -- wb=1 above -- would give the DQE's output itself; not working yet.)
+ */
+struct akita_snap {
+	uint64_t ns;                    /* since boot */
+	uint32_t width, height;         /* as kept */
+	uint32_t base;                  /* the DMA's address */
+	int32_t dqe_on;
+	int32_t dqe[12];                /* matrix (B, G, R rows and columns, 1.0 = 1024) and offsets */
+	uint8_t *rgb;
+};
+
+static struct akita_snap *snaps;
+static uint32_t snap_count, snap_next, snap_taken, snap_step = 2, snap_ms = 1000;
+static lck_grp_t *snap_grp;
+static lck_mtx_t *snap_lock;
+
+static void
+snap_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint64_t next = mach_absolute_time(), interval;
+
+	nanoseconds_to_absolutetime((uint64_t)snap_ms * NSEC_PER_MSEC, &interval);
+	for (;;) {
+		const uint8_t *pixels;
+		uint64_t phys, ns, now;
+		uint32_t w, h, rb;
+
+		/* on a fixed beat: the copy's own time (~0.4 s from write-combined memory) not added to the interval */
+		next += interval;
+		now = mach_absolute_time();
+		if (next > now) {
+			uint64_t wait_ns;
+
+			absolutetime_to_nanoseconds(next - now, &wait_ns);
+			delay(wait_ns / 1000);
+		} else {
+			next = now;
+		}
+		if (akita_display_snapshot(&pixels, &phys, &w, &h, &rb) != 0 || w == 0 || h == 0) {
+			continue;
+		}
+		lck_mtx_lock(snap_lock);
+		struct akita_snap *f = &snaps[snap_next];
+		uint32_t kw = w / snap_step, kh = h / snap_step;
+
+		if (f->rgb == NULL || f->width != kw || f->height != kh) {
+			if (f->rgb != NULL) {
+				kfree_data(f->rgb, (vm_size_t)f->width * f->height * 3);
+			}
+			f->rgb = kalloc_data((vm_size_t)kw * kh * 3, Z_WAITOK);
+			f->width = kw;
+			f->height = kh;
+		}
+		if (f->rgb != NULL) {
+			uint8_t *to = f->rgb;
+
+			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);      /* (the copy's start: its time) */
+
+			for (uint32_t y = 0; y < kh; y++) {
+				const uint32_t *row = (const uint32_t *)(const void *)(pixels + (uint64_t)y * snap_step * rb);
+
+				for (uint32_t x = 0; x < kw; x++) {
+					uint32_t v = row[x * snap_step];       /* (B, G, R, A in memory) */
+
+					*to++ = (uint8_t)(v >> 16);
+					*to++ = (uint8_t)(v >> 8);
+					*to++ = (uint8_t)v;
+				}
+			}
+			f->ns = ns;
+			f->base = (uint32_t)phys;
+			f->dqe_on = dqe_now_on && dqe_state > 0;
+			for (int i = 0; i < 12; i++) {
+				f->dqe[i] = dqe_now[i];
+			}
+			snap_next = (snap_next + 1) % snap_count;
+			snap_taken++;
+		}
+		lck_mtx_unlock(snap_lock);
+	}
+}
+
+static void snap_start(uint32_t n);
+
+static void
+snap_call(__unused thread_call_param_t p0, thread_call_param_t p1)
+{
+	snap_start((uint32_t)(uintptr_t)p1);
+}
+
+/* for port 10: the frames oldest first, each handed to emit() as a PPM (P6) with a comment line; the ring paused */
+int akita_display_snaps(void (*emit)(void *ctx, const void *data, uint32_t n), void *ctx);
+
+int
+akita_display_snaps(void (*emit)(void *ctx, const void *data, uint32_t n), void *ctx)
+{
+	static char line[400];
+	uint32_t have, first, sent = 0;
+
+	if (snaps == NULL) {
+		return -1;
+	}
+	lck_mtx_lock(snap_lock);
+	have = snap_taken < snap_count ? snap_taken : snap_count;
+	first = snap_taken < snap_count ? 0 : snap_next;
+	for (uint32_t i = 0; i < have; i++) {
+		struct akita_snap *f = &snaps[(first + i) % snap_count];
+		int n;
+
+		if (f->rgb == NULL) {
+			continue;
+		}
+		n = snprintf(line, sizeof(line), "P6\n# snap t_ns=%llu base=%#x step=%u dqe=%d m=%d,%d,%d,%d,%d,%d,%d,%d,%d "
+		    "off=%d,%d,%d\n%u %u\n255\n", (unsigned long long)f->ns, f->base, snap_step, f->dqe_on, f->dqe[0], f->dqe[1],
+		    f->dqe[2], f->dqe[3], f->dqe[4], f->dqe[5], f->dqe[6], f->dqe[7], f->dqe[8], f->dqe[9], f->dqe[10], f->dqe[11],
+		    f->width, f->height);
+		emit(ctx, line, (uint32_t)n);
+		emit(ctx, f->rgb, f->width * f->height * 3);
+		sent++;
+	}
+	lck_mtx_unlock(snap_lock);
+	return (int)sent;
+}
+
+static void
+snap_start(uint32_t n)
+{
+	thread_t thread;
+
+	if (n < 2) {
+		n = 60;
+	}
+	PE_parse_boot_argn("snap_step", &snap_step, sizeof(snap_step));
+	PE_parse_boot_argn("snap_ms", &snap_ms, sizeof(snap_ms));
+	if (snap_step < 1 || snap_step > 8) {
+		snap_step = 2;
+	}
+	if (snap_ms < 100) {
+		snap_ms = 100;
+	}
+	snaps = kalloc_data(sizeof(*snaps) * n, Z_WAITOK | Z_ZERO);
+	snap_grp = lck_grp_alloc_init("akita_snap", LCK_GRP_ATTR_NULL);
+	snap_lock = lck_mtx_alloc_init(snap_grp, LCK_ATTR_NULL);
+	if (snaps == NULL || snap_lock == NULL) {
+		return;
+	}
+	snap_count = n;
+	if (kernel_thread_start_priority(snap_thread, NULL, 31, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+		printf("akita_display: snap: %u frames, one pixel of %u, every %u ms (usbmux port 10)\n", n, snap_step, snap_ms);
+	}
+}
+/*
+ * (11-28) The writeback (CWB): DECON0's output copied back into RAM by the writeback DMA ("ODMA", Android's
+ * drmdpp@19908000 "samsung,exynos-writeback") -- what the panel gets, after the DQE. cal_9865's names:
+ * dpp_reg_init (ODMA part), odma_reg_set_coordinates/format, dma_reg_set_base_addr, decon_reg_set_cwb_enable.
+ * wb=1: one frame, wb_delay= seconds after boot (60), into free RAM (zuma-akita.dts: between abl's end 0xf9800000
+ * and the scan-out slots at 0xfac00000); the result logged, the path put back.
+ */
+#define ODMA0           0x19908000ULL
+#define ODMA_DPP0       0x19938000ULL
+#define WB_BUFFER       0xf9800000ULL
+#define WDMA_ENABLE_R   (0x000 / 4)
+#define WDMA_IRQ_R      (0x004 / 4)
+#define WDMA_OUT_CTRL_R (0x008 / 4)
+#define WDMA_DST_W_R    (0x010 / 4)
+#define WDMA_DST_H_R    (0x014 / 4)
+#define WDMA_DST_OFF_R  (0x018 / 4)
+#define WDMA_IMG_SIZE_R (0x01c / 4)
+#define WDMA_BASE0_R    (0x040 / 4)
+#define WDMA_BASE1_R    (0x044 / 4)
+#define WDMA_QOS_LO_R   (0x130 / 4)
+#define WDMA_QOS_HI_R   (0x134 / 4)
+#define WDMA_DG_EN_R    (0x140 / 4)
+#define WDMA_CFG_ERR_R  (0x740 / 4)
+#define ODMA_FRAME_DONE (1u << 16)
+#define ODMA_DEADLOCK   (1u << 17)
+#define ODMA_SLAVE_ERR  (1u << 19)
+#define ODMA_CONFIG_ERR (1u << 28)
+#define DPP_COM_IO_CON_R   (0x038 / 4)
+#define DPP_COM_IMG_SIZE_R (0x03c / 4)
+#define DPP_COM_SUB_CON_R  (0x060 / 4)
+#define DECON_DATA_PATH_CON_1 0x204
+#define DECON_CWB_PATH_EN     (1u << 2)
+#define DECON_SHD_UP_REQ_CMP  (1u << 20)
+
+static void
+akita_display_writeback(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	volatile uint32_t *odma = (volatile uint32_t *)ml_io_map(ODMA0, 0x1000);
+	volatile uint32_t *wdpp = (volatile uint32_t *)ml_io_map(ODMA_DPP0, 0x1000);
+	volatile uint32_t *buf;
+	uint32_t path0, path1, irq = 0;
+
+	if (decon == NULL) {
+		decon = (volatile uint32_t *)ml_io_map(DECON0, 0x1000);
+	}
+	buf = map_buffer(WB_BUFFER, FB_BYTES);
+	if (odma == NULL || wdpp == NULL || buf == NULL || decon == NULL) {
+		printf("akita_display: wb: not mapped\n");
+		return;
+	}
+	printf("akita_display: wb: before: enable %#x irq %#x ctrl %#x\n", odma[WDMA_ENABLE_R], odma[WDMA_IRQ_R],
+	    odma[WDMA_OUT_CTRL_R]);
+	/* a marker in the buffer: what the DMA did not write stays it */
+	for (uint32_t i = 0; i < 64; i++) {
+		buf[i] = 0x5a5a5a5a;
+	}
+	buf[FB_BYTES / 8] = 0x5a5a5a5a;
+	/* dpp_reg_init's ODMA part */
+	odma[WDMA_IRQ_R] = (odma[WDMA_IRQ_R] & ~(0x101bu << 1)) | 1u;      /* nothing masked, the irq on */
+	odma[WDMA_QOS_LO_R] = 0x44444444;
+	odma[WDMA_QOS_HI_R] = 0x44444444;
+	odma[WDMA_DG_EN_R] = 0;
+	odma[WDMA_OUT_CTRL_R] = (odma[WDMA_OUT_CTRL_R] & ~(0xffu << 24 | 0xffu << 16 | 0x3fu << 8 | 6u)) |
+	    0xffu << 24 | 0x40u << 16 | 3u << 8;                            /* alpha ff, ic_max 0x40, ARGB8888 */
+	/* the frame: whole panel, its stride the width */
+	odma[WDMA_DST_OFF_R] = 0;
+	odma[WDMA_DST_W_R] = FB_WIDTH;
+	odma[WDMA_DST_H_R] = FB_HEIGHT;
+	odma[WDMA_IMG_SIZE_R] = FB_HEIGHT << 16 | FB_WIDTH;
+	odma[WDMA_BASE0_R] = (uint32_t)WB_BUFFER;
+	odma[WDMA_BASE1_R] = 0;
+	/* (try 3) DPP_COM_TZPC (0x34): 1 in the writeback's DPP; the scan-out DPP's for comparison; then 0 tried */
+	{
+		volatile uint32_t *sdpp = (volatile uint32_t *)ml_io_map(0x19930000ULL, 0x1000);
+
+		printf("akita_display: wb: tzpc: scan-out dpp %#x, writeback dpp %#x\n", sdpp ? sdpp[0x34 / 4] : 0xdead,
+		    wdpp[0x34 / 4]);
+		wdpp[0x34 / 4] = 0;
+		printf("akita_display: wb: tzpc: writeback dpp after writing 0: %#x\n", wdpp[0x34 / 4]);
+	}
+	/* its DPP: size, 8 bpc, per-pixel alpha, ARGB8888 */
+	wdpp[DPP_COM_IMG_SIZE_R] = FB_HEIGHT << 16 | FB_WIDTH;
+	wdpp[DPP_COM_SUB_CON_R] = 0;
+	wdpp[DPP_COM_IO_CON_R] = (wdpp[DPP_COM_IO_CON_R] & ~0xffu) | 1u << 7;
+	odma[WDMA_IRQ_R] = odma[WDMA_IRQ_R] | (0x101bu << 16);             /* old status cleared */
+	/* (try 2) the ODMA's shadow forced (WDMA_ENABLE's SHD_UPDATE_FORCE), then what it holds: the shadow at +0x400 */
+	odma[WDMA_ENABLE_R] = odma[WDMA_ENABLE_R] | 1u << 4;
+	delay(1000);
+	printf("akita_display: wb: shadow: ctrl %#x w %u h %u size %#x base %#x; dpp io %#x size %#x\n",
+	    odma[(0x400 + 0x008) / 4], odma[(0x400 + 0x010) / 4], odma[(0x400 + 0x014) / 4], odma[(0x400 + 0x01c) / 4],
+	    odma[(0x400 + 0x040) / 4], wdpp[(0x100 + 0x038) / 4], wdpp[(0x100 + 0x03c) / 4]);
+	decon[0x074 / 4] = decon[0x074 / 4];     /* DECON's extra interrupts cleared */
+	/* DECON: the CWB path from out-FIFO 2 into WB interface 0 */
+	path0 = decon[DECON_DATA_PATH_CON_0 / 4];
+	path1 = decon[DECON_DATA_PATH_CON_1 / 4];
+	decon[DECON_DATA_PATH_CON_0 / 4] = path0 | DECON_CWB_PATH_EN;
+	decon[DECON_DATA_PATH_CON_1 / 4] = (path1 & ~(7u << 4 | 3u)) | 2u << 4;
+	decon[DECON_SHD_REG_UP_REQ / 4] = DECON_SHD_UP_REQ_CMP | (1u << 31);
+	printf("akita_display: wb: on: path %#x -> %#x, path1 %#x -> %#x, waiting for a frame\n", path0,
+	    decon[DECON_DATA_PATH_CON_0 / 4], path1, decon[DECON_DATA_PATH_CON_1 / 4]);
+	delay(100 * 1000);
+	printf("akita_display: wb: +100ms: up_req %#x, shadow path %#x path1 %#x; odma enable %#x shd %#x; wdpp io %#x size "
+	    "%#x op %#x irq %#x\n", decon[DECON_SHD_REG_UP_REQ / 4], decon[(0x800 + 0x200) / 4], decon[(0x800 + 0x204) / 4],
+	    odma[WDMA_ENABLE_R], odma[0x400 / 4], wdpp[0x38 / 4], wdpp[0x3c / 4], wdpp[0x30 / 4], wdpp[0x18 / 4]);
+	for (int t = 0; t < 300; t++) {          /* 3 s */
+		irq = odma[WDMA_IRQ_R];
+		if (irq & (ODMA_FRAME_DONE | ODMA_DEADLOCK | ODMA_SLAVE_ERR | ODMA_CONFIG_ERR)) {
+			break;
+		}
+		delay(10 * 1000);
+	}
+	/* put the path back first, whatever happened */
+	decon[DECON_DATA_PATH_CON_0 / 4] = path0;
+	decon[DECON_DATA_PATH_CON_1 / 4] = path1;
+	decon[DECON_SHD_REG_UP_REQ / 4] = DECON_SHD_UP_REQ_CMP | (1u << 31);
+	printf("akita_display: wb: irq %#x (%s%s%s%s) enable %#x cfg_err %#x\n", irq,
+	    irq & ODMA_FRAME_DONE ? "frame done " : "", irq & ODMA_DEADLOCK ? "deadlock " : "",
+	    irq & ODMA_SLAVE_ERR ? "slave error " : "", irq & ODMA_CONFIG_ERR ? "config error" : "",
+	    odma[WDMA_ENABLE_R], odma[WDMA_CFG_ERR_R]);
+	printf("akita_display: wb: decon int_pend %#x extra %#x\n", decon[0x070 / 4], decon[0x074 / 4]);
+	printf("akita_display: wb: buffer %08x %08x %08x %08x .. middle %08x %08x\n", buf[0], buf[1], buf[2], buf[3],
+	    buf[FB_BYTES / 8], buf[FB_BYTES / 8 + 1]);
+	odma[WDMA_IRQ_R] = odma[WDMA_IRQ_R] | (0x101bu << 16);
+}
+
 static void
 akita_display_init(void)
 {
@@ -1643,6 +1941,21 @@ akita_display_init(void)
 		scaler = thread_call_allocate(akita_display_scale, NULL);
 		clock_interval_to_deadline(at, NSEC_PER_SEC, &deadline);
 		thread_call_enter_delayed(scaler, deadline);
+	}
+	enabled = 0;
+	if (PE_parse_boot_argn("snap", &enabled, sizeof(enabled)) && enabled) {
+		/* (started 5 s in: threads and memory are not ready this early) */
+		clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+		thread_call_enter1_delayed(thread_call_allocate(snap_call, NULL), (thread_call_param_t)(uintptr_t)enabled,
+		    deadline);
+	}
+	enabled = 0;
+	if (PE_parse_boot_argn("wb", &enabled, sizeof(enabled)) && enabled) {
+		uint32_t at = 60;
+
+		PE_parse_boot_argn("wb_delay", &at, sizeof(at));
+		clock_interval_to_deadline(at, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(thread_call_allocate(akita_display_writeback, NULL), deadline);
 	}
 	enabled = 0;
 	if (!PE_parse_boot_argn("display_probe", &enabled, sizeof(enabled)) || !enabled) {

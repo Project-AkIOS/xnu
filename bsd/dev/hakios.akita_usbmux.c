@@ -309,6 +309,48 @@ surface_thread(void *parameter, __unused wait_result_t result)
 	lck_mtx_unlock(mux_lock);
 }
 
+/*
+ * Port 10 (11-28): the display's snapshot ring (boot-arg snap=N, hakios.akita_display.c): every frame kept, oldest
+ * first, each a PPM with a comment line (its time, the DMA's address, the DQE's matrix); then the connection is closed.
+ * tools/phone/usbmux-snap.py on the host.
+ */
+extern int akita_display_snaps(void (*emit)(void *ctx, const void *data, uint32_t n), void *ctx);
+
+static void
+snap_emit(void *ctx, const void *data, uint32_t n)
+{
+	struct mux_conn *c = ctx;
+
+	for (uint32_t at = 0; at < n && c->open;) {
+		uint32_t part = n - at < MAX_DATA ? n - at : MAX_DATA;
+
+		if (!screen_send(c, (const uint8_t *)data + at, part)) {
+			break;
+		}
+		at += part;
+	}
+}
+
+static void
+snaps_thread(void *parameter, __unused wait_result_t result)
+{
+	struct mux_conn *c = parameter;
+
+	if (akita_display_snaps(snap_emit, c) < 0) {
+		static const char none[] = "no snapshots: boot with snap=N\n";
+
+		screen_send(c, none, sizeof(none) - 1);
+	}
+	delay_for_interval(200, NSEC_PER_MSEC);
+	lck_mtx_lock(mux_lock);
+	if (c->open) {
+		send_tcp(c, TH_FIN | TH_ACK, c->tx_seq, c->rx_next, NULL, 0, false);
+		send_tcp(c, TH_RST, c->tx_seq + 1, c->rx_next, NULL, 0, false);
+	}
+	conn_free(c);
+	lck_mtx_unlock(mux_lock);
+}
+
 static void
 screen_thread(void *parameter, __unused wait_result_t result)
 {
@@ -695,7 +737,8 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
 		return;
 	}
-	if (phone_port == 1 || phone_port == 5 || phone_port == 6 || phone_port == 7 || phone_port == 8 || phone_port == 9) {
+	if (phone_port == 1 || phone_port == 5 || phone_port == 6 || phone_port == 7 || phone_port == 8 || phone_port == 9 ||
+	    phone_port == 10) {
 		lck_mtx_lock(mux_lock);
 		for (unsigned i = 0; i < CONNS && !c; i++) {
 			if (!conns[i].used) {
@@ -717,10 +760,10 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		}
 		printf("akita usbmux: host port %u: the %s\n", host_port,
 		    phone_port == 1 ? "console log" : phone_port == 5 ? "kernel message buffer" : phone_port == 7 ? "screen recording" :
-		    phone_port == 8 ? "sound recording" : phone_port == 9 ? "newest swap's surface" : "screen");
+		    phone_port == 8 ? "sound recording" : phone_port == 9 ? "newest swap's surface" : phone_port == 10 ? "snapshot ring" : "screen");
 		send_tcp(c, TH_SYN | TH_ACK, 0, seq + 1, NULL, 0, false);
 		if (kernel_thread_start(phone_port == 1 ? klog_thread : phone_port == 5 ? dmesg_thread : phone_port == 7 ? rec_thread :
-		    phone_port == 8 ? sound_thread : phone_port == 9 ? surface_thread : screen_thread, c,
+		    phone_port == 8 ? sound_thread : phone_port == 9 ? surface_thread : phone_port == 10 ? snaps_thread : screen_thread, c,
 		    &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		}
